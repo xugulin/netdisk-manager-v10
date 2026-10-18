@@ -20,6 +20,7 @@ use wp_transfer::{EngineOptions, TransferEngine, UploadGuardHook};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Browser,
+    Player,
     Transfers,
     Tools,
     Guard,
@@ -32,6 +33,7 @@ impl Page {
     pub fn label(self) -> &'static str {
         match self {
             Page::Browser => "网盘",
+            Page::Player => "播放",
             Page::Transfers => "传输",
             Page::Tools => "工具",
             Page::Guard => "敏感词",
@@ -43,6 +45,7 @@ impl Page {
     pub fn icon(self) -> &'static str {
         match self {
             Page::Browser => "☁",
+            Page::Player => "▶",
             Page::Transfers => "⇅",
             Page::Tools => "🛠",
             Page::Guard => "🛡",
@@ -1667,6 +1670,7 @@ impl eframe::App for App {
             )
             .show(ui, |ui| match self.page {
                 Page::Browser => pages::browser::show(self, ui),
+                Page::Player => pages::player::show(self, ui),
                 Page::Transfers => pages::transfers::show(self, ui),
                 Page::Tools => pages::tools::show(self, ui),
                 Page::Guard => pages::guard_page::show(self, ui),
@@ -2040,6 +2044,7 @@ impl App {
         ui.add_space(2.0);
         for page in [
             Page::Browser,
+            Page::Player,
             Page::Transfers,
             Page::Tools,
             Page::Guard,

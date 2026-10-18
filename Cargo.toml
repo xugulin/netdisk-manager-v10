@@ -8,6 +8,12 @@ members = [
     "crates/wp-drive-quark",
     "crates/wp-drive-guangya",
     "crates/wp-transfer",
+    "crates/wp-media",
+    "crates/wp-media-mpv",
+    "crates/wp-stream",
+    "crates/wp-subtitle",
+    "crates/wp-danmaku",
+    "crates/wp-ai",
     "crates/wp-gui",
     "crates/wp-cli",
 ]
@@ -28,6 +34,14 @@ wp-drive-baidu = { path = "crates/wp-drive-baidu" }
 wp-drive-quark = { path = "crates/wp-drive-quark" }
 wp-drive-guangya = { path = "crates/wp-drive-guangya" }
 wp-transfer = { path = "crates/wp-transfer" }
+wp-media = { path = "crates/wp-media" }
+wp-media-mpv = { path = "crates/wp-media-mpv" }
+wp-stream = { path = "crates/wp-stream" }
+wp-subtitle = { path = "crates/wp-subtitle" }
+wp-danmaku = { path = "crates/wp-danmaku" }
+wp-ai = { path = "crates/wp-ai" }
+
+libloading = "0.9"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
