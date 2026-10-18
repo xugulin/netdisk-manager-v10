@@ -147,6 +147,11 @@ engine.set_property("secondary-sub-visibility", "yes");
 - **建议**（与架构一致）：弹幕**主路径 = egui 覆盖层**（`wp-danmaku` 车道引擎 + 我们 `paint_video` 之上绘制，零 libass 负担）；**ASS 弹幕轨作为跨引擎/兜底路径**，并配合**密度上限/分片 sub-reload**。
 - 未做：真机 GPU 复测、百万级弹幕压测、主/副字幕层级（`sub-ass-override`/字体）矩阵（E5 字幕矩阵，属 M2）。
 
+> 🔁 **task-25 复测（2026-10-19）**：副字幕改走**正式命令** `PlayerCommand::SelectSecondarySubtitleTrack`
+> （不再用本节 `set_property` 逃生门）；4K + 千条/分钟弹幕复测 12 帧/1.15 fps/CPU 3.77 核/95 条副字幕 cue，
+> 与本节趋势一致。数据/截图见 [`docs/PLAYER_E5_RESULTS.md`](./PLAYER_E5_RESULTS.md) §4（E5-3）；
+> 主/副字幕层级、字体目录、同名自动加载也已在该文档实测。
+
 ---
 
 ## E4. hwdec 探测（Intel Iris Xe，headless）✅ VAAPI copy-back 可用
@@ -177,6 +182,9 @@ engine.set_property("secondary-sub-visibility", "yes");
 另：自建 LGPL 构建 meson 检测 `vulkan: NO`（缺 Vulkan 开发环境），故本构建无 Vulkan Video 路径；非当前阻塞项，后续可补 `vulkan-headers` 重构建。
 
 ## E5. HLS（网盘云端转码 m3u8）播放 ✅
+
+> 📌 命名说明：task-25 的「**M2/E5 真机复测**」指**字幕/弹幕/字体目录/sub-reload** 主题
+> （见 [`docs/PLAYER_E5_RESULTS.md`](./PLAYER_E5_RESULTS.md)）；本节 E5 仍指 **HLS** 播放。
 
 ### E5-1 本地 HLS 取证：请求头是否透传到「分片」
 
@@ -240,8 +248,8 @@ mpv-probe "$URL" --header "Cookie: $CK" --header "Referer: https://pan.quark.cn/
 2. **真机桌面零拷贝 VAAPI**：headless 已验证 vaapi-copy（CPU 0.27 核）；零拷贝 `hwdec=vaapi` 需 EGL/DRM 桌面环境，补 4K60 10bit HEVC 丢帧 <0.5% 与 GPU 占用指标（GUI 桌面会话跑）。
 3. **蓝光 ISO/BDMV 主标题**（E6）：需未加密原盘/ISO 样本；`bluray-device` + `bd://` 路径已实现，`SelectDiscTitle` 走 `bd://<n>`，标题枚举（libbluray DiscInfo）尚未实现（disc 快照仍为 None）。
 4. **T6 帧同步调优**：拿到首帧后动态启用 `video-sync=display-resample`、`BLOCK_FOR_TARGET_TIME`、repaint 节流（需真机 vsync 数据）。
-5. **发行合规**：LGPL FFmpeg 随包（当前动态链接系统 FFmpeg）；Windows ANGLE + libmpv-2.dll 构建/实测（脚本骨架已给）。
-6. 弹幕百万级/4K 真机压测，确定 ASS 轨 vs egui 覆盖层的最终阈值与降级策略。
+5. ~~**发行合规**：LGPL FFmpeg 随包~~ ✅ **已完成（task-19）**：自建 LGPL FFmpeg 8.0 + 重链 libmpv + 126MB 自包含运行时（合规校验 PASS），见 [`docs/PLAYER_PACKAGING.md`](./PLAYER_PACKAGING.md) §10；剩余 Windows ANGLE + libmpv-2.dll 构建/实测（脚本骨架已给）。
+6. 弹幕百万级/4K **真机 GPU** 压测（软件 GL 口径已在 task-25 复测：副字幕正式命令/字体目录/同名自动加载/sub-reload 均验通，见 [`docs/PLAYER_E5_RESULTS.md`](./PLAYER_E5_RESULTS.md)），确定 ASS 轨 vs egui 覆盖层阈值与降级策略。
 
 ---
 

@@ -14,7 +14,13 @@
 //!   --size <WxH>     窗口大小（默认 1280x720）
 //!   --hwdec <mode>   默认 auto-safe
 //!   --sub <path>     注入字幕（可多次；第一次选中）
-//!   --prop k=v       设置 mpv 属性（可多次，如 secondary-sid=2）
+//!   --prop k=v       设置 mpv 属性（可多次；E5 起副字幕请用 --secondary-sid 正式命令）
+//!   --secondary-sid <N>  用正式 PlayerCommand::SelectSecondarySubtitleTrack 选副字幕轨（E5-1）
+//!   --fonts-dir <dir>    MpvConfig.fonts_dir：自定义字幕字体目录（E5-2）
+//!   --sub-auto <mode>    MpvConfig.sub_auto：no/exact/fuzzy/all（默认 no；E5-2 同名自动加载）
+//!   --dump-props k1,k2   退出前读 mpv 属性写入 JSON（诊断，如 sub-fonts-dir,sub-auto,secondary-sid）
+//!   --sub-reload <path>|<old>|<new>  播放中改字幕文本 → ReloadSubtitles → 验证 cue 更新（E5-4）
+//!   --reload-at-ms <N>   sub-reload 触发时刻（默认 1500ms）
 //!   --json           输出单行 JSON
 //! ```
 //!
@@ -43,6 +49,16 @@ struct Args {
     /// 视频矩形（x,y,w,h，egui points；模拟 GUI 里 inner 16:9 区域）
     rect: Option<[f32; 4]>,
     seek: Option<f64>,
+    /// E5-1：副字幕轨 id（用正式 PlayerCommand 选择，不再用 set_property 逃生门）。
+    secondary_sid: Option<i64>,
+    /// E5-2：MpvConfig.fonts_dir / sub_auto。
+    fonts_dir: Option<String>,
+    sub_auto: Option<String>,
+    /// 退出前读取的 mpv 属性名（诊断）。
+    dump_props: Vec<String>,
+    /// E5-4：sub-reload 演示 (path, old, new)。
+    sub_reload: Option<(String, String, String)>,
+    reload_at_ms: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -58,6 +74,12 @@ fn parse_args() -> Result<Args, String> {
         screenshot_window: None,
         rect: None,
         seek: None,
+        secondary_sid: None,
+        fonts_dir: None,
+        sub_auto: None,
+        dump_props: Vec::new(),
+        sub_reload: None,
+        reload_at_ms: 1500,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -79,6 +101,31 @@ fn parse_args() -> Result<Args, String> {
                 let raw = it.next().ok_or("缺少值")?;
                 let (k, v) = raw.split_once('=').ok_or("--prop 需要 k=v")?;
                 args.props.push((k.into(), v.into()));
+            }
+            "--secondary-sid" => {
+                args.secondary_sid =
+                    Some(it.next().ok_or("缺少值")?.parse().map_err(|_| "需要整数")?)
+            }
+            "--fonts-dir" => args.fonts_dir = Some(it.next().ok_or("缺少值")?),
+            "--sub-auto" => args.sub_auto = Some(it.next().ok_or("缺少值")?),
+            "--dump-props" => {
+                let raw = it.next().ok_or("缺少值")?;
+                args.dump_props = raw
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect();
+            }
+            "--sub-reload" => {
+                let raw = it.next().ok_or("缺少值")?;
+                let parts: Vec<&str> = raw.split('|').collect();
+                if parts.len() != 3 {
+                    return Err("--sub-reload 需要 <path>|<old>|<new>".into());
+                }
+                args.sub_reload = Some((parts[0].into(), parts[1].into(), parts[2].into()));
+            }
+            "--reload-at-ms" => {
+                args.reload_at_ms = it.next().ok_or("缺少值")?.parse().map_err(|_| "需要整数")?
             }
             "--json" => args.json = true,
             "--screenshot" => args.screenshot = Some(it.next().ok_or("缺少值")?),
@@ -131,6 +178,12 @@ struct Measurements {
     paint_calls: u64,
     open_called_at: Option<Instant>,
     seek_done: bool,
+    /// E5-1：副字幕正式命令已发。
+    secondary_sent: bool,
+    /// E5-4：sub-reload 已执行 / 执行时刻 / 执行前 cue 数。
+    reload_done: bool,
+    reload_at: Option<Instant>,
+    reload_cues_before: usize,
 }
 
 struct ProbeApp {
@@ -179,6 +232,15 @@ impl ProbeApp {
             done: false,
             closed_at: None,
         })
+    }
+
+    fn subtitle_cue_count(&self) -> usize {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, e)| matches!(e, PlayerEvent::SubtitleCue { .. }))
+            .count()
     }
 
     fn finish(&mut self) {
@@ -281,6 +343,16 @@ impl eframe::App for ProbeApp {
             for (k, v) in &self.args.props {
                 let _ = self.engine.set_property(k.clone(), v.clone());
             }
+            // E5-1：副字幕用正式 PlayerCommand（等价 mpv secondary-sid），不再 set_property。
+            if let Some(id) = self.args.secondary_sid {
+                let _ = self
+                    .engine
+                    .command(PlayerCommand::SelectSecondarySubtitleTrack { id });
+                let _ = self
+                    .engine
+                    .command(PlayerCommand::SetSecondarySubtitleVisible(true));
+                self.measurements.secondary_sent = true;
+            }
         }
         if first_frame.is_some() && self.measurements.first_frame_at.is_none() {
             self.measurements.first_frame_at = first_frame;
@@ -290,6 +362,36 @@ impl eframe::App for ProbeApp {
                 if self.measurements.opened_at.is_some() {
                     self.measurements.seek_done = true;
                     let _ = self.engine.command(PlayerCommand::SeekAbsolute(target));
+                }
+            }
+        }
+        // E5-4：播放中改写字幕文件 → ReloadSubtitles → 后续 cue 应为新文本。
+        if !self.measurements.reload_done && self.measurements.opened_at.is_some() {
+            if self.started.elapsed().as_millis() as u64 >= self.args.reload_at_ms {
+                self.measurements.reload_done = true;
+                if let Some((path, old, new)) = &self.args.sub_reload {
+                    let before = self.subtitle_cue_count();
+                    match std::fs::read_to_string(path) {
+                        Ok(text) if text.contains(old) => {
+                            match std::fs::write(path, text.replace(old, new)) {
+                                Ok(()) => {
+                                    let _ = self.engine.command(PlayerCommand::ReloadSubtitles);
+                                    self.measurements.reload_at = Some(Instant::now());
+                                    self.measurements.reload_cues_before = before;
+                                    if !self.args.json {
+                                        eprintln!(
+                                            "[render_probe] sub-reload：{path} 文本 {old:?} → {new:?}"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!("[render_probe] sub-reload 写文件失败：{e}"),
+                            }
+                        }
+                        Ok(_) => eprintln!(
+                            "[render_probe] sub-reload 未找到旧文本 {old:?}（文件：{path}）"
+                        ),
+                        Err(e) => eprintln!("[render_probe] sub-reload 读文件失败：{e}"),
+                    }
                 }
             }
         }
@@ -329,6 +431,17 @@ impl eframe::App for ProbeApp {
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
         self.closed_at = Some(Instant::now());
         self.finish();
+        // 诊断属性必须在 engine.shutdown()（下面）之前读：worker 停掉后属性读取全部 None。
+        let props: serde_json::Map<String, serde_json::Value> = self
+            .args
+            .dump_props
+            .iter()
+            .filter_map(|name| {
+                self.engine
+                    .mpv_property_string(name)
+                    .map(|value| (name.clone(), serde_json::Value::String(value)))
+            })
+            .collect();
         // 窗口截图：读当前（默认）framebuffer，验证「视频画在 egui 期望的矩形里」
         if let (Some(path), Some(gl)) = (&self.args.screenshot_window, gl) {
             let mut viewport = [0i32; 4];
@@ -405,6 +518,44 @@ impl eframe::App for ProbeApp {
             .map(|(_, e)| format!("{e:?}"))
             .collect();
 
+        // E5：主/副 cue 分项 + sub-reload 前后对比（props 已在 on_exit 开头读取）。
+        let primary_cues = events
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    PlayerEvent::SubtitleCue {
+                        secondary: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let secondary_cues = events
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    PlayerEvent::SubtitleCue {
+                        secondary: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let reload = self.measurements.reload_at.map(|at| {
+            let after: Vec<String> = events
+                .iter()
+                .filter(|(t, e)| *t >= at && matches!(e, PlayerEvent::SubtitleCue { .. }))
+                .map(|(_, e)| format!("{e:?}"))
+                .collect();
+            serde_json::json!({
+                "at_secs": at.duration_since(self.t0).as_secs_f64(),
+                "cues_before": self.measurements.reload_cues_before,
+                "cues_after_reload": after,
+            })
+        });
+
         if self.args.json {
             let json = serde_json::json!({
                 "video": self.args.video,
@@ -431,7 +582,22 @@ impl eframe::App for ProbeApp {
                     "position_secs": snapshot.position_secs,
                     "duration_secs": snapshot.duration_secs,
                     "tracks": snapshot.tracks.len(),
+                    "tracks_detail": snapshot.tracks.iter().map(|t| serde_json::json!({
+                        "id": t.id,
+                        "kind": format!("{:?}", t.kind),
+                        "title": t.title,
+                        "lang": t.lang,
+                        "codec": t.codec,
+                        "selected": t.selected,
+                        "external": t.external,
+                    })).collect::<Vec<_>>(),
+                    "secondary_subtitle_track": snapshot.secondary_subtitle_track,
                 },
+                "primary_cues": primary_cues,
+                "secondary_cues": secondary_cues,
+                "secondary_command_sent": self.measurements.secondary_sent,
+                "props": props,
+                "sub_reload": reload,
                 "subtitle_cues": cues,
                 "errors": errors,
                 "render_last_error": self.render.as_ref().and_then(|r| r.last_error()),
@@ -472,6 +638,16 @@ impl eframe::App for ProbeApp {
                 snapshot.tracks.len()
             );
             println!("字幕 cue 条数：{}", cues.len());
+            println!(
+                "字幕 cue 分项：主={primary_cues} 副={secondary_cues}；副字幕命令已发送={} 快照 secondary_track={:?}",
+                self.measurements.secondary_sent, snapshot.secondary_subtitle_track
+            );
+            if !props.is_empty() {
+                println!("mpv 属性诊断：{props:?}");
+            }
+            if let Some(reload) = &reload {
+                println!("sub-reload：{reload}");
+            }
             for cue in cues.iter().take(6) {
                 println!("  {cue}");
             }
@@ -495,6 +671,8 @@ fn main() {
     };
     let mut config = MpvConfig {
         hwdec: args.hwdec.clone(),
+        fonts_dir: args.fonts_dir.as_ref().map(std::path::PathBuf::from),
+        sub_auto: args.sub_auto.clone().unwrap_or_else(|| "no".into()),
         ..Default::default()
     };
     // 注意：render mode = EmbeddedGl 时 vo=libmpv（默认），不要覆盖成 vo=null。

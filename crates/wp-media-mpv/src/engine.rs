@@ -162,6 +162,11 @@ enum EngineMsg {
     /// 直接设置 mpv 属性/选项（高级逃生门：双字幕 secondary-sid、HLS 调参等；
     /// 先按属性设置，失败再退回 option 接口）。
     SetProperty(String, String),
+    /// 读取 mpv 字符串属性（诊断/测试用；发送方在专用通道收结果）。
+    GetProperty {
+        name: String,
+        reply: Sender<Option<String>>,
+    },
     Shutdown,
 }
 
@@ -264,6 +269,22 @@ impl MpvEngine {
     /// 收到可恢复的 [`PlayerEvent::Error`]。
     pub fn set_property(&self, name: impl Into<String>, value: impl Into<String>) -> Result<()> {
         self.enqueue(EngineMsg::SetProperty(name.into(), value.into()))
+    }
+
+    /// 读取 mpv 字符串属性（**诊断/测试用**，如 `sub-fonts-dir`、`sub-auto`、
+    /// `secondary-sid`、`secondary-sub-visibility`；属性不存在返回 `None`）。
+    ///
+    /// 走引擎线程（mpv 句柄只归它使用），最多等 2s；UI 线程平时不必调用。
+    pub fn mpv_property_string(&self, name: &str) -> Option<String> {
+        let (reply, rx) = mpsc::channel();
+        self.enqueue(EngineMsg::GetProperty {
+            name: name.to_string(),
+            reply,
+        })
+        .ok()?;
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .ok()
+            .flatten()
     }
 
     fn enqueue(&self, msg: EngineMsg) -> Result<()> {
@@ -466,6 +487,10 @@ impl Worker {
                     Ok(EngineMsg::Command(command)) => self.handle_command(command),
                     Ok(EngineMsg::SetProperty(name, value)) => {
                         self.handle_set_property(&name, &value)
+                    }
+                    Ok(EngineMsg::GetProperty { name, reply }) => {
+                        let value = self.raw().get_property_string(&name);
+                        let _ = reply.send(value);
                     }
                     Ok(EngineMsg::Shutdown) => {
                         exit = true;
