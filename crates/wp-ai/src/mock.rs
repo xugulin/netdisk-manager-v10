@@ -25,6 +25,10 @@ struct MockState {
     translate_calls: AtomicUsize,
     complete_calls: AtomicUsize,
     transcribe_calls: AtomicUsize,
+    /// 文本生成（`complete`）的固定回复序列，按调用次数取（超出取最后一条）。
+    completions: Vec<String>,
+    /// 文本生成永远失败（摘要降级测试用）。
+    always_fail_complete: AtomicBool,
 }
 
 impl MockState {
@@ -97,6 +101,20 @@ impl MockProvider {
         self
     }
 
+    /// 注入文本生成（`complete`）的回复序列（按调用次数取，超出取最后一条）。
+    ///
+    /// 用于摘要/章节等「一次窗口一次文本生成」的可控测试：例如每个窗口返回不同 JSON。
+    pub fn with_completions(mut self, completions: Vec<String>) -> Self {
+        self.state_mut().completions = completions;
+        self
+    }
+
+    /// 文本生成永远失败（摘要失败降级/回退测试用）。
+    pub fn always_fail_complete(mut self) -> Self {
+        self.state_mut().always_fail_complete = AtomicBool::new(true);
+        self
+    }
+
     /// 已发生的翻译调用次数（测试断言用）。
     pub fn translate_calls(&self) -> usize {
         self.state.translate_calls.load(Ordering::SeqCst)
@@ -150,16 +168,23 @@ impl AiProvider for MockProvider {
     }
 
     async fn complete(&self, _prompt: &str) -> Result<String> {
-        self.state.complete_calls.fetch_add(1, Ordering::SeqCst);
+        let call_index = self.state.complete_calls.fetch_add(1, Ordering::SeqCst);
         if !self.state.delay.is_zero() {
             tokio::time::sleep(self.state.delay).await;
+        }
+        if self.state.always_fail_complete.load(Ordering::SeqCst) {
+            return Err(Error::network("Mock Provider 文本生成固定失败"));
         }
         if self.state.fail_remaining.load(Ordering::SeqCst) > 0
             || self.state.always_fail.load(Ordering::SeqCst)
         {
             return Err(Error::network(self.state.fail_message()));
         }
-        Ok("Mock 摘要结果".to_string())
+        if self.state.completions.is_empty() {
+            return Ok("Mock 摘要结果".to_string());
+        }
+        let index = call_index.min(self.state.completions.len() - 1);
+        Ok(self.state.completions[index].clone())
     }
 
     async fn transcribe(&self, _audio: &[u8], _lang: &str) -> Result<wp_subtitle::SubtitleDoc> {

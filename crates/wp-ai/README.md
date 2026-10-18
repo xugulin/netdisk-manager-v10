@@ -1,4 +1,4 @@
-# wp-ai —— AI 子系统（字幕翻译 P1 + 本地 ASR P2 + 集成闭环已落地）
+# wp-ai —— AI 子系统（P1 字幕翻译 + P2 本地 ASR + P3 摘要原型 + 集成闭环）
 
 播放优先的 AI 地基：**本地 + 远端 Provider 可分别启停/调优先级**，任务队列（优先级/取消/超时/
 并发上限/播放期策略），JSON 结果缓存（文件指纹+模型+目标语言+任务类型），字幕翻译管线与 ASR 管线。
@@ -9,6 +9,7 @@
 | 文本生成/摘要问答（P3 基础） | 同上 | ✅ |
 | 语音转写生成字幕（P2） | 本地 `whisper-cli`（whisper.cpp 外部进程） | ✅ 管线完整，真模型未在 CI 跑 |
 | 集成闭环：翻译 → 双语 ASS 文件（漏译统计/降级）、ffmpeg 抽 16k wav（ASR 前置） | `wp_ai::integration` | ✅ |
+| P3 字幕摘要/章节（原型）：分批窗口 → JSON 章节（容错/纯文本回退/失败降级）→ 时间轴合法化 → 缓存 | `wp_ai::summarize` | ✅ |
 | 语音转写（P2 远端） | 远端 OpenAI 兼容 `/audio/transcriptions` | ⏳ 未实现（当前返回 Unsupported 并回退） |
 | OCR/超分（P4） | ONNX | ⏳ 未实现 |
 
@@ -161,11 +162,27 @@ service.cancel(id)?;
 while let Some(event) = events.recv().await { /* Done/Failed/Canceled/Rejected */ }
 ```
 
+## P3 字幕摘要 / 章节（原型）
+
+```rust
+use wp_ai::summarize::{summarize_subtitles, summary_to_markdown, SummarizeOptions};
+
+let outcome = summarize_subtitles(&registry, &cache, &fingerprint, &doc, &SummarizeOptions::default()).await;
+println!("{}", outcome.summary.to_json_pretty()?);     // 章节 JSON
+println!("{}", summary_to_markdown(&outcome.summary)); // 可读 Markdown
+// AiSummary { chapters[{start_ms,end_ms,title,summary}], overview, keywords[] }
+// 窗口默认 5 分钟（可配 1–10 分钟）；JSON 容错/纯文本回退；Provider 失败→标题=首句；缓存命中零调用
+```
+
+示例（mock provider，无需 key）：`cargo run -p wp-ai --example summarize_srt`
+详细说明（数据结构/示例输出/GUI 章节目录+点击 seek 建议）见 [docs/PLAYER_AI.md](../../docs/PLAYER_AI.md) §5。
+
 ## 测试
 
 ```bash
-cargo test -p wp-ai                 # 51 单测 + 4 doc test（本地 mock HTTP/伪造进程，不联网）
-cargo test -p wp-ai --all-features  # 67 单测（+ 本地 LLM mock HTTP / 伪 whisper-cli 脚本）
+cargo test -p wp-ai                 # 65 单测 + 5 doc test（本地 mock HTTP/伪造进程，不联网）
+cargo test -p wp-ai --all-features  # 81 单测（+ 本地 LLM mock HTTP / 伪 whisper-cli 脚本）
+cargo run -p wp-ai --example summarize_srt  # P3 摘要示例（mock）
 cargo clippy -p wp-ai --all-features --all-targets  # 0 warning
 ```
 
@@ -173,7 +190,7 @@ cargo clippy -p wp-ai --all-features --all-targets  # 0 warning
 
 - 重活最终要跑独立 worker 进程（架构 §7）；当前 `service` 是进程内 tokio 队列，语义已对齐
   （id/优先级/取消/超时/事件），后续把 `execute_task` 换成 IPC 即可，GUI 接口不变。
-- 远端 ASR（`/audio/transcriptions`）、P3 摘要问答增强、P4 OCR/超分待做。
+- 远端 ASR（`/audio/transcriptions`）、P3 问答/台词搜索、P4 OCR/超分待做；P3 摘要原型已可用（每窗口独立生成后合并，超长片连贯性后续可做二次汇总）。
 - **真机翻译质量/时延待真机**（本机无 API key、无本地权重）：样本与方法见
-  [docs/PLAYER_AI.md](../../docs/PLAYER_AI.md) §7。
+  [docs/PLAYER_AI.md](../../docs/PLAYER_AI.md) §8（P3 摘要质量同样待真机，见 §5）。
 - 真实大模型/whisper 模型未纳入 CI（无密钥、无权重）；单测全部使用本地 mock HTTP 与伪造 CLI 脚本。

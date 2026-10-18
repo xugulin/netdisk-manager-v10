@@ -24,6 +24,7 @@
 //! | 字幕翻译管线 | [`pipeline::translate_subtitle_document`]（分批、术语表、缓存、失败降级原文） |
 //! | ASR 字幕管线 | [`pipeline::transcribe_to_subtitle`] / [`pipeline::transcribe_file_to_subtitle`]（whisper.cpp、缓存、失败降级） |
 //! | 集成闭环 | [`integration`]：翻译 → 双语 ASS → 原子写文件（漏译统计/失败降级）；ffmpeg 抽 16kHz wav（ASR 前置） |
+//! | P3 摘要/章节 | [`summarize::summarize_subtitles`]：分批窗口 → JSON 章节（容错/回退）→ 时间轴合法化 → 缓存 |
 //!
 //! ## 配置示例
 //!
@@ -114,7 +115,8 @@
 //!
 //! ## 任务路线
 //!
-//! P1 字幕翻译（已完成）→ P2 ASR 生成字幕（本版完成本地 whisper-cli 管线；远端 ASR 待接）→ P3 摘要/问答 → P4 OCR/超分。
+//! P1 字幕翻译（已完成）→ P2 ASR 生成字幕（本版完成本地 whisper-cli 管线；远端 ASR 待接）→
+//! P3 摘要/章节（原型已完成；问答待做）→ P4 OCR/超分。
 
 pub mod cache;
 pub mod integration;
@@ -123,6 +125,7 @@ pub mod pipeline;
 pub mod provider;
 pub mod remote;
 pub mod service;
+pub mod summarize;
 
 #[cfg(feature = "local-llm")]
 pub mod local_llm;
@@ -154,6 +157,10 @@ pub use remote::{RemoteOpenAiProvider, RemoteOptions};
 pub use service::{
     AiEvent, AiOutcome, AiResult, AiService, AiServiceConfig, AudioSource, TaskId, TaskPayload,
     TaskSpec,
+};
+pub use summarize::{
+    normalize_chapters, summarize_subtitles, summary_to_markdown, AiSummary, Chapter,
+    SummarizeOptions, SummarizeOutcome,
 };
 
 #[cfg(feature = "local-llm")]

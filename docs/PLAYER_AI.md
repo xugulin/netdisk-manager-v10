@@ -15,7 +15,8 @@
 | 本地 ASR（P2） | ✅ whisper.cpp `whisper-cli` 外部进程 | `wp_ai::integration::extract_audio_for_asr` → `pipeline::transcribe_file_to_subtitle` |
 | VIP 级「播放期不抢 CPU」 | ✅ 队列默认并发 1 + 播放期拒绝非紧急任务 + 超时/取消 | `AiService::set_playing` / `submit(..., urgent)` |
 | 结果缓存（跨次播放零成本） | ✅ (文件指纹 + 模型 + 目标语言 + 任务类型) | `AiCache` |
-| 远端 ASR / P3 摘要问答 / P4 OCR | ⏳ 未实现（返回 Unsupported 并按优先级回退） | — |
+| P3 字幕摘要 / 章节（原型） | ✅ 分批窗口 + JSON 容错 + 时间轴合法化 + 缓存 + 失败降级 | `wp_ai::summarize::summarize_subtitles` |
+| 远端 ASR / P3 问答 / P4 OCR | ⏳ 未实现（返回 Unsupported 并按优先级回退） | — |
 
 一次典型调用链（GUI 一个按钮）：
 
@@ -24,6 +25,15 @@
    └─(AiService 队列)→ Provider 翻译（本地优先/失败回退/缓存）
         └─→ 双语 ASS 文本（wp-subtitle：保留原 ASS 头/样式，原文+译文双轨）
              └─→ 原子写文件 → mpv: sub-add / sub-reload → 屏幕显示双语
+```
+
+P3 摘要链路（独立于播放）：
+
+```text
+外挂字幕 SubtitleDoc
+   └─(5 分钟窗口分批)→ 每窗口一次 complete（要求 JSON 章节/总览/关键词）
+        └─→ 解析容错（JSON/纯文本回退）→ 时间轴合法化 → AiSummary{chapters,overview,keywords}
+             └─→ 缓存（指纹+模型+语言）→ GUI 章节目录（点击 seek）/摘要面板
 ```
 
 ---
@@ -244,7 +254,105 @@ service.cancel(id)?;
 
 ---
 
-## 5. 集成 API 速查（`wp_ai::integration`）
+## 5. P3 字幕摘要 / 章节（原型，已实现）
+
+> 入口：`wp_ai::summarize`；示例：`cargo run -p wp-ai --example summarize_srt`（mock provider，无需 key）。
+> 真机质量评估待真机（与 §8 翻译评估同一批待办）。
+
+### 5.1 数据结构（`AiSummary`，可直接序列化给 GUI/前端）
+
+```json
+{
+  "chapters": [
+    { "start_ms": 0, "end_ms": 300000, "title": "雨夜与车站", "summary": "主角在雨夜车站等待列车" },
+    { "start_ms": 300000, "end_ms": 480000, "title": "沿铁轨前行", "summary": "主角决定沿铁轨走向天亮" }
+  ],
+  "overview": "一个雨夜，主角在车站等待一班不会来的列车；主角沿铁轨前行，遇到修车匠后得到新的方向。",
+  "keywords": ["雨夜", "车站", "等待", "铁轨", "修车匠", "方向"]
+}
+```
+
+- `start_ms/end_ms` 为**整片绝对毫秒**；章节按时间排序、互不重叠、裁剪到媒体时长；
+- `overview` 为整片总览；`keywords` 去重（最多 20 个）；
+- Rust 侧还提供 `AiSummary::to_json_pretty()` / `from_json()` / `find_chapter(time_ms)`（点击 seek 用）。
+
+### 5.2 分批与容错策略
+
+1. **窗口切分**：默认每 5 分钟一批（`window_ms` 可配，clamp 到 1–10 分钟），同时受
+   `max_cues_per_window`（默认 240 条）保护；跨小时的章节保留绝对毫秒（如 `3_900_000ms → 01:05:00`）。
+2. **Prompt 约束**：要求模型只输出 JSON：
+   `{"chapters":[{start_ms,end_ms,title,summary}],overview,keywords[]}`，
+   并限定每章时间必须落在该窗口绝对范围内、1–4 章、输出语言可配。
+3. **解析容错**：允许 markdown 围栏/前后废话；字段别名（`title/name/标题`、`summary/摘要/description`、
+   `overview/总览/概要`、`keywords/关键词`）；时间戳支持整数毫秒、数字字符串、
+   `00:05:00` / `00:05:00,000` 字符串；`chapters` 可以是数组、对象内数组或单章对象。
+4. **纯文本回退**：模型没给 JSON → 该窗口降级为「标题=该窗口首句、摘要=模型文本」，并记 warning。
+5. **失败降级**：某窗口 Provider 全部失败 → 该窗口生成「标题=首句」的章节，`degraded=true` + `errors`，
+   **不中断整片摘要**（其余窗口正常输出）。
+6. **时间轴合法化**（`normalize_chapters`）：排序 → 负值裁剪为 0 → 越界裁剪到媒体时长 →
+   重叠起始后移 → 无空间丢弃 → 空标题且空摘要丢弃。
+7. **缓存**：键 =（文件指纹 + 模型 + 语言 + `AiTaskKind::Summarize`）；命中时零 Provider 调用；
+   降级结果不写缓存（避免把坏结果固化）。
+
+### 5.3 示例输出（`cargo run -p wp-ai --example summarize_srt`，mock）
+
+```text
+== Markdown ==
+# 视频摘要
+
+**总览**：一个雨夜，主角在车站等待一班不会来的列车；主角沿铁轨前行，遇到修车匠后得到新的方向。
+
+**关键词**：雨夜、车站、等待、铁轨、修车匠、方向
+
+## 章节
+
+- `[00:00:00–00:05:00]` **雨夜与车站**：主角在雨夜车站等待列车
+- `[00:05:00–00:08:00]` **沿铁轨前行**：主角决定沿铁轨走向天亮
+- `[00:08:00–00:12:00]` **修车匠**：修车匠点明列车停运但路还在
+```
+
+### 5.4 GUI 接入建议
+
+```rust
+// 触发：「AI 摘要」按钮（建议暂停时跑；播放期用 urgent=false 会被队列拒绝）
+let outcome = wp_ai::summarize::summarize_subtitles(
+    &registry, &cache, &fingerprint, &current_doc,
+    &wp_ai::summarize::SummarizeOptions::default(),
+).await;
+
+if outcome.has_warning() {
+    // outcome.degraded → 提示「部分片段摘要失败」；outcome.warnings → 输出非 JSON 已降级
+}
+
+// 1) 章节目录面板（左侧/底部列表）：时间 + 标题 + 摘要
+for chapter in &outcome.summary.chapters {
+    let label = format!("[{}] {}", format_ts(chapter.start_ms), chapter.title);
+    if ui.button(label).clicked() {
+        player.seek_ms(chapter.start_ms);          // 点击 → 跳到章节起点
+    }
+}
+
+// 2) 摘要面板（overview + keywords 标签 + 「复制/导出 Markdown」）
+let markdown = wp_ai::summarize::summary_to_markdown(&outcome.summary);
+
+// 3) 章节热区（进度条上画章节分界/悬停提示，数据即 chapters）
+// 4) 缓存命中时直接展示（result.cached=true，零耗时）；换视频用新指纹自动失效
+```
+
+- 章节 JSON 可直接持久化到片库（按文件指纹 + 语言），下次打开秒出目录；
+- 点击章节即可 `seek`；拖进度条时用 `summary.find_chapter(time_ms)` 高亮当前章节；
+- 建议在**暂停/空闲**执行（播放期间队列按 `allow_during_playback` 拒绝，或标记 urgent 只跑短片段）；
+- 长片（>2 小时）窗口数×请求数线性增加，建议优先本地 llama-server 或整片一次缓存复用。
+
+### 5.5 限制
+
+- 真机质量/时延未测（无 key/无本地权重，同 §8）；
+- 摘要为「每窗口独立生成后合并」：跨窗口剧情连贯性依赖 prompt，超长片建议后续做二次汇总；
+- 只做字幕文本摘要（不读画面/音频）；P3 的「问答/台词搜索/精彩片段」未实现。
+
+---
+
+## 6. 集成 API 速查（`wp_ai::integration`）
 
 | API | 说明 |
 |---|---|
@@ -256,12 +364,21 @@ service.cancel(id)?;
 | `extract_audio_for_asr(input) -> Result<PathBuf>` | 抽轨到唯一临时 wav 路径（ASR 前置一步完成） |
 | `cleanup_temp_audio(path)` | 删除 ASR 临时音频（best-effort） |
 
+P3 摘要（`wp_ai::summarize`）：
+
+| API | 说明 |
+|---|---|
+| `summarize_subtitles(registry, cache, fingerprint, doc, &SummarizeOptions) -> SummarizeOutcome` | 整片字幕 → 分批窗口→ JSON 章节（容错/回退/降级）→ 时间轴合法化 → 写缓存；永不返回 Err |
+| `normalize_chapters(chapters, media_end_ms) -> Vec<Chapter>` | 章节时间轴合法化（排序/裁剪/去重叠/丢空） |
+| `summary_to_markdown(&AiSummary) -> String` | 可读 Markdown（导出/文本面板） |
+| `AiSummary::to_json_pretty()` / `from_json()` / `find_chapter(ms)` | JSON 导出/回读/按时间找章节（点击 seek 用） |
+
 失败语义：**翻译失败 = 降级不报错**（`degraded=true`、`matched=0`、`errors` 可读）；
 **写文件/ffmpeg 失败 = 返回 `Err`**（`NotFound` 可定位缺 ffmpeg/输入，`Network` 表示超时，`Other` 含 stderr 摘要）。
 
 ---
 
-## 6. 缓存 / 性能 / 隐私
+## 7. 缓存 / 性能 / 隐私
 
 - 缓存键 =（文件指纹 + 模型 + 目标语言 + 任务类型），JSON 文件、原子写、LRU（默认 200 条）；
   二次播放翻译 **0 次 Provider 调用**（GUI 显示「命中缓存」）。
@@ -271,20 +388,20 @@ service.cancel(id)?;
 - 隐私：`offline_only=true` 时纯本地；远端模式会把字幕文本（仅文本，不含视频/音频）发给
   `base_url`；`api_key` 不进日志。本地 ASR 时音频只在本机临时目录（用完删除）。
 
-## 7. 真机翻译评估：**待真机**
+## 8. 真机翻译评估：**待真机**
 
 本机现状（2026-10-19）：**无 OpenAI 兼容 API Key**（环境变量/配置均未提供），且
 `llama-server` 未启动、未下载 whisper/LLM 权重 → **无法做真机 20 句翻译质量/时延评估**，
 本节记录方法与样本，待 Lead 提供 key 或本机拉起 llama-server 后补测。
 
-### 7.1 评估方法（待执行）
+### 8.1 评估方法（待执行）
 
 1. 准备 20 句字幕样本（下表中英各半，含专有名词/口语/长句）；
 2. 用 `RemoteOpenAiProvider`（DeepSeek `deepseek-chat` 或本地 llama-server）批量翻译；
 3. 记录：总耗时、每批（20 条）请求数、token 用量、失败/漏译数、抽样人工质量评分（1–5）；
 4. 对照：`MockProvider` 仅验证管线正确性，不代表质量。
 
-### 7.2 样本（20 句，中→英 / 英→中的评估输入）
+### 8.2 样本（20 句，中→英 / 英→中的评估输入）
 
 | # | 源文 | 目标 | 期望观察点 |
 |---|---|---|---|
@@ -309,7 +426,7 @@ service.cancel(id)?;
 | 19 | Turn left at the next intersection. | zh | 导航短句 |
 | 20 | I can't believe we made it on time. | zh | 情绪/口语 |
 
-### 7.3 待填结果（真机后补）
+### 8.3 待填结果（真机后补）
 
 | 模型/端点 | 20 句总耗时 | 漏译 | 平均质量(1–5) | 备注 |
 |---|---|---|---|---|
@@ -321,7 +438,7 @@ service.cancel(id)?;
 
 ---
 
-## 8. 限制与后续
+## 9. 限制与后续
 
 1. **未接真模型**：单测全部 mock（HTTP/伪造 ffmpeg、whisper-cli 脚本）；真机质量/性能未测（§7）。
 2. **远端 ASR 未实现**：OpenAI 兼容 `/audio/transcriptions` 待 P2 补齐；当前 ASR 只有本地 whisper.cpp。
@@ -335,11 +452,12 @@ service.cancel(id)?;
 
 ---
 
-## 9. 验收 / 测试
+## 10. 验收 / 测试
 
 ```bash
-cargo test -p wp-ai                 # 51 单测 + 4 doc test（本地 mock HTTP/伪造进程，不联网）
-cargo test -p wp-ai --all-features  # 67 单测（+ 本地 LLM mock HTTP / 伪造 whisper-cli）
+cargo test -p wp-ai                 # 65 单测 + 5 doc test（本地 mock HTTP/伪造进程，不联网）
+cargo test -p wp-ai --all-features  # 81 单测（+ 本地 LLM mock HTTP / 伪造 whisper-cli）
+cargo run -p wp-ai --example summarize_srt          # P3 摘要示例（mock，无需 key）
 cargo clippy -p wp-ai --all-features --all-targets  # 0 warning
 ```
 
@@ -347,3 +465,6 @@ cargo clippy -p wp-ai --all-features --all-targets  # 0 warning
 写入文件可被 `wp_subtitle::parse` 回读、缓存命中二次调用、service 事件→ASS 闭环、
 伪造 ffmpeg 成功/参数正确/缺 CLI(NotFound)/非零退出含 stderr/超时 kill/无输出报错/缺输入、
 真实 ffmpeg 端到端（有 ffmpeg 时跑，没有则跳过）。
+P3 摘要新增 14 项：窗口切分/条数上限、5–10 分钟 clamp、JSON 围栏/字段别名/字符串时间戳容错、
+纯文本回退、Provider 失败降级（标题=首句）、时间轴合法化、缓存命中/语言失效/指纹失效、
+空字幕零调用、跨小时绝对时间、Markdown 渲染、空 JSON 章节兜底、JSON 往返与 find_chapter。
