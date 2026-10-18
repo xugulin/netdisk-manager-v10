@@ -387,6 +387,8 @@ crates/
 - **Rust 侧不依赖 bindgen/clang**：bindings 预生成并提交，CI 校验与 pinned 头文件一致；构建只需要链接 `libmpv`（vendored 路径或系统 `pkg-config` 可选）。
 - **系统库兼容**：cargo feature `system-mpv`（Linux 发行版自带 libmpv）与默认 `vendored-mpv`（我们构建，版本可控）二选一；两者 ABI 需匹配 pin 版本（声明最低/最高版本检测）。
 - **许可证合规**：动态链接 LGPL libmpv；发行包含 `LICENSE.LGPL`、依赖许可清单、源码获取说明（可提供 vendor 源码包/补丁）；不静态链接 LGPL 库；MPV_GPL 构建可选但单独标注。
+  - ⚠️ **FFmpeg 构建类型决定整包许可**：发行版 Arch 的 FFmpeg 9.0 是 **GPLv3 构建**（`--enable-gpl --enable-version3`），若 libmpv 动态链接它并随包分发，组合体有 GPL 传染风险 → **发行版运行时必须用自建 LGPL FFmpeg**（`--disable-gpl --disable-version3 --disable-nonfree`）重链 libmpv；系统依赖模式仅限用户自行安装（不随包）。
+  - 自包含运行时（`播放器运行时/lib/` 打包 FFmpeg/libass/libplacebo/libbluray/libmujs 等 `.so`）同样要求这些库为 LGPL/ISC/MIT 构建；打包脚本须校验 `ldd` 结果中无 GPL-only 组件。详见 [PLAYER_PACKAGING.md](PLAYER_PACKAGING.md)。
 - **可复现构建**：固定工具链（Rust stable + MSYS2 包版本）、CI 产出 Linux/Windows 播放器运行时包；record 构建日志哈希。
 
 ### 9.2 为什么自研 Rust 封装而不是 crate

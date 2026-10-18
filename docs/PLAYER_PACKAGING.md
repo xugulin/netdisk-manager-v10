@@ -1,0 +1,425 @@
+# 播放器运行时打包与 LGPL 合规（M6）
+
+> 状态：**Linux 系统依赖模式已落地并本机实测生成**；Windows 为结构级脚本 + 文档（本机无 Windows，
+> PE/DLL 递归依赖需 Windows 构建机复核）；自包含模式已实现脚本路径、待 LGPL 依赖构建后启用。
+>
+> 关联：任务 task-16（M6 打包合规）；构建来源 [build-media-stack-linux.sh](../scripts/build-media-stack-linux.sh)、
+> [build-media-stack-windows.ps1](../scripts/build-media-stack-windows.ps1)；
+> Windows 渲染路线 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md)；
+> libmpv 加载逻辑 `crates/wp-media-mpv/src/lib.rs`（`library_candidates()`）。
+
+---
+
+## 0. TL;DR
+
+| 项 | 现状 |
+|---|---|
+| Linux 运行时打包 | ✅ `scripts/package-player-runtime-linux.sh` 实测通过（sha256/readelf/ldd/许可证全绿） |
+| Linux 依赖模式 | **系统依赖模式（system-deps）**：发行包只带 LGPL libmpv；FFmpeg/libass/libplacebo 等由用户系统提供，脚本输出 139 个 Arch 包名清单 |
+| 自包含模式 | 脚本已实现（拷依赖 .so + `patchelf --set-rpath '$ORIGIN'`）；当前 prebuilt 无语义依赖库 → **明确报错**，待 LGPL FFmpeg 等构建后启用 |
+| Windows 打包 | 结构级脚本 `scripts/package-player-runtime-windows.ps1`（DLL/ANGLE/许可证/加载顺序校验，不下载 DLL） |
+| 许可材料 | ✅ `assets/licenses/`（10 份许可证文本 + 来源说明），打包脚本自动随包 |
+| LGPL 合规 | 动态链接 + 可替换 + 源码获取说明 + 许可证随包；GPL 可选构建单独说明（§6） |
+
+**一键生成 Linux 运行时**：
+
+```bash
+./scripts/package-player-runtime-linux.sh            # → ./播放器运行时/（gitignore）
+./scripts/package-player-runtime-linux.sh --verify-only
+./scripts/build-linux.sh --portable                 # 自动拷入 出/网盘管理-linux-x64/
+```
+
+---
+
+## 1. 运行时来源（vendored build）
+
+播放器内核不用系统 `libmpv`，而是**固定版本 + LGPL 构建**后随包（源码可控要求）：
+
+* 构建脚本：`scripts/build-media-stack-linux.sh`（Linux）、`scripts/build-media-stack-windows.ps1`（Windows 骨架）
+* 固定版本：**mpv v0.41.0**，meson 选项 `-Dgpl=false -Dlibmpv=true -Dcplayer=false`
+  → mpv 核心以 **LGPL-2.1+** 发布（不是 GPL）
+* 产物目录：`vendor/prebuilt/<平台>/`
+  * Linux：`lib/libmpv.so.2.5.0`（SONAME `libmpv.so.2`）+ `include/mpv/*.h` + `lib/mpv.pc`
+    + `licenses/{LICENSE.LGPL,LICENSE.GPL,Copyright}` + `BUILDINFO.txt`
+  * Windows：`lib/libmpv-2.dll`（待 Windows 构建机产出）
+* `BUILDINFO.txt` 记录：`built_at / mpv_version / builder / build_type / soname / size_bytes / sha256 /
+  linked_deps（完整 ldd）/ meson summary`——打包脚本以其中的 `sha256` 作为校验基准。
+
+> 为什么不用系统 libmpv：发行版 libmpv 通常是 GPL 构建（`-Dgpl=true`）且版本不可控，既违反
+> 「源码可控」也不满足 LGPL 发行条件。我们只链接**自己构建的 LGPL 版 libmpv**。
+
+---
+
+## 2. Linux 发行结构
+
+### 2.1 目录树（系统依赖模式，默认）
+
+```text
+出/网盘管理-linux-x64/            # scripts/build-linux.sh --portable 产出
+├─ 网盘管理                      # Rust GUI 主程序（动态加载 libmpv）
+├─ wp-cli                        # 命令行工具
+├─ portable                      # 绿色版标记（数据写 exe 旁）
+├─ docs/  README.md
+├─ 图标/
+└─ 播放器运行时/                 # ← scripts/package-player-runtime-linux.sh 生成
+   ├─ lib/
+   │  ├─ libmpv.so.2.5.0         # 我们构建的 LGPL libmpv（3.4MB）
+   │  ├─ libmpv.so.2 -> libmpv.so.2.5.0
+   │  └─ libmpv.so -> libmpv.so.2
+   ├─ LICENSES/
+   │  ├─ LGPL-2.1.txt  GPL-2.0.txt  mpv-Copyright.txt
+   │  ├─ libass-ISC.txt  FFmpeg-LGPL-2.1.txt  libplacebo-LGPL-2.1.txt
+   │  ├─ libbluray-LGPL-2.1.txt  libaacs-LGPL-2.1.txt  libbdplus-LGPL-2.1.txt
+   │  ├─ ANGLE-BSD-3-Clause.txt
+   │  └─ README.md               # 每份许可证对应的组件/来源
+   ├─ BUILDINFO.txt              # 打包信息 + sha256/SONAME/ldd + 源构建信息 + 许可证校验和
+   ├─ DEPENDENCIES.txt           # 系统依赖清单：soname → 路径 → 发行版包 → 类别
+   ├─ README.txt                 # 运行/替换/依赖说明
+   └─ 源码获取说明.txt            # LGPL 源码获取方式（合规必需）
+```
+
+`make` / 打包脚本没有构建 `include/` 时，运行包只有 `lib/`（发行不需要头文件）；
+`--with-headers` 会额外附带头文件与 `mpv.pc`（仅开发联调用）。
+
+### 2.2 系统依赖模式（默认，当前可发布）
+
+当前 `libmpv.so.2.5.0` 是**动态链接系统库**的构建（`ldd` 见 BUILDINFO），
+因此发行包**不随附** FFmpeg/libass/libplacebo/libmujs 等，目标机器必须已安装它们。
+打包脚本自动生成 `DEPENDENCIES.txt`：
+
+| 列 | 含义 |
+|---|---|
+| soname | 依赖的共享库 SONAME（如 `libass.so.9`） |
+| 系统路径 | 本机 ldd 解析出的实际路径 |
+| 所属发行版包 | 用 `pacman -Qo`（Arch）或 `dpkg -S`（Debian）反查包名+版本；基础库标记「系统基础」 |
+| 类别 | 系统基础（glibc/GCC 运行时）/ 需要安装 / 第三方（未能映射到包） |
+
+末尾自动汇总**去重后的发行版包清单**与安装建议：
+
+```text
+# ── 需要安装的发行版包（去重；Arch 可用）──
+  - ffmpeg libass libplacebo libbluray ...
+#   Arch:  sudo pacman -S --needed <上面列出的包>
+#   Debian/Ubuntu: sudo apt install <对应运行库包>（soname→包名映射不同）
+```
+
+真机实测（本机 Arch，FFmpeg 9.0.2 / libass 0.17.5 / libplacebo 7.360.1）：
+
+* 依赖 191 项（含 glibc 基础库），全部可解析；去重后 **139 个 Arch 包**（其中 `ffmpeg` 覆盖全部
+  libav* 组件，`mesa`/`vulkan-icd-loader`/`libva`/`libvdpau` 覆盖 GPU 硬解路径）；
+* 硬件解码另需目标机器安装对应 GPU 驱动（Mesa / NVIDIA 私有驱动），脚本不强制、文档说明；
+* Wayland/X11 运行时库在依赖清单内（libwayland*、libxcb*、libx11 等）。
+
+### 2.3 自包含模式（后续，脚本已实现路径）
+
+目标：发行包自带全部依赖 `.so`，目标机器零安装。做法：
+
+1. 用 **LGPL 构建的 FFmpeg/libass/libplacebo/libbluray/libmujs** 等重构建 libmpv
+   （或静态链接进 libmpv；注意 LGPL 静态链接需提供可重链接的目标文件，见 §4.7）；
+2. 把依赖 `.so` 放进 `vendor/prebuilt/linux-x86_64/lib/`（或 `--deps-dir` 指定目录）；
+3. 运行打包脚本自包含模式：
+
+```bash
+./scripts/package-player-runtime-linux.sh --self-contained
+# 或： --self-contained --deps-dir /path/to/lgpl-deps/lib
+```
+
+脚本会：拷贝依赖到 `播放器运行时/lib/` → `patchelf --set-rpath '$ORIGIN'`（每库，需安装 patchelf）
+→ 用 `LD_LIBRARY_PATH=lib/ ldd` 校验无缺失 → 写入 BUILDINFO 的 `package_mode: self-contained`。
+
+**当前状态**：AUR prebuilt 只有 libmpv 本体、依赖系统库，因此 `--self-contained` 会明确报错：
+
+```text
+✗ 自包含模式失败：prebuilt/lib 与 --deps-dir 均未提供依赖 .so（当前构建动态链接系统库）。
+  后续做法见 docs/PLAYER_PACKAGING.md §2.3：用 LGPL 构建的 FFmpeg/libass/libplacebo 等
+  （或静态链接）重构建 libmpv，把依赖 .so 放到 prebuilt/lib/ 后重跑 --self-contained。
+```
+
+> 这是**有意的失败**：宁可明确拒绝，也不生成一个「看起来自包含、实际缺库」的发行包。
+
+### 2.4 与 `scripts/build-linux.sh` 的对接
+
+`build-linux.sh --portable` 已有逻辑：若仓库根存在 `播放器运行时/`，整目录拷入
+`出/网盘管理-linux-x64/播放器运行时/`（见该脚本 :68-72）。因此标准发布流程：
+
+```bash
+./scripts/build-media-stack-linux.sh          # 可选：重建 vendor/prebuilt（已有产物可跳过）
+./scripts/package-player-runtime-linux.sh     # 生成 ./播放器运行时（=可发布的运行时）
+./scripts/build-linux.sh --portable           # 构建并把运行时拷进便携目录
+./scripts/package-player-runtime-linux.sh --verify-only   # 复核（也可对便携目录 --out 校验）
+```
+
+### 2.5 libmpv 加载顺序（决定「随包运行时」何时生效）
+
+`wp-media-mpv::library_candidates()` 的候选顺序（Linux）：
+
+1. 环境变量 `WP_MPV_LIB`（调试/自定义构建优先）；
+2. **系统库** `/usr/lib/libmpv.so.2`、`/usr/local/lib/...`、多架构目录；
+3. 可执行文件同级 `播放器运行时/libmpv.so.2`、`播放器运行时/lib/libmpv.so.2`；
+4. 可执行文件同级 `libmpv.so.2`。
+
+⚠️ 注意：**系统库优先于随包运行时**。因此：
+
+* 干净目标机器（无系统 libmpv）→ 使用随包 `播放器运行时/lib/libmpv.so.2` ✅
+* 开发机（已装系统 libmpv）→ 默认用系统库；要验证随包产物请显式指定：
+  ```bash
+  WP_MPV_LIB=./出/网盘管理-linux-x64/播放器运行时/lib/libmpv.so.2 ./出/网盘管理-linux-x64/网盘管理
+  ```
+* 也可据此实现「用户自选运行时」：改 `WP_MPV_LIB` 即可替换，无需重编译（LGPL 可替换性要求，见 §4.5）。
+
+---
+
+## 3. Windows 发行结构（结构级）
+
+### 3.1 目录树
+
+```text
+出/网盘管理-win64/
+├─ 网盘管理.exe
+├─ wp-cli.exe
+├─ portable
+├─ docs/  README.md
+└─ 播放器运行时/
+   ├─ libmpv-2.dll              # 我们 vendored 的 LGPL libmpv（带 OpenGL render API）
+   ├─ libass-*.dll  libavcodec-*.dll  libavformat-*.dll  libavutil-*.dll
+   ├─ libavfilter-*.dll  libswresample-*.dll  libswscale-*.dll  libavdevice-*.dll
+   ├─ libplacebo-*.dll  libbluray-*.dll  libluajit-*.dll  libwinpthread-1.dll …
+   ├─ libEGL.dll  libGLESv2.dll  # ANGLE（BSD-3-Clause）；d3dcompiler_47.dll 可选
+   ├─ LICENSES/…                # 同 Linux（含 ANGLE-BSD-3-Clause.txt）
+   ├─ BUILDINFO.txt
+   ├─ DEPENDENCIES.txt          # 必需/可选 DLL 清单 + 来源
+   ├─ LOAD-ORDER.txt            # DLL 搜索顺序 + 发布前检查
+   └─ README.txt
+```
+
+DLL 来源：
+1. `libmpv-2.dll` 与 FFmpeg/libass/libplacebo 等：MSYS2 UCRT64 下按
+   [build-media-stack-windows.ps1](../scripts/build-media-stack-windows.ps1) 构建/收集，放入
+   `vendor/prebuilt/windows-x86_64/lib/`；
+2. ANGLE `libEGL.dll`/`libGLESv2.dll`：优先取 **mpv 官方 Windows 发行包**自带的 ANGLE（与 libmpv
+   同源、版本匹配），或自行从 Google ANGLE 源码构建；不建议从 Chromium/Edge 抠（版本不确定）。
+   放 `vendor/prebuilt/windows-x86_64/angle/`，打包脚本会一并复制。
+
+### 3.2 DLL 加载顺序（关键）
+
+* 应用侧（`wp-media-mpv`）：先找 exe 同级 `播放器运行时\libmpv-2.dll`、`播放器运行时\lib\libmpv-2.dll`、
+  再找 exe 同级；支持 `WP_MPV_LIB` 覆盖。**libmpv 必须与自己依赖的 DLL 同目录**（或都在搜索路径内）。
+* libmpv 加载依赖 DLL 时，Windows 默认只搜「exe 目录 + System32 + PATH」，**不会自动搜
+  `播放器运行时\` 子目录** → 应用启动时必须把该目录注册进进程搜索路径：
+  * 推荐：`SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)` +
+    `AddDllDirectory(<exe>\播放器运行时)`（进程级、不污染全局 PATH）；
+  * 不要用 `SetDllDirectory`（全局、会覆盖 exe 目录语义）或改用户 PATH（污染环境）。
+* ANGLE 的 `libEGL.dll`/`libGLESv2.dll` 同样通过上述目录注册后加载（应用创建 GL 上下文前）。
+* 细节与渲染链路见 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md)。
+
+### 3.3 结构级脚本用法（本机无 Windows，只做结构/清单校验）
+
+```powershell
+# 只校验（默认；缺必需 DLL 时 Errors>0，Strict 模式退出码 1）
+powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-windows.ps1 -Check
+
+# 生成目录骨架 + LICENSES + 清单 + 加载顺序说明（开发机无 DLL 也可跑，缺 DLL 只警告）
+powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-windows.ps1 -Generate
+
+# 生成到便携目录并严格校验
+powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-windows.ps1 -Generate `
+    -RuntimeDir "出\网盘管理-win64\播放器运行时" -PrebuiltDir "vendor\prebuilt\windows-x86_64"
+```
+
+脚本职责：必需/可选 DLL 清单检查（通配符）、LICENSES 完整性、LOAD-ORDER/README/BUILDINFO 存在性、
+与 exe 同级布局提示；**不联网下载 DLL、不构建**。PE 架构、签名、递归依赖仍需在 Windows 构建机用
+`ntldd -R libmpv-2.dll`（MSYS2）或 [Dependencies.exe](https://github.com/lucasg/Dependencies) 复核。
+
+### 3.4 Windows 待实测项（沿用 ANGLE 文档清单）
+
+W1 GL 上下文类型为 EGL/ANGLE；W2 render API 出帧；W3 `hwdec-current=d3d11va`；
+W4 4K HEVC 10bit 性能（丢帧<0.5%）；W5 HDR 行为记录；W6 无 ANGLE 可回退 WGL；W7 干净 Win10/11 可启动播放。
+详见 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md) §5。
+
+---
+
+## 4. LGPL 合规义务（重点）
+
+我们发行的 `播放器运行时/` 中，**libmpv 是 LGPL-2.1+ 的库**（`-Dgpl=false` 构建）。
+LGPL 允许闭源程序动态链接它，但必须满足以下义务：
+
+### 4.1 动态链接 + 可替换
+
+* libmpv 以**动态库**（`libmpv.so.2` / `libmpv-2.dll`）随包，不被静态链接进 `网盘管理` 可执行文件；
+* 用户必须能**替换**该库：应用运行时动态加载（`libloading` + `WP_MPV_LIB` / 目录候选），
+  用户放一个 ABI 兼容（client API 2.x）的 libmpv 即可替换，无需重编译本程序；
+* 加载失败的候选会继续尝试下一个，缺库时给可读错误（不 panic）；
+* `README.txt` / `源码获取说明.txt` 中写明替换方法。
+
+### 4.2 对应源码提供（LGPL-2.1 §6 / GPL §3 精神）
+
+发行包必须让接收者能获得**对应源码**。本仓库做法（`播放器运行时/源码获取说明.txt` 自动生成）：
+
+* mpv 源码：`https://github.com/mpv-player/mpv/archive/refs/tags/v0.41.0.tar.gz`（固定 tag）；
+* 构建脚本：`scripts/build-media-stack-linux.sh`（meson 参数完整可复现）；
+* 对 mpv 的修改：**无**（直接上游源码构建；`vendor/glutin-winit` 的补丁属 Windows 窗口层 crate，
+  不进入 libmpv 产物，但其源码随仓库提供）；
+* 动态链接依赖（system-deps 模式不随包分发）：各库上游源码地址 + 构建机版本记录在说明文件；
+* 建议在发行页/README 提供**书面承诺**：「本发行包所含 LGPL 组件的对应源码可向发行方索取，
+  有效期 3 年」—— 至少保证上述 URL 长期可达。
+
+### 4.3 许可证文本与版权声明随包
+
+* `LICENSES/` 必含：LGPL-2.1、GPL-2.0（可选构建参考）、mpv Copyright、libass ISC、FFmpeg LGPL、
+  libplacebo LGPL、libbluray/libaacs/libbdplus LGPL、ANGLE BSD-3；
+* 每份文本在 `LICENSES/README.md` 注明对应组件与来源 URL；
+* 打包脚本校验 `LICENSES/` 完整性（缺一份即失败）；`BUILDINFO.txt` 记录各许可证 sha256。
+
+### 4.4 修改声明
+
+* 若自行 patch 了 mpv/FFmpeg 等 LGPL 组件：必须在发行说明中声明修改、并随源码提供 patch；
+* 当前 libmpv **无 patch**（`BUILDINFO.build_type` 可证：stock upstream + `-Dgpl=false`）；
+* 若未来 patch，则同步更新 `scripts/build-media-stack-*.sh` 与 `源码获取说明.txt`。
+
+### 4.5 用户可替换性验证（发布前手工做一次）
+
+```bash
+# 干净机器（无系统 libmpv）或强制指定：
+WP_MPV_LIB=./播放器运行时/lib/libmpv.so.2 ./网盘管理 --demo
+# 用系统/另一份 libmpv 替换：
+WP_MPV_LIB=/usr/lib/libmpv.so.2 ./网盘管理 --demo      # 应能启动（版本兼容时）
+# 删除运行时 → 应给可读错误（缺少 libmpv），而不是崩溃
+```
+
+### 4.6 禁止事项
+
+* ❌ 静态链接 LGPL libmpv 进闭源可执行文件而不提供可重链接目标文件；
+* ❌ 去掉/隐藏许可证文本、修改 libmpv 后不声明；
+* ❌ 用 GPL 构建的 libmpv（`-Dgpl=true`）随闭源程序分发（若要用 GPL 构建，见 §6，整体按 GPL 处理）。
+
+### 4.7 若未来走静态链接
+
+静态链接 LGPL 库需满足 LGPL-2.1 §6(a)：「提供目标文件/链接脚本，使接收者能修改库后重新链接」，
+或改用自包含的**动态** `.so` 随包方案（§2.3，首选）。
+
+---
+
+## 5. FFmpeg / 依赖的 GPL 风险（发行必读）
+
+**事实（本机实测）**：Arch Linux 的 `ffmpeg 2:9.0.2` 是 **GPLv3 构建**：
+
+```console
+$ ffmpeg -version | head -1
+ffmpeg version n9.0.2 ...
+$ ffmpeg -L | head -3
+ffmpeg is free software; ... GNU General Public License ... version 3
+$ ffmpeg -buildconf | grep -E "enable-(gpl|version3)"
+  --enable-gpl
+  --enable-version3
+```
+
+含义与对策：
+
+| 场景 | 合规判断 |
+|---|---|
+| **system-deps 模式（当前）**：我们只分发「应用 + LGPL libmpv」，**不分发 FFmpeg**；用户系统里的 GPL FFmpeg 由用户自行安装/使用 | 发行包本身不含 GPL 代码；libmpv 动态加载用户系统的 FFmpeg 属于「用户组合」，我们不做 GPL 声明义务。**这是当前可发布形态** |
+| **自包含模式（未来）**：若把 ffmpeg 的 `.so` 打进发行包 | **必须换成 LGPL 构建的 FFmpeg**（`--disable-gpl`，或 `--enable-lgpl` 等价配置），否则整个组合按 GPLv3 分发，需履行 GPL 全部义务（源码、许可证、可再分发条款），与「闭源主程序」冲突 |
+| **GPL 可选版**：故意提供 GPL 构建的整包 | 单独的 GPL 发行渠道，随包 LICENSE.GPL + 对应源码；不得与闭源版混发 |
+
+因此：
+
+* `package-player-runtime-linux.sh` 的**自包含模式**在正式发行前，必须先确认依赖库全为 LGPL/兼容许可；
+  脚本会把 `ldd` 结果列入 `DEPENDENCIES.txt` 供审计；
+* 官方发布检查清单（§7）要求：核对 `BUILDINFO.build_type` + 依赖清单中每个库的许可证；
+* 文档中 `FFmpeg-LGPL-2.1.txt` 是为「LGPL 构建的 FFmpeg」准备的文本 —— 若发行方用 GPL FFmpeg，
+  应改为 GPL-3.0 文本并按 §6 处理。
+
+---
+
+## 6. GPL 构建可选说明
+
+mpv 支持 `-Dgpl=true`（引入 GPL-only 组件，例如部分蓝光/DVD 相关功能）。本项目默认使用
+`-Dgpl=false`（LGPL）构建。若某发行版希望启用 GPL-only 特性：
+
+1. 用 `-Dgpl=true` 重新构建 libmpv，产物按 **GPL-2.0+** 分发；
+2. 该发行版整体（应用 + libmpv）必须按 **GPL** 兼容方式分发：随包 `LICENSE.GPL`、提供完整对应源码、
+   允许再分发与修改；
+3. 不能与 LGPL 发行版共用一个下载页/安装包而不加区分；
+4. 我们的 `vendor/prebuilt/` 只保留 LGPL 构建；GPL 构建应放独立目录（如
+   `vendor/prebuilt/linux-x86_64-gpl/`）并在 BUILDINFO 标注 `build_type: ... -Dgpl=true`；
+5. 现有脚本预留：`build-media-stack-linux.sh` 可通过传入自定义 meson 参数扩展（当前默认 `-Dgpl=false`）。
+
+> 结论：**默认发行 = LGPL**；GPL 版本仅作为可选、单独分发。
+
+---
+
+## 7. 发布前验证清单
+
+### 7.1 Linux（脚本自动 + 人工复核）
+
+自动化（`package-player-runtime-linux.sh` 每次运行/`--verify-only` 都执行）：
+
+- [x] `lib/libmpv.so.2.5.0` 存在且为 ELF 64-bit x86-64
+- [x] **sha256 与 `vendor/prebuilt/.../BUILDINFO.txt` 一致**
+- [x] `readelf -d` SONAME = `libmpv.so.2`（ABI 正确）
+- [x] 符号链接 `libmpv.so.2`、`libmpv.so` 正确
+- [x] `ldd` 无缺失依赖（system-deps 模式要求构建机全可解析；目标机按 DEPENDENCIES.txt 安装）
+- [x] `LICENSES/` 10 份必需文本齐全
+- [x] `源码获取说明.txt` 存在（LGPL 合规）
+- [x] `DEPENDENCIES.txt` 存在
+
+人工（发布前一次）：
+
+- [ ] 干净 Linux（无系统 libmpv）解压即用：启动 → 播放本地 4K 视频 → 拖进度条 → 字幕/音轨切换
+- [ ] `WP_MPV_LIB` 显式指定随包运行时生效（验证加载顺序）
+- [ ] 删除 `播放器运行时/` → 启动给可读错误而非崩溃
+- [ ] `DEPENDENCIES.txt` 包清单在一台干净机 `pacman -S --needed` 后播放正常（Arch 实机）
+- [ ] 发行页挂出「源码获取」说明（或书面承诺）
+- [ ] `LICENSES/` 文本与 `BUILDINFO` 校验和一致（脚本已记录）
+- [ ] 若用自包含模式：依赖库许可证审计为 LGPL/兼容（§5）
+
+### 7.2 Windows
+
+- [ ] `package-player-runtime-windows.ps1 -Check -Strict` 全绿（必需 DLL/许可证/清单）
+- [ ] `ntldd -R libmpv-2.dll` 递归依赖齐全（与 `DEPENDENCIES.txt` 一致）
+- [ ] 干净 Win10/11：启动 → 内嵌播放 1080p/4K → ANGLE 生效（W1/W2）
+- [ ] 硬解 `d3d11va` 生效（W3）；4K HEVC 10bit 性能达标（W4）
+- [ ] 无 ANGLE 回退 WGL 不崩溃（W6）
+- [ ] 删除 `libmpv-2.dll` → 可读错误；删除 `播放器运行时/` → 同
+- [ ] `LICENSES/` 含 ANGLE BSD-3 文本；发行页挂源码获取说明
+
+---
+
+## 8. 脚本速查
+
+| 脚本 | 作用 | 备注 |
+|---|---|---|
+| `scripts/build-media-stack-linux.sh` | 构建 LGPL libmpv → `vendor/prebuilt/linux-x86_64/` | 需 meson/ninja/FFmpeg 等构建依赖 |
+| `scripts/build-media-stack-windows.ps1` | Windows 构建骨架（MSYS2 UCRT64） | 文档级，未实测 |
+| `scripts/package-player-runtime-linux.sh` | **运行时打包/校验**（系统依赖/自包含） | 默认 `--system-deps`；`--verify-only` |
+| `scripts/package-player-runtime-windows.ps1` | Windows 运行时结构级生成/校验 | 不下载 DLL；PE 校验需 Windows |
+| `scripts/build-linux.sh --portable` | 构建便携目录并自动拷入 `播放器运行时/` | 已对接 |
+| `scripts/build-windows.ps1 -Portable` | 构建 Windows 便携目录 | 需手工/GUI 拷运行时（后续可对接） |
+
+常用命令：
+
+```bash
+# Linux
+./scripts/package-player-runtime-linux.sh                 # 生成 ./播放器运行时
+./scripts/package-player-runtime-linux.sh --verify-only   # 校验
+./scripts/package-player-runtime-linux.sh --with-headers  # 附带头文件（开发）
+./scripts/build-linux.sh --portable                      # 打包到 出/
+
+# Windows（在 Windows PowerShell 中）
+powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-windows.ps1 -Check -Strict
+powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-windows.ps1 -Generate
+```
+
+---
+
+## 9. 已知限制与后续
+
+| # | 项 | 说明 / 后续 |
+|---|---|---|
+| P1 | Linux 自包含模式未启用 | 需 LGPL 构建的 FFmpeg 等依赖（或静态链接 + 目标文件）；脚本路径已就绪 |
+| P2 | Windows 全链路未实测 | 本机无 Windows；结构级脚本已备，PE/ntldd/ANGLE 验证待 Windows 机器（M0-Win 清单） |
+| P3 | 系统依赖版本漂移 | system-deps 依赖用户发行版版本；DEPENDENCIES.txt 记录构建机版本，发行说明注明「Linux x86_64 + 常见发行版」 |
+| P4 | FFmpeg GPL 构建 | 见 §5；自包含发行前必须换 LGPL FFmpeg 并更新 `FFmpeg-LGPL-2.1.txt`/审计 |
+| P5 | 字体/编解码器 | 字幕字体走系统字体目录；某些私有编码（如 H.266）依赖系统 FFmpeg 能力，不额外打包 |
+| P6 | Windows 便携目录对接 | `build-windows.ps1 -Portable` 尚未自动拷贝 `播放器运行时\`（可在 Windows 侧补一行） |
+| P7 | 运行时体积 | 当前 3.6MB（仅 libmpv）；自包含模式预计 80–150MB（FFmpeg 全家桶），需评估分发方式 |
