@@ -234,6 +234,8 @@ pub enum PlayerAction {
     SwitchPanel(PlayerPanel),
     /// 选择外挂字幕文件（复用内置 FilePicker）。
     PickSubtitleFile,
+    /// 网盘播放终态（熔断/错误）重试：丢弃旧会话 → 重新取链（仅用户点击触发）。
+    RetryRemote,
     Toast(ToastKind, String),
 }
 
@@ -414,6 +416,15 @@ impl PlayerUi {
         let mut mpv_cfg = MpvConfig::default();
         // UI 自带控制条/时间码：关闭 mpv 自己的 OSD（否则播放页会叠一层 mpv 时间/文件名）
         mpv_cfg.extra_options.push("osd-level=0".into());
+        // 网络源（HLS 直连 / 代理流）缓存调优：统一注入（本地文件不受影响）。
+        // resolve 阶段已知 is_hls，但 mpv 选项在引擎初始化时一次性设置最简单；两类源均受益。
+        for opt in [
+            "cache=yes",
+            "demuxer-max-bytes=128MiB",
+            "demuxer-readahead-secs=30",
+        ] {
+            mpv_cfg.extra_options.push(opt.into());
+        }
         if std::env::var("WP_PLAYER_AO_NULL").is_ok() {
             mpv_cfg.extra_options.push("ao=null".into());
         }
@@ -1047,6 +1058,7 @@ impl App {
                     }
                 );
                 self.close_stream_session();
+                self.player.engine_note = None;
                 self.remote_target = Some(RemotePlayTarget {
                     drive,
                     path,
@@ -1074,6 +1086,7 @@ impl App {
                 }
             }
             Err(err) => {
+                self.player.engine_note = None;
                 let readable = readable_playback_error(&err.to_string());
                 wp_core::log_error!("播放器", "网盘播放源解析失败 {path}：{readable}");
                 self.toast(ToastKind::Error, format!("无法播放网盘文件：{readable}"));
@@ -1087,6 +1100,34 @@ impl App {
             self.stream_proxy.close(&token);
             wp_core::log_info!("播放器", "已关闭代理流会话 token={token}");
         }
+    }
+
+    /// 用户点击「重试」：丢弃旧代理会话 → 全新 `resolve_playback`（新会话自动重置 fatal）。
+    ///
+    /// 仅由 [`PlayerAction::RetryRemote`]（UI 按钮）或验收钩子 `WP_AUTO_RETRY_ONCE` 触发，
+    /// **不做自动重建**；重试后允许 1 次「链接过期自动续播」（`remote_retried` 复位、由续播逻辑再置位）。
+    pub fn retry_remote_playback(&mut self) {
+        let Some(target) = self.remote_target.clone() else {
+            self.toast(ToastKind::Warn, "没有可重试的网盘播放源（请重新打开文件）");
+            return;
+        };
+        // 丢弃旧会话：fatal 会话已停上游请求，close 释放 token 与预读线程
+        self.close_stream_session();
+        // 全新会话 = 重置重试/熔断展示状态；续播时由 on_remote_play_resolved 再置 remote_retried=true
+        self.remote_retried = false;
+        self.proxy_hint_shown = false;
+        self.player.proxy_diag = None;
+        self.player.fatal_hint = None;
+        self.player.error = None;
+        self.player.engine_note = Some("正在重新取链（新会话）…".into());
+        wp_core::log_info!("播放器", "用户重试：重新解析网盘播放源 {}", target.label);
+        self.toast(ToastKind::Info, format!("重试取链：{}", target.label));
+        self.start_remote_resolve(
+            target.drive,
+            target.path,
+            target.resume_at,
+            Some(target.label),
+        );
     }
 
     /// 应用 `--seek-ms`（验收用；等首帧后再 seek）。
@@ -1276,6 +1317,7 @@ impl App {
             PlayerAction::OpenLocalFile => self.open_local_media_picker(),
             PlayerAction::OpenSelectedRemote => self.open_selected_media(),
             PlayerAction::OpenDemo => self.open_player_demo(),
+            PlayerAction::RetryRemote => self.retry_remote_playback(),
             PlayerAction::CloseMedia => {
                 self.player.set_fullscreen(false, self.ctx.as_ref());
                 self.close_stream_session();
@@ -1528,7 +1570,7 @@ fn show_stage(
     ui.add_space(4.0);
     show_controls(player, ui, t, actions);
     if !fullscreen {
-        show_status_line(player, ui, t);
+        show_status_line(player, ui, t, actions);
     }
 }
 
@@ -1667,7 +1709,20 @@ fn show_controls(player: &PlayerUi, ui: &mut Ui, t: &Theme, actions: &mut Vec<Pl
         });
 }
 
-fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme) {
+/// 网盘播放终态（熔断/错误）时的「重试」按钮：仅用户点击触发重建会话。
+fn retry_button(player: &PlayerUi, ui: &mut Ui, t: &Theme, actions: &mut Vec<PlayerAction>) {
+    if player.network.is_none() && player.fatal_hint.is_none() {
+        return;
+    }
+    if widgets::secondary_button(ui, t, "🔄 重试")
+        .on_hover_text("丢弃当前网盘会话并重新取链（新会话会重置熔断/错误状态）")
+        .clicked()
+    {
+        actions.push(PlayerAction::RetryRemote);
+    }
+}
+
+fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme, actions: &mut Vec<PlayerAction>) {
     ui.horizontal(|ui| {
         let (label, color) = overlay::state_style(player.snapshot.state, t);
         ui.label(RichText::new(format!("● {label}")).size(11.0).color(color));
@@ -1683,6 +1738,10 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme) {
             status_kv(ui, t, "链路", &network.mode);
         }
         if let Some(diag) = &player.proxy_diag {
+            // 熔断/错误终态：把「重试」放在最前，避免长错误文案把它挤出可视区
+            if diag.fatal || player.fatal_hint.is_some() {
+                retry_button(player, ui, t, actions);
+            }
             // 区分「磁盘缓存命中」与「本会话真实下载」：buffered 含旧缓存，downloaded 只算本次
             status_kv(
                 ui,
@@ -1698,30 +1757,29 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme) {
                 status_kv(ui, t, "弱网", "自适应预读已降窗");
             }
             if diag.fatal {
-                ui.label(
-                    RichText::new(format!(
-                        "⛔ 上游熔断：{}（连续失败 {} 块）",
-                        diag.fatal_reason, diag.consecutive_failures
-                    ))
-                    .size(10.5)
-                    .color(t.error),
-                )
-                .on_hover_text(
-                    "网盘流代理判定为权限类永久错误（如百度 31326/CDN 限制/登录失效）：\n\
-                     已停止后台预读与换链重试，后续请求直接返回可读错误；\n\
-                     请换文件、重新登录，或稍后重试。",
+                let label = format!(
+                    "⛔ 上游熔断：{}（连续失败 {} 块）",
+                    widgets::ellipsis(&diag.fatal_reason, 42),
+                    diag.consecutive_failures
                 );
+                ui.label(RichText::new(label).size(10.5).color(t.error))
+                    .on_hover_text(format!(
+                        "网盘流代理判定为权限类永久错误（如百度 31326/CDN 限制/登录失效）：\n\
+                         已停止后台预读与换链重试，后续请求直接返回可读错误；\n\
+                         请换文件、重新登录，或点「重试」重建会话。\n\n完整原因：{}",
+                        diag.fatal_reason
+                    ));
             } else if let Some((reason, fails)) = &player.fatal_hint {
                 // 粘性熔断提示：重取链/新会话后仍展示，直到切换媒体
-                ui.label(
-                    RichText::new(format!("⛔ 上游熔断：{reason}（连续失败 {fails} 块）"))
-                        .size(10.5)
-                        .color(t.error),
-                )
-                .on_hover_text(
-                    "网盘流代理判定为权限类永久错误（如百度 31326/CDN 限制/登录失效）：\n\
-                     已停止后台预读与换链重试；请换文件、重新登录，或稍后重试。",
+                let label = format!(
+                    "⛔ 上游熔断：{}（连续失败 {fails} 块）",
+                    widgets::ellipsis(reason, 42)
                 );
+                ui.label(RichText::new(label).size(10.5).color(t.error))
+                    .on_hover_text(format!(
+                        "网盘流代理判定为权限类永久错误（如百度 31326/CDN 限制/登录失效）：\n\
+                         已停止后台预读与换链重试；请换文件、重新登录，或点「重试」重建会话。\n\n完整原因：{reason}"
+                    ));
             } else if diag.errors > 0 || diag.restarts > 0 {
                 let text = format!(
                     "上游错误 {} / 换链 {} / 已下载 {}",
@@ -1799,6 +1857,8 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme) {
                     .color(t.error),
             )
             .on_hover_text(err);
+            // 网盘播放的 Error 终态：给「重试」（新会话重新取链）
+            retry_button(player, ui, t, actions);
         }
     });
 }
@@ -2061,6 +2121,18 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn proxy_diag_fatal_is_stalled() {
+        let diag = ProxyDiag {
+            fatal: true,
+            fatal_reason: "上游持续拒绝 HTTP 403（已熔断）".into(),
+            consecutive_failures: 4,
+            ..Default::default()
+        };
+        assert!(diag.is_stalled());
+        assert!(!ProxyDiag::default().is_stalled());
     }
 
     #[test]

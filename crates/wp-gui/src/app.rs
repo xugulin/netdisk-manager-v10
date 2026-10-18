@@ -527,6 +527,8 @@ pub struct App {
     pub pending_seek: Option<f64>,
     /// 网盘流「上游连续失败」可读提示是否已弹（每次打开新媒体重置）
     pub proxy_hint_shown: bool,
+    /// 验收钩子：`WP_AUTO_RETRY_ONCE` 是否已自动模拟过一次「重试」
+    pub auto_retry_done: bool,
     /// 应用 logo 纹理（顶栏 / 关于页；懒加载一次）
     pub logo: Option<egui::TextureHandle>,
     pub guard_new_word: String,
@@ -726,6 +728,7 @@ impl App {
             remote_retried: false,
             pending_seek: None,
             proxy_hint_shown: false,
+            auto_retry_done: false,
             logo: None,
             guard_new_word: String::new(),
             guard_new_instance_word: String::new(),
@@ -1729,6 +1732,7 @@ impl eframe::App for App {
         }
         // 验收模式：媒体打开后阻塞等待（网盘流 demux/解码/预缓冲慢时给首帧时间）
         // 网盘流代理诊断：上游错误/换链计数回填状态行；连续失败且零下载时给可读 toast 一次
+        let mut auto_retry_now = false;
         if let Some(token) = self.stream_token.as_ref() {
             if let Some(stats) = self.stream_proxy.stats(token) {
                 let diag = crate::pages::player::ProxyDiag {
@@ -1746,6 +1750,11 @@ impl eframe::App for App {
                 if diag.fatal {
                     self.player.fatal_hint =
                         Some((diag.fatal_reason.clone(), diag.consecutive_failures));
+                    // 验收钩子：WP_AUTO_RETRY_ONCE=1 时在首次熔断后自动模拟点击一次「重试」
+                    if !self.auto_retry_done && std::env::var("WP_AUTO_RETRY_ONCE").is_ok() {
+                        self.auto_retry_done = true;
+                        auto_retry_now = true;
+                    }
                 }
                 if diag.is_stalled() && !self.proxy_hint_shown {
                     self.proxy_hint_shown = true;
@@ -1768,6 +1777,10 @@ impl eframe::App for App {
                     }
                 }
             }
+        }
+        if auto_retry_now {
+            wp_core::log_info!("播放器", "验收：自动模拟点击「重试」（WP_AUTO_RETRY_ONCE）");
+            self.retry_remote_playback();
         }
 
         if let Some(ms) = self.dev.wait_media_ms {
