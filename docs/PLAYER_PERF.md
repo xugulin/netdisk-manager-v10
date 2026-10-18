@@ -306,6 +306,7 @@ mpv --no-config     --http-header-fields="Cookie: …" --user-agent "…" --refe
 * 观测平均拉流带宽 **< 1.2× 内容码率** → 基本可判定「带宽不足」（本机实测：劣化网络 5 分钟 114 分片，平均 **6.12 Mbps** vs 内容 **14.07 Mbps** → 93 次 >1.5s 卡顿，纯带宽不足，非代理/HLS 服务问题）。
 * GUI 启发式（方案 A，无需新字段）：HLS 直连且连续 `Buffering(0<pct<100)` >8s → 状态行提示「网络带宽可能不足：HLS 约需内容码率 1.5× 带宽（1080p≈12–24Mbps / 4K≈60–150Mbps），正在缓冲…」，恢复 Playing 自动清除。
 * **GUI 已实现（task-28，方案 A）**：`PlayerUi` 记录连续 `Buffering(0<pct<100)` 起点，≥8s 且距最近 seek ≥3s（去抖，HLS 正常 seek 2.2–2.3s 不误报）→ 状态行提示「带宽可能不足（HLS 约需 ≥1.5× 内容码率）」；`Buffering(100)`、seek、切换媒体自动清除；仅在 `PlayerNetwork` 为「HLS 直连」时启用（代理流有 StreamStats，不用此启发式）。
+* **GUI 补洞（task-29）**：劣化网络下 HLS `seek` 可能长时间停在 Opening/Seeking 且 `cache-buffering-state` 不落在 `0<pct<100`（8s 规则覆盖不到）→ 追加「跳转/缓冲超时」启发式：HLS 直连 + 距最近播放进展（位置推进/Playing/FirstFrame/seek 起点）≥10s 且仍 Opening/Seeking/Buffering → 状态行提示「网络较慢（HLS 跳转/缓冲超时）」。两种提示互斥（缓冲提示优先），恢复播放/位置推进/切媒体自动清除。
 * 精确版（方案 B）需要 mpv `cache-speed`（bytes/s）→ 由 wp-media-mpv 发 `CacheState/avg_mbps` 事件，wp-stream 不参与 HLS 直连、不在本 crate 范围。
 
 ---

@@ -119,6 +119,26 @@ pub fn hls_bandwidth_hint_due(
         && last_seek_at.map_or(true, |t| now.saturating_duration_since(t) >= SEEK_DEBOUNCE)
 }
 
+/// HLS 跳转/缓冲超时启发式判定（纯函数，可单测）。
+///
+/// 规则：HLS 直连 + 距最近一次播放进展（位置推进/Playing/FirstFrame/打开或 seek 起点）
+/// ≥10s，且当前仍处于 Opening/Seeking/Buffering。劣化网络下 `cache-buffering-state`
+/// 可能不落在 `0<pct<100`（8s 缓冲规则覆盖不到），本规则兜底提示「网络较慢」。
+pub fn hls_timeout_hint_due(
+    is_hls: bool,
+    last_progress_at: Option<Instant>,
+    state: PlayerState,
+    now: Instant,
+) -> bool {
+    const STALL: Duration = Duration::from_secs(10);
+    is_hls
+        && last_progress_at.is_some_and(|t| now.saturating_duration_since(t) >= STALL)
+        && matches!(
+            state,
+            PlayerState::Opening | PlayerState::Seeking | PlayerState::Buffering
+        )
+}
+
 /// 当前网盘播放目标（链接过期时重新取链 + 续播用）。
 #[derive(Debug, Clone)]
 pub struct RemotePlayTarget {
@@ -346,6 +366,10 @@ pub struct PlayerUi {
     buffering_event_since: Option<Instant>,
     /// 最近一次 seek 时间（去抖：seek 后 3s 内不判带宽不足）
     pub last_seek_at: Option<Instant>,
+    /// 最近一次播放进展（位置推进 / Playing / FirstFrame / 打开或 seek 起点）
+    last_progress_at: Option<Instant>,
+    /// HLS 跳转/缓冲超时提示（≥10s 无进展且仍 Opening/Seeking/Buffering；与 8s 缓冲提示互斥）
+    pub hls_timeout_hint: bool,
     last_tick: Instant,
     pub subtitle: SubtitleUi,
     pub danmaku: DanmakuUi,
@@ -390,6 +414,8 @@ impl PlayerUi {
             hls_bandwidth_hint: false,
             buffering_event_since: None,
             last_seek_at: None,
+            last_progress_at: None,
+            hls_timeout_hint: false,
             last_tick: Instant::now(),
             subtitle: SubtitleUi::default(),
             danmaku: DanmakuUi::default(),
@@ -520,6 +546,12 @@ impl PlayerUi {
         self.duration = 0.0;
         self.buffering_pct = 0;
         self.first_frame = false;
+        // 切换媒体：重置 HLS 提示计时（8s 缓冲 / 10s 跳转超时）
+        self.hls_bandwidth_hint = false;
+        self.hls_timeout_hint = false;
+        self.buffering_event_since = None;
+        self.last_seek_at = None;
+        self.last_progress_at = Some(Instant::now());
         self.playing = false;
         self.error = None;
         self.engine_note = None;
@@ -614,6 +646,8 @@ impl PlayerUi {
         self.hls_bandwidth_hint = false;
         self.buffering_event_since = None;
         self.last_seek_at = None;
+        self.last_progress_at = None;
+        self.hls_timeout_hint = false;
         self.subtitle.reset();
     }
 
@@ -685,8 +719,10 @@ impl PlayerUi {
         self.position = target;
         // seek 去抖：正常 HLS seek 2.2–2.3s，不应当作「带宽不足」
         self.last_seek_at = Some(Instant::now());
+        self.last_progress_at = Some(Instant::now());
         self.buffering_event_since = None;
         self.hls_bandwidth_hint = false;
+        self.hls_timeout_hint = false;
         self.send(PlayerCommand::SeekAbsolute(target));
     }
 
@@ -715,19 +751,40 @@ impl PlayerUi {
         self.last_seek_at = None;
     }
 
-    /// 每帧评估 HLS 带宽不足提示（启发式；仅 HLS 直连；恢复满缓冲/切换媒体自动消失）。
+    /// 验收用：注入「HLS 直连 + 跳转中 12s 无进展」，用于无头截图验证跳转/缓冲超时提示。
+    ///
+    /// 仅由 `WP_DEMO_HLS_TIMEOUT` 验收钩子调用；不影响正常播放逻辑。
+    #[doc(hidden)]
+    pub fn force_hls_timeout_hint_for_demo(&mut self) {
+        self.network = Some(PlayerNetwork {
+            mode: "HLS 直连".into(),
+            size: 173_709_677,
+        });
+        self.snapshot.state = PlayerState::Seeking;
+        self.last_progress_at = Some(Instant::now() - Duration::from_secs(12));
+        self.buffering_event_since = None;
+        self.last_seek_at = None;
+        self.buffering_pct = 0;
+    }
+
+    /// 每帧评估 HLS 提示（8s 连续缓冲 / 10s 跳转超时；两者互斥，缓冲提示优先）。
     pub fn update_hls_bandwidth_hint(&mut self) {
         let is_hls = self.network.as_ref().is_some_and(|n| n.is_hls());
-        let due = hls_bandwidth_hint_due(
-            is_hls,
-            self.buffering_event_since,
-            self.last_seek_at,
-            Instant::now(),
-        );
-        if due && !self.hls_bandwidth_hint {
+        let now = Instant::now();
+        let buffering_due =
+            hls_bandwidth_hint_due(is_hls, self.buffering_event_since, self.last_seek_at, now);
+        // 劣化网络下 HLS seek 可能长时间停在 Opening/Seeking 且无 0<pct<100 事件：
+        // 用「距最近播放进展 >10s」兜底；两种提示互斥（缓冲提示优先）。
+        let timeout_due = !buffering_due
+            && hls_timeout_hint_due(is_hls, self.last_progress_at, self.snapshot.state, now);
+        if buffering_due && !self.hls_bandwidth_hint {
             wp_core::log_info!("播放器", "HLS 带宽不足提示出现（连续缓冲 >8s，启发式）");
         }
-        self.hls_bandwidth_hint = due;
+        if timeout_due && !self.hls_timeout_hint {
+            wp_core::log_info!("播放器", "HLS 跳转/缓冲超时提示出现（>10s 无播放进展）");
+        }
+        self.hls_bandwidth_hint = buffering_due;
+        self.hls_timeout_hint = timeout_due;
     }
 
     pub fn set_volume(&mut self, volume: f64) {
@@ -865,6 +922,11 @@ impl PlayerUi {
             }
             PlayerEvent::StateChanged(state) => {
                 self.snapshot.state = state;
+                if matches!(state, PlayerState::Playing) {
+                    // 恢复播放 = 进展：清超时提示
+                    self.last_progress_at = Some(Instant::now());
+                    self.hls_timeout_hint = false;
+                }
                 self.playing = matches!(
                     state,
                     PlayerState::Playing | PlayerState::Buffering | PlayerState::Opening
@@ -872,6 +934,12 @@ impl PlayerUi {
             }
             PlayerEvent::PositionChanged(pos) => {
                 if self.backend == EngineBackend::Mpv {
+                    // 只有**真正前进**才算进展（mpv 缓冲/跳转期间会周期性重发相同或回退的
+                    // PositionChanged，不能把它当成进度，否则跳转超时提示永远不触发）。
+                    if pos > self.position + 0.05 {
+                        self.last_progress_at = Some(Instant::now());
+                        self.hls_timeout_hint = false;
+                    }
                     self.position = pos.max(0.0);
                 }
             }
@@ -900,7 +968,11 @@ impl PlayerUi {
                 self.buffering_pct = pct.min(100);
                 self.note_buffering_event(pct);
             }
-            PlayerEvent::FirstFrame => self.first_frame = true,
+            PlayerEvent::FirstFrame => {
+                self.first_frame = true;
+                self.last_progress_at = Some(Instant::now());
+                self.hls_timeout_hint = false;
+            }
             PlayerEvent::EndOfFile => {
                 self.playing = false;
                 self.snapshot.state = PlayerState::Ended;
@@ -1820,6 +1892,19 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme, actions: &mut Vec
                  夸克 HLS 真机样例内容码率 14.07Mbps（docs/PLAYER_PERF.md §8.1）。\n\
                  恢复播放后提示自动消失；若持续出现请检查网络或换源。",
             );
+        } else if player.hls_timeout_hint {
+            ui.label(
+                RichText::new("⚠ 网络较慢（HLS 跳转/缓冲超时）：HLS 约需 ≥1.5× 内容码率…")
+                    .size(10.5)
+                    .color(t.warning),
+            )
+            .on_hover_text(
+                "HLS 直连已 >10s 无播放进展且仍处于打开/跳转/缓冲：可能带宽低于 HLS 内容码率 1.5×，\n\
+                 或网络抖动/丢包导致分片拉取慢。\n\
+                 参考：1080p HLS 8–16Mbps → 需 12–24Mbps；4K 40–100Mbps → 需 60–150Mbps；\n\
+                 夸克 HLS 真机样例内容码率 14.07Mbps（docs/PLAYER_PERF.md §8.1）。\n\
+                 恢复播放后提示自动消失；若持续出现请检查网络或换源。",
+            );
         }
         ui.separator();
         let hwdec = player.snapshot.hwdec.clone().unwrap_or_else(|| {
@@ -2091,6 +2176,71 @@ mod tests {
             Some(now - Duration::from_secs(4)),
             now
         ));
+    }
+
+    #[test]
+    fn hls_timeout_hint_due_rules() {
+        let now = Instant::now();
+        // HLS + 跳转中 + 11s 无进展 → 提示；5s → 不提示
+        assert!(hls_timeout_hint_due(
+            true,
+            Some(now - Duration::from_secs(11)),
+            PlayerState::Seeking,
+            now
+        ));
+        assert!(!hls_timeout_hint_due(
+            true,
+            Some(now - Duration::from_secs(5)),
+            PlayerState::Seeking,
+            now
+        ));
+        // 已恢复 Playing / 非 HLS → 不提示
+        assert!(!hls_timeout_hint_due(
+            true,
+            Some(now - Duration::from_secs(11)),
+            PlayerState::Playing,
+            now
+        ));
+        assert!(!hls_timeout_hint_due(
+            false,
+            Some(now - Duration::from_secs(11)),
+            PlayerState::Seeking,
+            now
+        ));
+    }
+
+    #[test]
+    fn hls_timeout_hint_lifecycle_and_priority() {
+        // HLS 跳转中 12s 无进展 → 超时提示
+        let mut ui = fresh_ui();
+        ui.network = Some(PlayerNetwork {
+            mode: "HLS 直连".into(),
+            size: 1,
+        });
+        ui.snapshot.state = PlayerState::Seeking;
+        ui.last_progress_at = Some(Instant::now() - Duration::from_secs(12));
+        ui.update_hls_bandwidth_hint();
+        assert!(ui.hls_timeout_hint);
+        assert!(!ui.hls_bandwidth_hint);
+        // 位置恢复推进（Mpv 后端）→ 清除
+        ui.backend = EngineBackend::Mpv;
+        ui.position = 0.0;
+        ui.on_event(PlayerEvent::PositionChanged(5.0));
+        ui.update_hls_bandwidth_hint();
+        assert!(!ui.hls_timeout_hint);
+        // 互斥优先级：8s 缓冲条件同时满足 → 只显示带宽提示，不重复超时提示
+        let mut both = fresh_ui();
+        both.network = Some(PlayerNetwork {
+            mode: "HLS 直连".into(),
+            size: 1,
+        });
+        both.snapshot.state = PlayerState::Seeking;
+        both.buffering_event_since = Some(Instant::now() - Duration::from_secs(9));
+        both.last_seek_at = None;
+        both.last_progress_at = Some(Instant::now() - Duration::from_secs(12));
+        both.update_hls_bandwidth_hint();
+        assert!(both.hls_bandwidth_hint);
+        assert!(!both.hls_timeout_hint);
     }
 
     #[test]

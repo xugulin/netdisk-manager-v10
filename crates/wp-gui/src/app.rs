@@ -787,6 +787,13 @@ impl App {
             app.player.force_hls_bandwidth_hint_for_demo();
             wp_core::log_info!("播放器", "验收：注入 HLS 带宽不足提示（WP_DEMO_HLS_HINT）");
         }
+        if std::env::var("WP_DEMO_HLS_TIMEOUT").is_ok() && app.page == Page::Player {
+            app.player.force_hls_timeout_hint_for_demo();
+            wp_core::log_info!(
+                "播放器",
+                "验收：注入 HLS 跳转超时提示（WP_DEMO_HLS_TIMEOUT）"
+            );
+        }
         app
     }
 
