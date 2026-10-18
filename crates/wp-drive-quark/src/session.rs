@@ -280,6 +280,33 @@ impl Api {
         .await
     }
 
+    /// 指定基址的 GET。
+    ///
+    /// 分享页接口（`share/sharepage/token|detail|save`）必须走
+    /// `https://drive.quark.cn/1/clouddrive`，不能复用 `drive-pc` 基址。
+    pub async fn get_at(
+        &self,
+        base: &str,
+        path: &str,
+        extra: Vec<(String, String)>,
+    ) -> Result<Value> {
+        self.request_inner(AuthMode::Required, base, Method::GET, path, extra, None)
+            .await
+    }
+
+    /// 指定基址的 POST（分享页接口用）。
+    pub async fn post_at(&self, base: &str, path: &str, body: Value) -> Result<Value> {
+        self.request_inner(
+            AuthMode::Required,
+            base,
+            Method::POST,
+            path,
+            Vec::new(),
+            Some(&body),
+        )
+        .await
+    }
+
     /// `GET member`（账号 / 容量 / 会员）。`allow_expired` 供 `__puus` 刷新使用。
     pub async fn member(&self, allow_expired: bool) -> Result<Value> {
         let mode = if allow_expired {

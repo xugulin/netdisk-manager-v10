@@ -287,6 +287,95 @@ async fn dispatch(drive: &dyn Drive, cmd: &str, args: &[String]) -> i32 {
         "upload" => cmd_upload(drive, args).await,
         "download" => cmd_download(drive, args).await,
         "share" => cmd_share(drive, args).await,
+        "recycle-list" => match drive.recycle_list().await {
+            Ok(list) => {
+                eprintln!("# 回收站 {} 项", list.len());
+                print_json(&list)
+            }
+            Err(e) => fail(e),
+        },
+        "recycle-restore" => {
+            if args.is_empty() {
+                return usage("recycle-restore <id...>");
+            }
+            match drive.recycle_restore(args).await {
+                Ok(r) => print_json(&r),
+                Err(e) => fail(e),
+            }
+        }
+        "recycle-delete" => {
+            if args.is_empty() {
+                return usage("recycle-delete <id...>");
+            }
+            match drive.recycle_delete(args).await {
+                Ok(r) => print_json(&r),
+                Err(e) => fail(e),
+            }
+        }
+        "recycle-clear" => match drive.recycle_clear().await {
+            Ok(r) => print_json(&r),
+            Err(e) => fail(e),
+        },
+        "cloud-add" => match args.first() {
+            Some(url) => {
+                let dest = args.get(1).cloned().unwrap_or_else(|| "/".into());
+                match drive.cloud_add(url, &dest).await {
+                    Ok(id) => print_json(&serde_json::json!({"任务ID": id, "保存到": dest})),
+                    Err(e) => fail(e),
+                }
+            }
+            None => usage("cloud-add <直链或 magnet> [保存目录]"),
+        },
+        "cloud-tasks" => match drive.cloud_tasks().await {
+            Ok(list) => {
+                eprintln!("# 云任务 {} 项", list.len());
+                print_json(&list)
+            }
+            Err(e) => fail(e),
+        },
+        "records" => {
+            let limit = args
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(100);
+            match drive.upload_records(limit).await {
+                Ok(list) => {
+                    eprintln!("# 记录 {} 项", list.len());
+                    print_json(&list)
+                }
+                Err(e) => fail(e),
+            }
+        }
+        "share-info" => match args.first() {
+            Some(url) => {
+                let pwd = args.get(1).cloned().unwrap_or_default();
+                match drive.share_info(url, &pwd).await {
+                    Ok(detail) => print_json(&detail),
+                    Err(e) => fail(e),
+                }
+            }
+            None => usage("share-info <分享链接> [提取码]"),
+        },
+        "share-save" => match (args.first(), args.get(1)) {
+            (Some(url), Some(dest)) => {
+                let pwd = args.get(2).cloned().unwrap_or_default();
+                match drive.save_shared(url, &pwd, dest).await {
+                    Ok(r) => print_json(&r),
+                    Err(e) => fail(e),
+                }
+            }
+            _ => usage("share-save <分享链接> <保存目录> [提取码]"),
+        },
+        "categories" => {
+            let cat = args.first().cloned().unwrap_or_else(|| "all".into());
+            match drive.category_list(&cat).await {
+                Ok(list) => {
+                    eprintln!("# 分类 {cat} 下 {} 项", list.len());
+                    print_json(&list)
+                }
+                Err(e) => fail(e),
+            }
+        }
         "shares" => match drive.list_shares().await {
             Ok(list) => print_json(&list),
             Err(e) => fail(e),
@@ -569,6 +658,16 @@ fn print_help() {
   share <路径...> [--days N] [--password P]
   shares                          分享列表
   cancel-shares <share_id...>     取消分享
+  share-info <链接> [提取码]       校验/预览分享内容（转存前）
+  share-save <链接> <目录> [提取码] 转存分享到自己的网盘
+  recycle-list                    回收站列表
+  recycle-restore <id...>         从回收站恢复
+  recycle-delete <id...>          彻底删除回收站条目
+  recycle-clear                   清空回收站
+  cloud-add <链接|magnet> [目录]   云添加（离线下载/BT，光鸭）
+  cloud-tasks                     云任务列表
+  records [N]                     上传记录 / 操作记录
+  categories [video|audio|image|doc|app|other|all]  按分类列全盘文件（百度）
   write-probe                     写权限探测
 
 输出：结构化结果一律 JSON（stdout）；进度/错误走 stderr。

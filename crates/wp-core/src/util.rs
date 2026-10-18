@@ -4,6 +4,17 @@ use chrono::{Local, TimeZone};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 当前 Unix 秒。
+/// 截断字符串到指定字符数（超出补 `…`，按字符而不是字节，避免中文被截半）。
+pub fn ellipsis(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars || max_chars == 0 {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 pub fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

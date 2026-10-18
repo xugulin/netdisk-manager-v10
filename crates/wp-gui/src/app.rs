@@ -21,6 +21,7 @@ use wp_transfer::{EngineOptions, TransferEngine, UploadGuardHook};
 pub enum Page {
     Browser,
     Transfers,
+    Tools,
     Guard,
     Logs,
     Settings,
@@ -32,6 +33,7 @@ impl Page {
         match self {
             Page::Browser => "网盘",
             Page::Transfers => "传输",
+            Page::Tools => "工具",
             Page::Guard => "敏感词",
             Page::Logs => "日志",
             Page::Settings => "设置",
@@ -42,6 +44,7 @@ impl Page {
         match self {
             Page::Browser => "☁",
             Page::Transfers => "⇅",
+            Page::Tools => "🛠",
             Page::Guard => "🛡",
             Page::Logs => "📋",
             Page::Settings => "⚙",
@@ -193,6 +196,40 @@ pub enum Event {
     /// 移动/复制目标目录选择器：列目录结果
     PickerListed {
         path: String,
+        result: Result<Vec<RemoteEntry>, wp_core::Error>,
+    },
+    // ── 工具页 ──
+    RecycleListed {
+        drive: String,
+        result: Result<Vec<RecycleEntry>, wp_core::Error>,
+    },
+    RecycleOp {
+        message: String,
+        result: Result<String, wp_core::Error>,
+    },
+    CloudTasksListed {
+        drive: String,
+        result: Result<Vec<CloudTask>, wp_core::Error>,
+    },
+    CloudAdded {
+        result: Result<String, wp_core::Error>,
+    },
+    RecordsListed {
+        drive: String,
+        result: Result<Vec<UploadRecord>, wp_core::Error>,
+    },
+    SharesListed {
+        drive: String,
+        result: Result<Vec<ShareInfo>, wp_core::Error>,
+    },
+    ShareInfoGot {
+        result: Result<ShareDetail, wp_core::Error>,
+    },
+    ShareSaved {
+        result: Result<String, wp_core::Error>,
+    },
+    CategoriesListed {
+        drive: String,
         result: Result<Vec<RemoteEntry>, wp_core::Error>,
     },
 }
@@ -353,6 +390,69 @@ pub enum Dialog {
     CrossCopy(CrossCopyDialog),
 }
 
+/// 工具页标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolsTab {
+    Recycle,
+    Cloud,
+    Records,
+    Shares,
+    Categories,
+}
+
+impl ToolsTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolsTab::Recycle => "回收站",
+            ToolsTab::Cloud => "云任务",
+            ToolsTab::Records => "上传记录",
+            ToolsTab::Shares => "分享管理 / 转存",
+            ToolsTab::Categories => "分类浏览",
+        }
+    }
+}
+
+/// 一组异步加载的数据。
+#[derive(Debug)]
+pub struct LoadBox<T> {
+    pub data: Vec<T>,
+    pub loading: bool,
+    pub error: String,
+}
+
+impl<T> Default for LoadBox<T> {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            loading: false,
+            error: String::new(),
+        }
+    }
+}
+
+/// 工具页状态。
+#[derive(Default)]
+pub struct ToolsState {
+    pub tab: Option<ToolsTab>,
+    /// 已加载的 key：`drive:tab:extra`，用于判断是否需要（重新）加载
+    pub loaded_key: String,
+    pub recycle: LoadBox<RecycleEntry>,
+    pub recycle_selected: BTreeSet<String>,
+    pub cloud_tasks: LoadBox<CloudTask>,
+    pub cloud_url: String,
+    pub cloud_dest: String,
+    pub cloud_busy: bool,
+    pub records: LoadBox<UploadRecord>,
+    pub shares: LoadBox<ShareInfo>,
+    pub share_url: String,
+    pub share_pwd: String,
+    pub share_dest: String,
+    pub share_detail: Option<ShareDetail>,
+    pub share_busy: bool,
+    pub categories: LoadBox<RemoteEntry>,
+    pub category: String,
+}
+
 /// 全局应用状态。
 pub struct App {
     pub paths: Paths,
@@ -377,6 +477,7 @@ pub struct App {
     /// 设置页草稿（保存后写盘）
     pub settings_draft: SettingsDraft,
     pub settings_draft_kind: DriveKind,
+    pub tools: ToolsState,
     pub guard_new_word: String,
     pub guard_new_instance_word: String,
     pub loading_accounts: bool,
@@ -421,6 +522,8 @@ pub struct DevOptions {
     pub dialog: Option<String>,
     /// 验收用：启动后直接导航到的逻辑路径
     pub initial_path: Option<String>,
+    /// 验收用：工具页默认标签（recycle/cloud/records/shares/categories）
+    pub tools_tab: Option<String>,
 }
 
 impl App {
@@ -498,6 +601,7 @@ impl App {
             .unwrap_or(0);
         let page = match dev.initial_page.as_deref() {
             Some("transfers") => Page::Transfers,
+            Some("tools") => Page::Tools,
             Some("settings") => Page::Settings,
             Some("logs") => Page::Logs,
             Some("guard") => Page::Guard,
@@ -528,6 +632,10 @@ impl App {
             log_auto_scroll: true,
             settings_draft,
             settings_draft_kind: DriveKind::Baidu,
+            tools: ToolsState {
+                tab: Some(ToolsTab::Recycle),
+                ..Default::default()
+            },
             guard_new_word: String::new(),
             guard_new_instance_word: String::new(),
             loading_accounts: false,
@@ -545,6 +653,16 @@ impl App {
         if let Some(slot) = app.drives.get(app.active) {
             let id = slot.id().to_string();
             app.load_dir_for(&id, "/");
+        }
+        if let Some(tab) = app.dev.tools_tab.clone() {
+            app.tools.tab = Some(match tab.as_str() {
+                "cloud" => ToolsTab::Cloud,
+                "records" => ToolsTab::Records,
+                "shares" => ToolsTab::Shares,
+                "categories" => ToolsTab::Categories,
+                _ => ToolsTab::Recycle,
+            });
+            app.tools.loaded_key.clear();
         }
         if let Some(path) = app.dev.initial_path.clone() {
             let id = app.active_drive_id();
@@ -1298,6 +1416,121 @@ impl App {
                 }
                 Err(e) => self.toast(ToastKind::Error, format!("获取直链失败：{e}")),
             },
+            Event::RecycleListed { drive, result } => {
+                if drive != self.active_drive_id() && !self.tools.recycle.loading {
+                    return;
+                }
+                self.tools.recycle.loading = false;
+                match result {
+                    Ok(list) => {
+                        self.tools.recycle.data = list;
+                        self.tools.recycle.error.clear();
+                        self.tools.recycle_selected.clear();
+                    }
+                    Err(e) => self.tools.recycle.error = e.to_string(),
+                }
+            }
+            Event::RecycleOp { message, result } => {
+                self.tools.recycle.loading = false;
+                match result {
+                    Ok(msg) => {
+                        self.toast(
+                            ToastKind::Success,
+                            if msg.is_empty() {
+                                message
+                            } else {
+                                format!("{message}：{msg}")
+                            },
+                        );
+                        let id = self.active_drive_id();
+                        self.recycle_load(&id);
+                    }
+                    Err(e) => self.toast(ToastKind::Error, format!("{message}失败：{e}")),
+                }
+            }
+            Event::CloudTasksListed { drive, result } => {
+                if drive != self.active_drive_id() && !self.tools.cloud_tasks.loading {
+                    return;
+                }
+                self.tools.cloud_tasks.loading = false;
+                match result {
+                    Ok(list) => {
+                        self.tools.cloud_tasks.data = list;
+                        self.tools.cloud_tasks.error.clear();
+                    }
+                    Err(e) => self.tools.cloud_tasks.error = e.to_string(),
+                }
+            }
+            Event::CloudAdded { result } => {
+                self.tools.cloud_busy = false;
+                match result {
+                    Ok(task) => {
+                        self.toast(ToastKind::Success, format!("云任务已创建：{task}"));
+                        let id = self.active_drive_id();
+                        self.cloud_tasks_load(&id);
+                    }
+                    Err(e) => self.toast(ToastKind::Error, format!("云添加失败：{e}")),
+                }
+            }
+            Event::RecordsListed { drive, result } => {
+                if drive != self.active_drive_id() && !self.tools.records.loading {
+                    return;
+                }
+                self.tools.records.loading = false;
+                match result {
+                    Ok(list) => {
+                        self.tools.records.data = list;
+                        self.tools.records.error.clear();
+                    }
+                    Err(e) => self.tools.records.error = e.to_string(),
+                }
+            }
+            Event::SharesListed { drive, result } => {
+                if drive != self.active_drive_id() && !self.tools.shares.loading {
+                    return;
+                }
+                self.tools.shares.loading = false;
+                match result {
+                    Ok(list) => {
+                        self.tools.shares.data = list;
+                        self.tools.shares.error.clear();
+                    }
+                    Err(e) => self.tools.shares.error = e.to_string(),
+                }
+            }
+            Event::ShareInfoGot { result } => {
+                self.tools.share_busy = false;
+                match result {
+                    Ok(detail) => {
+                        self.toast(
+                            ToastKind::Success,
+                            format!("分享校验通过：{}", detail.title),
+                        );
+                        self.tools.share_detail = Some(detail);
+                    }
+                    Err(e) => self.toast(ToastKind::Error, format!("分享校验失败：{e}")),
+                }
+            }
+            Event::ShareSaved { result } => {
+                self.tools.share_busy = false;
+                match result {
+                    Ok(msg) => self.toast(ToastKind::Success, msg),
+                    Err(e) => self.toast(ToastKind::Error, format!("转存失败：{e}")),
+                }
+            }
+            Event::CategoriesListed { drive, result } => {
+                if drive != self.active_drive_id() && !self.tools.categories.loading {
+                    return;
+                }
+                self.tools.categories.loading = false;
+                match result {
+                    Ok(list) => {
+                        self.tools.categories.data = list;
+                        self.tools.categories.error.clear();
+                    }
+                    Err(e) => self.tools.categories.error = e.to_string(),
+                }
+            }
             Event::PickerListed { path, result } => {
                 if let Some(Dialog::DirPicker(d)) = self.dialog.as_mut() {
                     d.loading = false;
@@ -1397,6 +1630,7 @@ impl eframe::App for App {
             .show(ui, |ui| match self.page {
                 Page::Browser => pages::browser::show(self, ui),
                 Page::Transfers => pages::transfers::show(self, ui),
+                Page::Tools => pages::tools::show(self, ui),
                 Page::Guard => pages::guard_page::show(self, ui),
                 Page::Logs => pages::logs::show(self, ui),
                 Page::Settings => pages::settings::show(self, ui),
@@ -1486,6 +1720,9 @@ impl App {
         }
         if ctrl_1_6.5 {
             self.page = Page::About;
+        }
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Num7)) {
+            self.page = Page::Tools;
         }
         let _ = ctrl_f;
         if f5 {
@@ -1760,6 +1997,7 @@ impl App {
         for page in [
             Page::Browser,
             Page::Transfers,
+            Page::Tools,
             Page::Guard,
             Page::Logs,
             Page::Settings,
@@ -2139,6 +2377,194 @@ impl App {
         };
         load_local_dir(&mut picker, &start);
         self.file_picker = Some(picker);
+    }
+
+    // ───────────── 工具页异步封装 ─────────────
+
+    pub fn recycle_load(&mut self, drive_id: &str) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.recycle.loading = true;
+        self.tools.recycle.error.clear();
+        let id = drive_id.to_string();
+        self.spawn(async move {
+            Event::RecycleListed {
+                drive: id,
+                result: drive.recycle_list().await,
+            }
+        });
+    }
+
+    pub fn recycle_restore(&mut self, drive_id: &str, ids: Vec<String>) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.recycle.loading = true;
+        self.spawn(async move {
+            Event::RecycleOp {
+                message: format!("恢复 {} 项", ids.len()),
+                result: drive.recycle_restore(&ids).await.map(|r| r.summary()),
+            }
+        });
+    }
+
+    pub fn recycle_delete(&mut self, drive_id: &str, ids: Vec<String>) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.recycle.loading = true;
+        self.spawn(async move {
+            Event::RecycleOp {
+                message: format!("彻底删除 {} 项", ids.len()),
+                result: drive.recycle_delete(&ids).await.map(|r| r.summary()),
+            }
+        });
+    }
+
+    pub fn recycle_clear(&mut self, drive_id: &str) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.recycle.loading = true;
+        self.spawn(async move {
+            Event::RecycleOp {
+                message: "清空回收站".into(),
+                result: drive.recycle_clear().await.map(|r| r.summary()),
+            }
+        });
+    }
+
+    pub fn cloud_tasks_load(&mut self, drive_id: &str) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.cloud_tasks.loading = true;
+        self.tools.cloud_tasks.error.clear();
+        let id = drive_id.to_string();
+        self.spawn(async move {
+            Event::CloudTasksListed {
+                drive: id,
+                result: drive.cloud_tasks().await,
+            }
+        });
+    }
+
+    pub fn cloud_add(&mut self, drive_id: &str, url: String, dest: String) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.cloud_busy = true;
+        self.spawn(async move {
+            Event::CloudAdded {
+                result: drive.cloud_add(&url, &dest).await,
+            }
+        });
+    }
+
+    pub fn records_load(&mut self, drive_id: &str) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.records.loading = true;
+        self.tools.records.error.clear();
+        let id = drive_id.to_string();
+        self.spawn(async move {
+            Event::RecordsListed {
+                drive: id,
+                result: drive.upload_records(100).await,
+            }
+        });
+    }
+
+    pub fn shares_load(&mut self, drive_id: &str) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.shares.loading = true;
+        self.tools.shares.error.clear();
+        let id = drive_id.to_string();
+        self.spawn(async move {
+            Event::SharesListed {
+                drive: id,
+                result: drive.list_shares().await,
+            }
+        });
+    }
+
+    pub fn share_info(&mut self, drive_id: &str, url: String, pwd: String) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.share_busy = true;
+        self.spawn(async move {
+            Event::ShareInfoGot {
+                result: drive.share_info(&url, &pwd).await,
+            }
+        });
+    }
+
+    pub fn share_save(&mut self, drive_id: &str, url: String, pwd: String, dest: String) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.share_busy = true;
+        self.spawn(async move {
+            Event::ShareSaved {
+                result: drive
+                    .save_shared(&url, &pwd, &dest)
+                    .await
+                    .map(|r| format!("转存完成：{}", r.summary())),
+            }
+        });
+    }
+
+    pub fn categories_load(&mut self, drive_id: &str, category: String) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.tools.categories.loading = true;
+        self.tools.categories.error.clear();
+        let id = drive_id.to_string();
+        self.spawn(async move {
+            Event::CategoriesListed {
+                drive: id,
+                result: drive.category_list(&category).await,
+            }
+        });
     }
 
     // ───────────── 动态重建网盘实例 ─────────────

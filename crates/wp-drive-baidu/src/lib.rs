@@ -10,15 +10,23 @@
 //!   连接失败重试 3 次（0.5/1/2s），读超时不重试。
 //! * 上传走 rapidupload → precreate → superfile2 → create，MD5 有“纯净/展示态”
 //!   两套表示；下载走 `filemetas?dlink=1` 取服务端签好的直链，必须带 Cookie。
+//! * 回收站走 `/api/recycle/list/` 与 `/api/recycle/restore`；彻底删除/清空
+//!   会触发 132 短信风控，Python 源码刻意不自动化，这里同样不实现。
+//! * 分类浏览走 `/api/categorylist`；分享校验/转存走 verify → list → transfer。
+//! * 云添加只实现只读 `cloud_dl?method=list_task`（HAR 有完整请求/响应样本）；
+//!   新建离线任务的参数未抓到，`cloud_add` 保持 Unsupported。
 //!
 //! 对外唯一入口是 [`create`]。
 
 pub mod session;
 
 mod auth;
+mod category;
+mod cloud;
 mod download;
 mod files;
 mod http;
+mod recycle;
 mod share;
 mod upload;
 
@@ -30,8 +38,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use wp_core::model::{
-    AccountInfo, AuthCaps, DirectLink, DownloadOptions, DriveKind, OpReport, ProgressFn,
-    RemoteEntry, UploadOptions,
+    AccountInfo, AuthCaps, CloudTask, DirectLink, DownloadOptions, DriveKind, OpReport, ProgressFn,
+    RecycleEntry, RemoteEntry, ShareDetail, UploadOptions,
 };
 use wp_core::util::now_ts;
 use wp_core::{Error, Result};
@@ -259,11 +267,24 @@ impl Drive for BaiduDrive {
             search: true,
             share: true,
             direct_link: true,
-            // Drive trait 没有回收站方法，故明确标记不支持；
-            // 文档 §4.3 的回收站列表/还原只能等 trait 扩展后再暴露。
-            recycle: false,
+            // 回收站：列表/还原有实测端点；彻底删除/清空会触发 132 短信风控，
+            // Python 源码只提供说明，不自动化。
+            recycle: true,
             upload: true,
             download: true,
+            recycle_list: true,
+            recycle_restore: true,
+            recycle_delete: false,
+            recycle_clear: false,
+            // 云添加：HAR 只抓到 list_task/query_task 只读参数，创建参数缺失。
+            cloud_add: false,
+            // 只读任务列表可安全实现（请求参数见 cloud.rs）。
+            cloud_tasks: true,
+            // Python 源码里上传记录是 NotImplemented 占位。
+            upload_records: false,
+            share_info: true,
+            share_save: true,
+            categories: true,
         }
     }
 
@@ -371,6 +392,36 @@ impl Drive for BaiduDrive {
     async fn cancel_shares(&self, ids: &[String]) -> Result<OpReport> {
         share::cancel_shares(self, ids).await
     }
+
+    async fn share_info(&self, url: &str, password: &str) -> Result<ShareDetail> {
+        share::share_info(self, url, password).await
+    }
+
+    async fn save_shared(&self, url: &str, password: &str, dest_dir: &str) -> Result<OpReport> {
+        share::save_shared(self, url, password, dest_dir).await
+    }
+
+    async fn recycle_list(&self) -> Result<Vec<RecycleEntry>> {
+        recycle::list(self).await
+    }
+
+    async fn recycle_restore(&self, ids: &[String]) -> Result<OpReport> {
+        recycle::restore(self, ids).await
+    }
+
+    async fn cloud_tasks(&self) -> Result<Vec<CloudTask>> {
+        cloud::list_tasks(self).await
+    }
+
+    async fn category_list(&self, category: &str) -> Result<Vec<RemoteEntry>> {
+        category::list(self, category).await
+    }
+
+    // 刻意不覆写（保持 trait 默认的 Unsupported）：
+    // * recycle_delete / recycle_clear：百度首次调用必触发 errno:132 短信验证，
+    //   客户端无法绕过（`回收站接口.py` 明确不提供自动化方法）；
+    // * cloud_add：创建离线任务的参数未抓到，不臆造；
+    // * upload_records：Python 源码为 NotImplemented 占位。
 
     async fn write_probe(&self) -> Result<String> {
         auth::write_probe(self).await

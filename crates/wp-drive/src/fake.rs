@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use wp_core::model::{
-    AccountInfo, AuthCaps, DirectLink, DownloadOptions, DriveKind, OpReport, ProgressFn, Quota,
-    RemoteEntry, ShareInfo, UploadOptions,
+    AccountInfo, AuthCaps, CloudTask, DirectLink, DownloadOptions, DriveKind, OpReport, ProgressFn,
+    Quota, RecycleEntry, RemoteEntry, ShareDetail, ShareInfo, UploadOptions, UploadRecord,
 };
 use wp_core::util::{base_name, join_path, norm_path, parent_path, sort_entries, SortBy};
 use wp_core::{Error, Result};
@@ -26,6 +26,9 @@ struct State {
     logged_in: bool,
     entries: BTreeMap<String, RemoteEntry>,
     shares: Vec<ShareInfo>,
+    recycle: Vec<RecycleEntry>,
+    cloud_tasks: Vec<CloudTask>,
+    records: Vec<UploadRecord>,
 }
 
 pub struct FakeDrive {
@@ -60,6 +63,86 @@ pub fn create(init: DriveInit) -> Result<Arc<dyn Drive>> {
         e.modified = Some(wp_core::util::now_ts() - (i as i64 + 1) * 86400);
         entries.insert(path.to_string(), e);
     }
+    // 工具页演示数据：回收站 / 云任务 / 上传记录
+    let now = wp_core::util::now_ts();
+    let recycle = vec![
+        RecycleEntry {
+            id: "recycle-0001".into(),
+            name: "误删的文档.txt".into(),
+            path: "/文档/误删的文档.txt".into(),
+            is_dir: false,
+            size: 2048,
+            deleted_at: Some(now - 3600),
+            original_path: "/文档".into(),
+        },
+        RecycleEntry {
+            id: "recycle-0002".into(),
+            name: "旧目录".into(),
+            path: "/旧目录".into(),
+            is_dir: true,
+            size: 0,
+            deleted_at: Some(now - 86400),
+            original_path: "/".into(),
+        },
+    ];
+    let cloud_tasks = vec![
+        CloudTask {
+            id: "cloud-0001".into(),
+            name: "演示离线任务-进行中.iso".into(),
+            url: "https://example.com/demo.iso".into(),
+            status: "1".into(),
+            status_text: "下载中".into(),
+            progress: 0.42,
+            total: 500_000_000,
+            done: 210_000_000,
+            created: Some(now - 600),
+            save_path: "/文档/演示离线任务-进行中.iso".into(),
+            error: String::new(),
+        },
+        CloudTask {
+            id: "cloud-0002".into(),
+            name: "演示完全任务.zip".into(),
+            url: "magnet:?xt=urn:btih:demo".into(),
+            status: "2".into(),
+            status_text: "已完成".into(),
+            progress: 1.0,
+            total: 1024,
+            done: 1024,
+            created: Some(now - 7200),
+            save_path: "/文档/演示完全任务.zip".into(),
+            error: String::new(),
+        },
+    ];
+    let records = vec![
+        UploadRecord {
+            id: "rec-0001".into(),
+            name: "示例影片-4K.mp4".into(),
+            path: "/影视/示例影片-4K.mp4".into(),
+            size: 4_500_000_000,
+            time: Some(now - 300),
+            action: "上传".into(),
+            parent: "影视".into(),
+        },
+        UploadRecord {
+            id: "rec-0002".into(),
+            name: "使用说明.txt".into(),
+            path: "/文档/使用说明.txt".into(),
+            size: 1024,
+            time: Some(now - 1800),
+            action: "上传".into(),
+            parent: "文档".into(),
+        },
+        UploadRecord {
+            id: "rec-0003".into(),
+            name: "示例音乐.flac".into(),
+            path: "/音乐/示例音乐.flac".into(),
+            size: 38_000_000,
+            time: Some(now - 7200),
+            action: "下载".into(),
+            parent: "音乐".into(),
+        },
+    ];
+
     Ok(Arc::new(FakeDrive {
         id: init.id,
         name: if init.name.is_empty() {
@@ -72,6 +155,9 @@ pub fn create(init: DriveInit) -> Result<Arc<dyn Drive>> {
             logged_in: true,
             entries,
             shares: Vec::new(),
+            recycle,
+            cloud_tasks,
+            records,
         }),
     }))
 }
@@ -152,6 +238,16 @@ impl Drive for FakeDrive {
             recycle: false,
             upload: true,
             download: true,
+            recycle_list: true,
+            recycle_restore: true,
+            recycle_delete: true,
+            recycle_clear: true,
+            cloud_add: true,
+            cloud_tasks: true,
+            upload_records: true,
+            share_info: true,
+            share_save: true,
+            categories: true,
         }
     }
 
@@ -276,6 +372,17 @@ impl Drive for FakeDrive {
             if !st.entries.contains_key(&p) {
                 report.fail(format!("{p} 不存在"));
                 continue;
+            }
+            if let Some(e) = st.entries.get(&p).cloned() {
+                st.recycle.push(RecycleEntry {
+                    id: format!("recycle-{}", wp_core::util::random_hex(8)),
+                    name: e.name.clone(),
+                    path: e.path.clone(),
+                    is_dir: e.is_dir,
+                    size: e.size,
+                    deleted_at: Some(wp_core::util::now_ts()),
+                    original_path: parent_path(&p),
+                });
             }
             let prefix = format!("{p}/");
             st.entries.retain(|k, _| k != &p && !k.starts_with(&prefix));
@@ -463,7 +570,19 @@ impl Drive for FakeDrive {
         let mut e = RemoteEntry::file(&name, &path, done);
         e.id = format!("fake-{}", wp_core::util::random_hex(8));
         e.modified = Some(wp_core::util::now_ts());
-        self.lock().entries.insert(path.clone(), e.clone());
+        {
+            let mut st = self.lock();
+            st.records.push(UploadRecord {
+                id: e.id.clone(),
+                name: name.clone(),
+                path: path.clone(),
+                size: done,
+                time: Some(wp_core::util::now_ts()),
+                action: "上传".into(),
+                parent: base_name(&dir),
+            });
+            st.entries.insert(path.clone(), e.clone());
+        }
         Ok(e)
     }
 
@@ -510,6 +629,184 @@ impl Drive for FakeDrive {
         report.ok = before - st.shares.len();
         report.failed = ids.len().saturating_sub(report.ok);
         Ok(report)
+    }
+
+    async fn recycle_list(&self) -> Result<Vec<RecycleEntry>> {
+        self.require_login()?;
+        let mut v = self.lock().recycle.clone();
+        v.sort_by(|a, b| b.deleted_at.unwrap_or(0).cmp(&a.deleted_at.unwrap_or(0)));
+        Ok(v)
+    }
+
+    async fn recycle_restore(&self, ids: &[String]) -> Result<OpReport> {
+        self.require_login()?;
+        let mut report = OpReport::default();
+        let mut st = self.lock();
+        let mut to_restore: Vec<RecycleEntry> = Vec::new();
+        st.recycle.retain(|e| {
+            if ids.contains(&e.id) {
+                to_restore.push(e.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for e in to_restore {
+            // 原目录不存在就补建
+            let dir = if e.original_path.is_empty() {
+                "/".to_string()
+            } else {
+                e.original_path.clone()
+            };
+            st.entries
+                .entry(dir.clone())
+                .or_insert_with(|| RemoteEntry::dir(base_name(&dir), &dir));
+            let path = join_path(&dir, &e.name);
+            let mut entry = if e.is_dir {
+                RemoteEntry::dir(&e.name, &path)
+            } else {
+                RemoteEntry::file(&e.name, &path, e.size)
+            };
+            entry.id = format!("fake-{}", wp_core::util::random_hex(8));
+            entry.modified = Some(wp_core::util::now_ts());
+            st.entries.insert(path, entry);
+            report.success();
+        }
+        drop(st);
+        Ok(report)
+    }
+
+    async fn recycle_delete(&self, ids: &[String]) -> Result<OpReport> {
+        self.require_login()?;
+        let mut report = OpReport::default();
+        let mut st = self.lock();
+        for id in ids {
+            if st.recycle.iter().any(|e| &e.id == id) {
+                st.recycle.retain(|e| &e.id != id);
+                report.success();
+            } else {
+                report.fail(format!("{id} 不存在"));
+            }
+        }
+        Ok(report)
+    }
+
+    async fn recycle_clear(&self) -> Result<OpReport> {
+        self.require_login()?;
+        let mut st = self.lock();
+        let mut report = OpReport::default();
+        report.ok = st.recycle.len();
+        st.recycle.clear();
+        Ok(report)
+    }
+
+    async fn cloud_add(&self, url: &str, dest_dir: &str) -> Result<String> {
+        self.require_login()?;
+        if url.trim().is_empty() {
+            return Err(Error::other("链接不能为空"));
+        }
+        let dir = norm_path(dest_dir);
+        let id = format!("cloud-{}", wp_core::util::random_hex(6));
+        let mut st = self.lock();
+        st.cloud_tasks.push(CloudTask {
+            id: id.clone(),
+            name: wp_core::util::file_name_from_url(url),
+            url: url.to_string(),
+            status: "0".into(),
+            status_text: "等待中".into(),
+            progress: 0.0,
+            total: 0,
+            done: 0,
+            created: Some(wp_core::util::now_ts()),
+            save_path: dir,
+            error: String::new(),
+        });
+        Ok(id)
+    }
+
+    async fn cloud_tasks(&self) -> Result<Vec<CloudTask>> {
+        self.require_login()?;
+        Ok(self.lock().cloud_tasks.clone())
+    }
+
+    async fn upload_records(&self, limit: usize) -> Result<Vec<UploadRecord>> {
+        self.require_login()?;
+        let mut v = self.lock().records.clone();
+        v.sort_by(|a, b| b.time.unwrap_or(0).cmp(&a.time.unwrap_or(0)));
+        v.truncate(limit.max(1));
+        Ok(v)
+    }
+
+    async fn share_info(&self, url: &str, password: &str) -> Result<ShareDetail> {
+        self.require_login()?;
+        if !url.contains("demo.invalid") && !url.contains("/s/") {
+            return Err(Error::other("演示网盘只认识 /s/ 形式的分享链接"));
+        }
+        let files = self
+            .lock()
+            .entries
+            .values()
+            .filter(|e| !e.is_dir)
+            .take(2)
+            .cloned()
+            .collect();
+        Ok(ShareDetail {
+            title: "演示分享（共 2 个文件）".into(),
+            url: url.to_string(),
+            password: password.to_string(),
+            files,
+            expire_at: None,
+            note: "演示数据".into(),
+        })
+    }
+
+    async fn save_shared(&self, url: &str, _password: &str, dest_dir: &str) -> Result<OpReport> {
+        self.require_login()?;
+        let detail = self.share_info(url, "").await?;
+        let dir = norm_path(dest_dir);
+        let mut report = OpReport::default();
+        for f in detail.files {
+            let mut st = self.lock();
+            st.entries
+                .entry(dir.clone())
+                .or_insert_with(|| RemoteEntry::dir(base_name(&dir), &dir));
+            let path = join_path(&dir, &f.name);
+            let mut e = RemoteEntry::file(&f.name, &path, f.size);
+            e.id = format!("fake-{}", wp_core::util::random_hex(8));
+            e.modified = Some(wp_core::util::now_ts());
+            st.entries.insert(path, e);
+            report.success();
+        }
+        Ok(report)
+    }
+
+    async fn category_list(&self, category: &str) -> Result<Vec<RemoteEntry>> {
+        self.require_login()?;
+        let cat = category.to_ascii_lowercase();
+        let match_ext = |name: &str| -> bool {
+            let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            match cat.as_str() {
+                "all" => true,
+                "video" => matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "webm"),
+                "audio" => matches!(ext.as_str(), "mp3" | "flac" | "wav" | "aac" | "ogg"),
+                "image" => matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp"),
+                "doc" => matches!(
+                    ext.as_str(),
+                    "txt" | "md" | "pdf" | "doc" | "docx" | "xls" | "ppt"
+                ),
+                "app" => matches!(ext.as_str(), "exe" | "apk" | "deb" | "rpm"),
+                _ => true,
+            }
+        };
+        let mut v: Vec<RemoteEntry> = self
+            .lock()
+            .entries
+            .values()
+            .filter(|e| !e.is_dir && match_ext(&e.name))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.size.cmp(&a.size));
+        Ok(v)
     }
 
     async fn write_probe(&self) -> Result<String> {

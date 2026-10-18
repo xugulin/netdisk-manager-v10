@@ -124,6 +124,16 @@ impl Drive for LocalDrive {
             recycle: false,
             upload: true,
             download: true,
+            recycle_list: false,
+            recycle_restore: false,
+            recycle_delete: false,
+            recycle_clear: false,
+            cloud_add: false,
+            cloud_tasks: false,
+            upload_records: false,
+            share_info: false,
+            share_save: false,
+            categories: false,
         }
     }
 

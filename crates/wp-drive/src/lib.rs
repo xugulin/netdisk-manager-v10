@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wp_core::model::{
-    AccountInfo, AuthCaps, DirectLink, DownloadOptions, DriveKind, OpReport, ProgressFn, QrState,
-    RemoteEntry, ShareInfo, UploadOptions,
+    AccountInfo, AuthCaps, CloudTask, DirectLink, DownloadOptions, DriveKind, OpReport, ProgressFn,
+    QrState, RecycleEntry, RemoteEntry, ShareDetail, ShareInfo, UploadOptions, UploadRecord,
 };
 use wp_core::{Error, Result};
 
@@ -55,6 +55,23 @@ pub struct DriveCaps {
     /// 上传 / 下载
     pub upload: bool,
     pub download: bool,
+    /// 回收站：列表 / 恢复 / 彻底删除 / 清空
+    pub recycle_list: bool,
+    pub recycle_restore: bool,
+    pub recycle_delete: bool,
+    pub recycle_clear: bool,
+    /// 云添加（离线下载/BT）
+    pub cloud_add: bool,
+    /// 云添加任务列表
+    pub cloud_tasks: bool,
+    /// 上传记录 / 操作记录
+    pub upload_records: bool,
+    /// 分享链接校验（转存前预览）
+    pub share_info: bool,
+    /// 分享转存
+    pub share_save: bool,
+    /// 按分类列全盘文件
+    pub categories: bool,
 }
 
 impl Default for DriveCaps {
@@ -70,6 +87,16 @@ impl Default for DriveCaps {
             recycle: false,
             upload: true,
             download: true,
+            recycle_list: false,
+            recycle_restore: false,
+            recycle_delete: false,
+            recycle_clear: false,
+            cloud_add: false,
+            cloud_tasks: false,
+            upload_records: false,
+            share_info: false,
+            share_save: false,
+            categories: false,
         }
     }
 }
@@ -93,6 +120,16 @@ impl DriveCaps {
             recycle: true,
             upload: true,
             download: true,
+            recycle_list: true,
+            recycle_restore: true,
+            recycle_delete: true,
+            recycle_clear: true,
+            cloud_add: true,
+            cloud_tasks: true,
+            upload_records: true,
+            share_info: true,
+            share_save: true,
+            categories: true,
         }
     }
 }
@@ -287,6 +324,61 @@ pub trait Drive: Send + Sync {
 
     async fn cancel_shares(&self, _ids: &[String]) -> Result<OpReport> {
         Err(Error::unsupported("该网盘不支持分享"))
+    }
+
+    // ───────────── 回收站 ─────────────
+    /// 回收站列表（最近删除）。
+    async fn recycle_list(&self) -> Result<Vec<RecycleEntry>> {
+        Err(Error::unsupported("该网盘不支持回收站"))
+    }
+
+    /// 从回收站恢复。
+    async fn recycle_restore(&self, _ids: &[String]) -> Result<OpReport> {
+        Err(Error::unsupported("该网盘不支持恢复回收站条目"))
+    }
+
+    /// 从回收站彻底删除（不可恢复）。
+    async fn recycle_delete(&self, _ids: &[String]) -> Result<OpReport> {
+        Err(Error::unsupported("该网盘不支持彻底删除回收站条目"))
+    }
+
+    /// 清空回收站。
+    async fn recycle_clear(&self) -> Result<OpReport> {
+        Err(Error::unsupported("该网盘不支持清空回收站"))
+    }
+
+    // ───────────── 云添加（离线下载 / BT） ─────────────
+    /// 添加云任务：直链或 magnet 链接，保存到 dest_dir。
+    async fn cloud_add(&self, _url: &str, _dest_dir: &str) -> Result<String> {
+        Err(Error::unsupported("该网盘不支持云添加"))
+    }
+
+    /// 云任务列表。
+    async fn cloud_tasks(&self) -> Result<Vec<CloudTask>> {
+        Err(Error::unsupported("该网盘不支持云任务"))
+    }
+
+    // ───────────── 记录 ─────────────
+    /// 上传记录 / 最近操作记录。
+    async fn upload_records(&self, _limit: usize) -> Result<Vec<UploadRecord>> {
+        Err(Error::unsupported("该网盘不支持上传记录"))
+    }
+
+    // ───────────── 分享增强 ─────────────
+    /// 解析/校验分享链接（转存前预览）。
+    async fn share_info(&self, _url: &str, _password: &str) -> Result<ShareDetail> {
+        Err(Error::unsupported("该网盘不支持解析分享链接"))
+    }
+
+    /// 转存分享到自己的网盘目录。
+    async fn save_shared(&self, _url: &str, _password: &str, _dest_dir: &str) -> Result<OpReport> {
+        Err(Error::unsupported("该网盘不支持转存分享"))
+    }
+
+    // ───────────── 分类浏览 ─────────────
+    /// 按分类列出全盘文件。`category` 取值：video/audio/image/doc/app/other/all。
+    async fn category_list(&self, _category: &str) -> Result<Vec<RemoteEntry>> {
+        Err(Error::unsupported("该网盘不支持分类浏览"))
     }
 
     // ───────────── 其它 ─────────────

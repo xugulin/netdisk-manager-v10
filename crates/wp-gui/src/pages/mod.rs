@@ -4,4 +4,5 @@ pub mod browser;
 pub mod guard_page;
 pub mod logs;
 pub mod settings;
+pub mod tools;
 pub mod transfers;

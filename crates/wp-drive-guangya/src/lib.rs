@@ -21,11 +21,13 @@
 //! # 能力
 //! * 扫码 / 短信 / 令牌登录，access+refresh 令牌持久化与 401 自愈；
 //! * 浏览、分页列目录、递归建目录、删除（进回收站）、直链、分享；
+//! * 回收站列表 / 清空、云添加任务创建 / 列表、上传/操作记录；
 //! * 上传：MD5 → `get_res_center_token` → OSS V1 签名单 PUT（小文件）或
 //!   multipart（大文件）→ 业务完成确认 → 轮询任务；
 //! * 下载：取签名直链 → 单连接断点续传 / 多段并发（`wp-net` 下载器）。
 //!
-//! 不支持的 Drive 能力（无服务端接口）：重命名、移动/复制、搜索、回收站列表、转存。
+//! 不支持的 Drive 能力（无服务端接口）：重命名、移动/复制、搜索、回收站单项
+//! 恢复/彻底删除、分享解析/转存、分类浏览。
 //!
 //! # 线程安全
 //! 内部实例 `GuangyaDrive` 只使用 `Mutex<Option<...>>` 保护扫码/短信临时状态，
@@ -37,6 +39,8 @@ mod cloud_add;
 mod device;
 mod download;
 mod files;
+mod records;
+mod recycle;
 mod session;
 mod share;
 mod sign;
@@ -215,24 +219,36 @@ impl GuangyaDrive {
         body: Value,
         allow_codes: &[i64],
     ) -> Result<Value> {
+        self.api_post_opt(path, Some(body), allow_codes).await
+    }
+
+    /// 业务 API POST，不带请求体（`clear_recycle_bin` 明确要求无 body）。
+    pub(crate) async fn api_post_no_body(&self, path: &str, allow_codes: &[i64]) -> Result<Value> {
+        self.api_post_opt(path, None, allow_codes).await
+    }
+
+    async fn api_post_opt(
+        &self,
+        path: &str,
+        body: Option<Value>,
+        allow_codes: &[i64],
+    ) -> Result<Value> {
         let url = format!("{API_BASE}{path}");
         let mut refreshed = false;
         loop {
             let token = self.bearer().await?;
-            let mut h = self.api_headers(Some("application/json"))?;
+            let content_type = body.as_ref().map(|_| "application/json");
+            let mut h = self.api_headers(content_type)?;
             h.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {token}"))
                     .map_err(|e| Error::other(format!("Authorization 头非法：{e}")))?,
             );
-            let resp = self
-                .api
-                .post(&url)
-                .headers(h)
-                .json(&body)
-                .send()
-                .await
-                .map_err(wp_net::client::net_err)?;
+            let mut req = self.api.post(&url).headers(h);
+            if let Some(body) = body.as_ref() {
+                req = req.json(body);
+            }
+            let resp = req.send().await.map_err(wp_net::client::net_err)?;
             let status = resp.status().as_u16();
             let request_id = response_request_id(&resp);
             let text = resp.text().await.map_err(wp_net::client::net_err)?;
@@ -319,10 +335,23 @@ impl Drive for GuangyaDrive {
             search: false,
             share: true,
             direct_link: true,
-            // Drive trait 没有回收站列表/清空入口；delete 默认进回收站。
-            recycle: false,
+            // 回收站：有列表和清空；源码没有单项恢复/彻底删除接口。
+            recycle: true,
             upload: true,
             download: true,
+            recycle_list: true,
+            recycle_restore: false,
+            recycle_delete: false,
+            recycle_clear: true,
+            // 云添加：创建任务 + 任务列表；没有暂停/删除任务接口。
+            cloud_add: true,
+            cloud_tasks: true,
+            // 上传/操作记录来自 get_user_action。
+            upload_records: true,
+            // 分享没有解析/转存接口；也没有按分类列全盘文件的接口。
+            share_info: false,
+            share_save: false,
+            categories: false,
         }
     }
 
@@ -438,6 +467,29 @@ impl Drive for GuangyaDrive {
 
     async fn cancel_shares(&self, ids: &[String]) -> Result<wp_core::model::OpReport> {
         share::cancel_shares(self, ids).await
+    }
+
+    // 回收站在 recycle.rs，上传/操作记录在 records.rs，云添加在 cloud_add.rs。
+    // 恢复/彻底删除/分享解析/转存/分类浏览没有服务端接口，沿用 trait 默认
+    // 的 Unsupported 实现（caps 中也已标为 false）。
+    async fn recycle_list(&self) -> Result<Vec<wp_core::model::RecycleEntry>> {
+        recycle::list(self).await
+    }
+
+    async fn recycle_clear(&self) -> Result<wp_core::model::OpReport> {
+        recycle::clear(self).await
+    }
+
+    async fn cloud_add(&self, url: &str, dest_dir: &str) -> Result<String> {
+        crate::cloud_add::add(self, url, dest_dir).await
+    }
+
+    async fn cloud_tasks(&self) -> Result<Vec<wp_core::model::CloudTask>> {
+        crate::cloud_add::tasks(self).await
+    }
+
+    async fn upload_records(&self, limit: usize) -> Result<Vec<wp_core::model::UploadRecord>> {
+        records::upload_records(self, limit).await
     }
 
     async fn write_probe(&self) -> Result<String> {
@@ -653,6 +705,12 @@ mod tests {
         assert!(caps.auth.qr && caps.auth.sms && caps.auth.token && !caps.auth.cookie);
         assert!(caps.upload && caps.download && caps.share && caps.direct_link);
         assert!(!caps.rename && !caps.move_copy && !caps.search);
+        // 新能力：回收站列表/清空、云添加/任务、上传记录可用；
+        // 恢复/彻底删除/分享解析/转存/分类浏览无接口。
+        assert!(caps.recycle && caps.recycle_list && caps.recycle_clear);
+        assert!(!caps.recycle_restore && !caps.recycle_delete);
+        assert!(caps.cloud_add && caps.cloud_tasks && caps.upload_records);
+        assert!(!caps.share_info && !caps.share_save && !caps.categories);
         // 未登录时 account() 必须是 Auth，且不能发起网络请求。
         let err = drive.account().await.unwrap_err();
         assert!(err.is_auth());

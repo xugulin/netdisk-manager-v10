@@ -249,7 +249,8 @@ fn root_entry() -> RemoteEntry {
     }
 }
 
-fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
+/// 取第一个非空字符串字段（数字也转成字符串）；供回收站/记录/云任务映射复用。
+pub(crate) fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
     for k in keys {
         let Some(val) = v.get(*k) else { continue };
         let s = match val {
@@ -264,7 +265,8 @@ fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn first_u64(v: &Value, keys: &[&str]) -> Option<u64> {
+/// 取第一个非负整数字段（数字/字符串都认）。
+pub(crate) fn first_u64(v: &Value, keys: &[&str]) -> Option<u64> {
     for k in keys {
         let Some(val) = v.get(*k) else { continue };
         if let Some(n) = val.as_u64() {
@@ -285,7 +287,7 @@ fn first_u64(v: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 /// 服务端时间可能是秒、毫秒、浮点或字符串；统一成 Unix 秒。
-fn first_ts(v: &Value, keys: &[&str]) -> Option<i64> {
+pub(crate) fn first_ts(v: &Value, keys: &[&str]) -> Option<i64> {
     for k in keys {
         let Some(val) = v.get(*k) else { continue };
         let mut n = match val {

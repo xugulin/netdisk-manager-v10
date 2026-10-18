@@ -4,7 +4,7 @@
 //! 渲染结束后统一执行，避免 UI 闭包里持有 `&mut App` 与只读借用的冲突。
 
 use crate::app::{
-    AccountStatus, App, BrowseState, DetailsDialog, Dialog, DirPickerAction, ToastKind,
+    AccountStatus, App, BrowseState, DetailsDialog, Dialog, DirPickerAction, ToastKind, ToolsTab,
 };
 use crate::theme::{self, Theme};
 use crate::widgets;
@@ -298,6 +298,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     actions.push(Action::Details(selected_entries[0].clone()));
                 }
                 ui.close();
+            }
+            ui.separator();
+            let tools_items: &[(&str, ToolsTab)] = &[
+                ("🗑 回收站", ToolsTab::Recycle),
+                ("☁ 云任务 / 云添加", ToolsTab::Cloud),
+                ("🕘 上传记录", ToolsTab::Records),
+                ("🔗 分享管理 / 转存", ToolsTab::Shares),
+                ("🗂 分类浏览", ToolsTab::Categories),
+            ];
+            for (label, tab) in tools_items {
+                if ui.button(*label).clicked() {
+                    actions.push(Action::OpenTools(*tab));
+                    ui.close();
+                }
             }
             ui.separator();
             if ui.button("全选").clicked() {
@@ -626,6 +640,7 @@ pub enum Action {
     SelectEntry(String, bool),
     ToggleSelect(String),
     Open(RemoteEntry),
+    OpenTools(ToolsTab),
 }
 
 fn apply(app: &mut App, action: Action) {
@@ -789,5 +804,10 @@ fn apply(app: &mut App, action: Action) {
             }
         }
         Action::Open(e) => app.open_entry(&e),
+        Action::OpenTools(tab) => {
+            app.page = crate::app::Page::Tools;
+            app.tools.tab = Some(tab);
+            app.tools.loaded_key.clear();
+        }
     }
 }

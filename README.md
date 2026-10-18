@@ -23,7 +23,11 @@
 | 传输队列 | ✅ | 小/大文件分级并发、失败重试（指数退避）、暂停/继续/取消、任务持久化（重启恢复） |
 | 跨盘传输 | ✅ | 源盘下载到本地缓存 → 目标盘上传（不经第三方中转） |
 | 敏感词守卫 | ✅ | AC 自动机、最长命中、按实例词库、警告/拦截/自动改名（拼音规避）、百度非法字符命名规避 |
-| 分享 | ✅（三家协议已接） | 创建分享、链接/提取码一键复制 |
+| 分享 | ✅ | 创建/列表/取消；**分享链接校验 + 转存**（百度/夸克） |
+| 回收站 | ✅ 新增 | 列表 / 恢复 / 彻底删除 / 清空（按各家实际接口能力显示） |
+| 云添加（离线下载/BT） | ✅ 新增 | 光鸭云盘：直链/magnet 创建任务 + 任务列表；百度因创建参数未抓到暂不实现 |
+| 上传记录 / 操作记录 | ✅ 新增 | 光鸭云盘 |
+| 分类浏览 | ✅ 新增 | 百度网盘：全盘视频/音频/图片/文档/应用/其它 |
 | 多账号实例 | ✅ | 同一家网盘可挂多个账号，凭证目录互相隔离 |
 | 主题 | ✅ | 10 套（Dracula / One Dark / Nord / Tokyo Night / Catppuccin …），对齐 V2 主题管理器 |
 | 播放内核 / AI / 刮削 / 弹幕 | ❌ 不移植 | V2 的视频播放与 AI 是另一套大工程，不属于「网盘管理」核心（详见 [PORTING.md](docs/PORTING.md)） |
@@ -70,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Portable
 
 ```bash
 ./scripts/build-linux.sh
-./scripts/smoke-headless.sh    # Xvfb 里跑页面+对话框共 17 项并截图 → 出/验收截图/*.png
+./scripts/smoke-headless.sh    # Xvfb 里跑页面+对话框+工具页共 22 项并截图 → 出/验收截图/*.png
 ```
 
 单页/单对话框截图（排查 UI 用）：
@@ -91,6 +95,12 @@ GUI 之外还有同一套适配器的 CLI，适合批量验证、自动化和无
 ./出/网盘管理-linux-x64/wp-cli --drive quark upload /tmp/a.bin /测试目录
 ./出/网盘管理-linux-x64/wp-cli --drive quark download /测试目录/a.bin /tmp/a.bin
 ./出/网盘管理-linux-x64/wp-cli --drive baidu account   # 账号/容量
+# 新增能力：
+./出/网盘管理-linux-x64/wp-cli --drive quark recycle-list          # 回收站
+./出/网盘管理-linux-x64/wp-cli --drive guangya cloud-add <链接|magnet> /目录
+./出/网盘管理-linux-x64/wp-cli --drive guangya records             # 上传记录
+./出/网盘管理-linux-x64/wp-cli --drive baidu categories video      # 分类浏览
+./出/网盘管理-linux-x64/wp-cli --drive quark share-info <分享链接> [提取码]
 ./出/网盘管理-linux-x64/wp-cli --help
 ```
 
@@ -101,9 +111,10 @@ GUI 之外还有同一套适配器的 CLI，适合批量验证、自动化和无
 | 项 | 结果 |
 |---|---|
 | `cargo check --workspace` | ✅ 0 error / 0 warning |
-| `cargo test --workspace` | ✅ **159** 个测试全部通过 |
+| `cargo test --workspace` | ✅ **196** 个测试全部通过 |
 | `cargo build --release -p wp-gui` | ✅ 单文件约 24 MB |
-| `scripts/smoke-headless.sh` | ✅ 17 项截图全部通过（页面 + 10 类对话框） |
+| `scripts/smoke-headless.sh` | ✅ 22 项截图全部通过（页面 + 10 类对话框 + 5 个工具页） |
+| **接口覆盖** | [docs/API_COVERAGE.md](docs/API_COVERAGE.md)：百度 95 个 HAR 路径 + 夸克 24 接口 + 光鸭 30+ 接口的地毯式扫描矩阵（已实现/未实现原因） |
 | **真机联调**（真实账号） | ✅ 光鸭/夸克全链路（登录/列目录/上传分片/下载 **sha256 一致**/直链/分享/删除）；百度：Cookie 登录后列目录/建目录/重命名/删除/下载/分享 ✅，文件上传因**账号超容**被服务端拒绝（errno:-10，非客户端问题）——详见 [待验证清单](docs/待验证清单.md) |
 
 详细报告：[docs/验收报告.md](docs/验收报告.md)

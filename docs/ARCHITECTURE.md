@@ -21,7 +21,8 @@
 └──────────────┬────────────────────────────────────────────────┘
                │ Arc<dyn Drive>
 ┌──────────────▼────────────────────────────────────────────────┐
-│ wp-drive：统一 Drive trait                                      │
+│ wp-drive：统一 Drive trait（文件/传输/分享/回收站/云添加/记录/   │
+│           分享转存/分类浏览，能力集 DriveCaps 逐家裁剪）         │
 │  ├─ wp-drive-baidu   (百度 PCS 协议)                            │
 │  ├─ wp-drive-quark   (夸克 clouddrive 协议)                     │
 │  ├─ wp-drive-guangya (光鸭 + 阿里云 OSS V1 签名)                 │
@@ -141,7 +142,7 @@ app.rs         全局状态 App、Event 通道、页面布局、快捷键、截�
 theme.rs       10 套主题色板 + egui Visuals 映射
 fonts.rs       中文字体探测与注入、QR PNG → 纹理
 widgets.rs     卡片/徽标/按钮/进度条/空态/文件图标等通用小部件
-pages/         browser / transfers / guard_page / logs / settings / about
+pages/         browser / transfers / tools / guard_page / logs / settings / about
 dialogs.rs     全部模态对话框（Modal）
 ```
 

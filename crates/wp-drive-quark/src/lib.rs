@@ -15,6 +15,7 @@
 mod auth;
 mod download;
 mod files;
+mod recycle;
 mod session;
 mod share;
 mod upload;
@@ -27,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wp_core::error::ErrorKind;
 use wp_core::model::{
     AccountInfo, AuthCaps, DirectLink, DownloadOptions, DriveKind, OpReport, ProgressFn,
-    RemoteEntry, ShareInfo, UploadOptions,
+    RecycleEntry, RemoteEntry, ShareDetail, ShareInfo, UploadOptions,
 };
 use wp_core::{Error, Result};
 use wp_drive::{Drive, DriveCaps, DriveInit, QrChallenge, QrPoll, ShareOptions};
@@ -421,10 +422,20 @@ impl Drive for QuarkDrive {
             search: true,
             share: true,
             direct_link: true,
-            // Drive trait 没有回收站接口。
-            recycle: false,
+            recycle: true,
             upload: true,
             download: true,
+            recycle_list: true,
+            recycle_restore: true,
+            recycle_delete: true,
+            recycle_clear: true,
+            // 夸克没有可用的上传记录/云添加/分类浏览接口，保持 Unsupported。
+            cloud_add: false,
+            cloud_tasks: false,
+            upload_records: false,
+            share_info: true,
+            share_save: true,
+            categories: false,
         }
     }
 
@@ -521,6 +532,34 @@ impl Drive for QuarkDrive {
 
     async fn cancel_shares(&self, ids: &[String]) -> Result<OpReport> {
         self.cancel_shares_impl(ids).await
+    }
+
+    // ───────────── 回收站 ─────────────
+
+    async fn recycle_list(&self) -> Result<Vec<RecycleEntry>> {
+        self.recycle_list_impl().await
+    }
+
+    async fn recycle_restore(&self, ids: &[String]) -> Result<OpReport> {
+        self.recycle_restore_impl(ids).await
+    }
+
+    async fn recycle_delete(&self, ids: &[String]) -> Result<OpReport> {
+        self.recycle_delete_impl(ids).await
+    }
+
+    async fn recycle_clear(&self) -> Result<OpReport> {
+        self.recycle_clear_impl().await
+    }
+
+    // ───────────── 分享增强 ─────────────
+
+    async fn share_info(&self, url: &str, password: &str) -> Result<ShareDetail> {
+        self.share_info_impl(url, password).await
+    }
+
+    async fn save_shared(&self, url: &str, password: &str, dest_dir: &str) -> Result<OpReport> {
+        self.save_shared_impl(url, password, dest_dir).await
     }
 }
 
@@ -643,7 +682,11 @@ mod tests {
         let c = d.caps();
         assert!(c.auth.qr && c.auth.cookie);
         assert!(c.upload && c.download && c.share && c.direct_link && c.search);
-        assert!(!c.recycle);
+        assert!(c.recycle);
+        assert!(c.recycle_list && c.recycle_restore && c.recycle_delete && c.recycle_clear);
+        assert!(c.share_info && c.share_save);
+        assert!(!c.upload_records);
+        assert!(!c.cloud_add && !c.cloud_tasks && !c.categories);
         assert!(d.id() == "q");
         assert_eq!(d.kind(), DriveKind::Quark);
         assert_eq!(d.name(), "q");

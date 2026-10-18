@@ -74,6 +74,12 @@ run_case "14-分享"          --drive demo --dialog share
 run_case "15-跨盘传输"      --drive demo --dialog crosscopy
 run_case "16-文件详情"      --drive demo --dialog details
 run_case "17-本地文件选择"  --drive demo --dialog filepicker
+# ── 工具页（演示网盘内置演示数据）
+run_case "18-工具-回收站"    --drive demo --page tools --tools-tab recycle
+run_case "19-工具-云任务"    --drive demo --page tools --tools-tab cloud
+run_case "20-工具-上传记录"  --drive demo --page tools --tools-tab records
+run_case "21-工具-分享管理"  --drive demo --page tools --tools-tab shares
+run_case "22-工具-分类浏览"  --drive demo --page tools --tools-tab categories
 
 echo
 echo "==> 结果：通过 $PASS 项，失败 $FAIL 项（截图目录：$OUT）"

@@ -316,6 +316,108 @@ pub struct ShareInfo {
     pub title: String,
 }
 
+/// 回收站条目。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RecycleEntry {
+    /// 回收站记录 id（fid / record_id / fs_id）
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+    pub is_dir: bool,
+    #[serde(default)]
+    pub size: u64,
+    /// 删除时间（Unix 秒）
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
+    /// 原路径（部分网盘提供）
+    #[serde(default)]
+    pub original_path: String,
+}
+
+/// 云添加（离线下载 / 转存）任务。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CloudTask {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    /// 原始状态（各家不同，原样保留）
+    #[serde(default)]
+    pub status: String,
+    /// 状态中文（适配器翻译，如 等待中/下载中/已完成/失败）
+    pub status_text: String,
+    #[serde(default)]
+    pub progress: f32,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub done: u64,
+    #[serde(default)]
+    pub created: Option<i64>,
+    #[serde(default)]
+    pub save_path: String,
+    #[serde(default)]
+    pub error: String,
+}
+
+/// 上传记录 / 操作记录条目。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UploadRecord {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub size: u64,
+    /// 时间（Unix 秒）
+    #[serde(default)]
+    pub time: Option<i64>,
+    /// 操作类型文本（上传/下载/删除/分享…）
+    #[serde(default)]
+    pub action: String,
+    /// 归属目录名（部分网盘提供）
+    #[serde(default)]
+    pub parent: String,
+}
+
+/// 分享链接解析详情（转存前预览）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ShareDetail {
+    /// 分享标题 / 文件列表名
+    pub title: String,
+    /// 分享链接
+    #[serde(default)]
+    pub url: String,
+    /// 提取码
+    #[serde(default)]
+    pub password: String,
+    /// 内容文件列表（可能为空：部分网盘只给标题）
+    #[serde(default)]
+    pub files: Vec<RemoteEntry>,
+    /// 过期时间（Unix 秒）
+    #[serde(default)]
+    pub expire_at: Option<i64>,
+    /// 适配器附加说明
+    #[serde(default)]
+    pub note: String,
+}
+
+/// 云添加任务状态辅助：把常见状态码翻译为中文。
+pub fn cloud_status_text(code: &str) -> String {
+    match code {
+        "0" | "pending" | "waiting" => "等待中".into(),
+        "1" | "running" | "downloading" => "下载中".into(),
+        "2" | "done" | "success" | "finished" => "已完成".into(),
+        "3" | "failed" | "error" => "失败".into(),
+        "4" | "paused" => "已暂停".into(),
+        "5" | "deleted" | "canceled" | "cancelled" => "已删除".into(),
+        other => other.to_string(),
+    }
+}
+
 /// 传输任务类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

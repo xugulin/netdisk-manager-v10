@@ -73,6 +73,12 @@ fn main() -> eframe::Result<()> {
                     i += 1;
                 }
             }
+            "--tools-tab" => {
+                if let Some(t) = next(i) {
+                    dev.tools_tab = Some(t);
+                    i += 1;
+                }
+            }
             other if other.starts_with("--drive=") => {
                 dev.initial_drive = Some(other["--drive=".len()..].to_string());
             }
