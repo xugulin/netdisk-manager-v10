@@ -10,7 +10,21 @@ libmpv 及其依赖（FFmpeg/libass/libplacebo/libbluray）的 vendored 构建�
 
 ---
 
-## media-stack（LGPL libmpv，M0-E1 已完成 Linux）
+## media-stack（LGPL libmpv，M0-E1 已完成 Linux；M6 合规版见下）
+
+### M6 合规：LGPL FFmpeg + 重链 libmpv + 自包含运行时（2026-10-19）
+
+- `./scripts/build-media-stack-linux.sh --lgpl-ffmpeg`：先自建 **LGPL FFmpeg 8.0**
+  （`--disable-gpl --disable-version3 --disable-nonfree`，装到 `vendor/build/ffmpeg-lgpl/`，
+  gitignore），再用它重链 mpv v0.41.0 → `vendor/prebuilt/linux-x86_64-lgpl/`。
+- `./scripts/package-player-runtime-linux.sh --self-contained`：自动收集 libmpv 的全部
+  非 glibc 依赖到 `播放器运行时/lib/`（108 个 .so、126MB），`patchelf rpath=$ORIGIN`，
+  合规校验（libav* 必须来自自建 LGPL FFmpeg、无 x264/x265/rubberband 等 GPL-only 组件）。
+- 发行请用自包含运行时；M0 的 `linux-x86_64/` 仅供开发联调（动态链接系统 FFmpeg，
+  发行版 FFmpeg 常为 GPL 构建 → 不可随包分发）。
+- 详细数据/验证证据：`docs/PLAYER_PACKAGING.md` §10。
+
+
 
 `scripts/build-media-stack-linux.sh` 用系统依赖 + mpv v0.41.0 源码构建 **LGPL libmpv**
 （`-Dgpl=false -Dlibmpv=true -Dcplayer=false`），产物布局：

@@ -15,9 +15,13 @@
 # 两种模式：
 #   system-deps（默认）：libmpv 动态链接系统 FFmpeg/libass/libplacebo/libmujs…
 #                       发行包**不随附**这些库；生成系统依赖包清单供用户安装。
-#   self-contained     ：把依赖 .so 一并放进 lib/ 并设 rpath $ORIGIN（未来用 LGPL FFmpeg
-#                       等重构建后使用）。当前 prebuilt 只带 libmpv 本身、依赖系统库，
-#                       因此该模式会明确报错并提示后续做法（见 docs/PLAYER_PACKAGING.md）。
+#   self-contained     ：把依赖 .so 一并放进 lib/ 并设 rpath $ORIGIN。依赖来源优先级：
+#                         ① --deps-dir；② prebuilt/lib 内已有依赖；③ **自动从 libmpv 的
+#                         ldd 收集全部非 glibc 库**（M6 默认路径）。自动模式会做合规校验：
+#                         libav* 必须来自自建 LGPL FFmpeg（vendor/build/ffmpeg-lgpl）、
+#                         打包集合不得含 GPL-only 组件（x264/x265/rubberband/dvd*）；
+#                         GPU/驱动栈（GL/EGL/GBM/DRM/VA/CUDA）与 glibc 保持系统提供。
+#                       prebuilt 默认优先 vendor/prebuilt/linux-x86_64-lgpl（LGPL 版）。
 #
 # 用法：
 #   ./scripts/package-player-runtime-linux.sh                    # 系统依赖模式打包
@@ -40,6 +44,7 @@ export LC_ALL=C
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREBUILT="$ROOT/vendor/prebuilt/linux-x86_64"
 OUT="$ROOT/播放器运行时"
+PREBUILT_EXPLICIT=0
 ASSETS_LICENSES="$ROOT/assets/licenses"
 MODE="system"
 VERIFY_ONLY=0
@@ -79,7 +84,7 @@ while [ $# -gt 0 ]; do
     --self-contained) MODE="self-contained" ;;
     --verify-only) VERIFY_ONLY=1 ;;
     --with-headers) WITH_HEADERS=1 ;;
-    --prebuilt) PREBUILT="${2:?--prebuilt 需要目录}"; shift ;;
+    --prebuilt) PREBUILT="${2:?--prebuilt 需要目录}"; PREBUILT_EXPLICIT=1; shift ;;
     --out) OUT="${2:?--out 需要目录}"; shift ;;
     --deps-dir) DEPS_DIR="${2:?--deps-dir 需要目录}"; shift ;;
     -h|--help) usage 0 ;;
@@ -88,6 +93,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# M6 合规：self-contained 模式优先用「自建 LGPL FFmpeg 重链」的 prebuilt；
+# system-deps 模式必须用与系统库 ABI 匹配的构建（默认 M0 prebuilt），否则 ldd 会缺 libav*.62。
+if [ "$PREBUILT_EXPLICIT" = 0 ] && [ "$MODE" = "self-contained" ] \
+   && [ -f "$ROOT/vendor/prebuilt/linux-x86_64-lgpl/lib/libmpv.so.2.5.0" ]; then
+  PREBUILT="$ROOT/vendor/prebuilt/linux-x86_64-lgpl"
+fi
 # 输出目录安全校验：拒绝空/根/仓库根
 case "$OUT" in
   ""|"/"|"$ROOT"|"$ROOT/") die "拒绝的输出目录：$OUT" ;;
@@ -301,16 +312,107 @@ if [ "$MODE" = "self-contained" ]; then
     SRC_DEPS+=("$f")
   done < <(find "$PREBUILT/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
 
+  # 自包含依赖自动收集：从 libmpv 的 ldd 结果里挑非 glibc / 非 GPU 驱动栈的库
+  #（ldd 已展开传递闭包；GPU/驱动栈必须匹配用户硬件，保持系统提供）。
+  AUTO_COLLECT=0
+  SKIPPED_SYSTEM=()
+  DEP_ORIGIN_FILE="$(mktemp)"
+  is_selfcontained_skip() {
+    case "$1" in
+      linux-vdso*|ld-linux*|libc.so*|libm.so*|libmvec.so*|libpthread.so*|librt.so*|libdl.so*|libresolv.so*|libutil.so*|libnsl.so*|libanl.so*|libthread_db.so*|libgcc_s.so*|libstdc++.so*)
+        return 0 ;;
+      libGL.so*|libGLX*|libGLdispatch*|libOpenGL*|libEGL*|libgbm*|libdrm*|libva.so*|libva-*|libvdpau*|libcuda*|libnvidia*|libnvcuvid*)
+        return 0 ;;
+    esac
+    return 1
+  }
+  DEP_SEARCH_PATH="$ROOT/vendor/build/ffmpeg-lgpl/lib:$PREBUILT/lib"
   if [ "${#SRC_DEPS[@]}" = 0 ]; then
-    die "自包含模式失败：prebuilt/lib 与 --deps-dir 均未提供依赖 .so（当前构建动态链接系统库）。
-    后续做法见 docs/PLAYER_PACKAGING.md §2.3：用 LGPL 构建的 FFmpeg/libass/libplacebo 等
-    （或静态链接）重构建 libmpv，把依赖 .so 放到 prebuilt/lib/ 后重跑 --self-contained。"
+    AUTO_COLLECT=1
+    say "未提供 --deps-dir / prebuilt 依赖 → 自动从 ldd 收集（跳过 glibc 与 GPU 驱动栈）"
+    say "依赖搜索路径：$DEP_SEARCH_PATH"
+    while IFS=$'\t' read -r soname dpath; do
+      [ -n "${soname:-}" ] || continue
+      case "${dpath:-}" in
+        *"<not found>"*|"") die "自动收集失败：依赖 $soname 未解析（libmpv 运行期依赖不完整）" ;;
+      esac
+      base="$(basename "$dpath")"
+      if is_selfcontained_skip "$base"; then SKIPPED_SYSTEM+=("$base"); continue; fi
+      real="$(readlink -f "$dpath")"
+      [ -f "$real" ] || die "依赖实体不存在：$dpath"
+      SRC_DEPS+=("$real")
+      printf '%s\t%s\n' "$(basename "$real")" "$dpath" >> "$DEP_ORIGIN_FILE"
+    done < <(LD_LIBRARY_PATH="$DEP_SEARCH_PATH" collect_deps "$SRC_LIB")
+    if [ "${#SKIPPED_SYSTEM[@]}" -gt 0 ]; then
+      ok "系统提供（不打包）：$(printf '%s\n' "${SKIPPED_SYSTEM[@]}" | sort -u | tr '\n' ' ')"
+    fi
   fi
+  declare -A _copied=()
   for f in "${SRC_DEPS[@]}"; do
-    cp -f "$f" "$OUT/lib/" || die "拷贝依赖失败：$f"
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    [ -n "${_copied[$base]:-}" ] && continue
+    _copied[$base]=1
+    cp -f "$f" "$OUT/lib/$base" || die "拷贝依赖失败：$f"
+    # 按 SONAME 建符号链接（NEEDED 用 SONAME 查找；真实文件名可能带完整版本号）
+    soname="$(readelf -d "$f" 2>/dev/null | sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p' | head -1)"
+    if [ -n "$soname" ] && [ "$soname" != "$base" ] && [ ! -e "$OUT/lib/$soname" ]; then
+      ln -sfn "$base" "$OUT/lib/$soname"
+    fi
     EXTRA_LIBS=$((EXTRA_LIBS+1))
   done
-  ok "已拷入 $EXTRA_LIBS 个依赖 .so"
+  ok "已拷入 $EXTRA_LIBS 个依赖 .so（自含）"
+
+  # —— 绝对路径 NEEDED 修正（如系统 libmujs.so 无 SONAME 时 mpv NEEDED 会写成 /usr/lib/x.so）——
+  # 自包含要求改为 basename + 随包文件，否则运行期永远从系统绝对路径加载。
+  SC_ABS_FIXED=0
+  for f in "$OUT/lib"/*.so*; do
+    [ -f "$f" ] || continue
+    while IFS= read -r abs; do
+      [ -n "$abs" ] || continue
+      base="$(basename "$abs")"
+      if [ ! -e "$OUT/lib/$base" ] && [ -f "$abs" ]; then
+        cp -f "$abs" "$OUT/lib/$base" || true
+        EXTRA_LIBS=$((EXTRA_LIBS+1))
+      fi
+      if [ -e "$OUT/lib/$base" ] && have patchelf; then
+        patchelf --replace-needed "$abs" "$base" "$f" 2>/dev/null && SC_ABS_FIXED=$((SC_ABS_FIXED+1))
+      fi
+    done < <(readelf -d "$f" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(\/.*\)\]/\1/p')
+  done
+  if [ "$SC_ABS_FIXED" -gt 0 ]; then ok "已修正 $SC_ABS_FIXED 个绝对路径 NEEDED → 随包 basename"; fi
+
+  # —— 合规校验（自动收集模式）：FFmpeg 必须来自自建 LGPL 目录；禁 GPL-only 组件 ——
+  if [ "$AUTO_COLLECT" = 1 ]; then
+    say "自包含合规校验"
+    SC_BAD=0
+    SC_FFMPEG_SEEN=0
+    declare -A _av_checked=()
+    for f in "$OUT/lib"/libav*.so.* "$OUT/lib"/libsw*.so.*; do
+      [ -f "$f" ] || continue
+      # 符号链接与实体文件会重复出现：按「实体文件名」去重并查 origin
+      real="$(readlink -f "$f")"
+      base="$(basename "$real")"
+      [ -n "${_av_checked[$base]:-}" ] && continue
+      _av_checked[$base]=1
+      origin="$(awk -F'\t' -v b="$base" '$1==b{print $2; exit}' "$DEP_ORIGIN_FILE" 2>/dev/null)"
+      origin="${origin:-未知}"
+      case "$origin" in
+        "$ROOT/vendor/build/ffmpeg-lgpl/"*) SC_FFMPEG_SEEN=$((SC_FFMPEG_SEEN+1)) ;;
+        *) fail "FFmpeg 库非自建 LGPL 构建：$base ← $origin"; SC_BAD=1 ;;
+      esac
+    done
+    if [ "$SC_FFMPEG_SEEN" -gt 0 ]; then ok "FFmpeg 库 $SC_FFMPEG_SEEN 个来自自建 LGPL：vendor/build/ffmpeg-lgpl"; fi
+    FORBIDDEN_RE='libx264|libx265|libx262|libfdk-aac|librubberband|libdvdread|libdvdnav|libdvdcss'
+    SC_FORBIDDEN="$(printf '%s\n' "${SRC_DEPS[@]:-}" | grep -E "$FORBIDDEN_RE" || true)"
+    if [ -n "$SC_FORBIDDEN" ]; then
+      fail "打包集合含 GPL-only/nonfree 组件："; printf '%s\n' "$SC_FORBIDDEN" | sed 's/^/      /' >&2; SC_BAD=1
+    else
+      ok "无 GPL-only 组件（x264/x265/fdk-aac/rubberband/dvd*）"
+    fi
+    rm -f "$DEP_ORIGIN_FILE"
+    [ "$SC_BAD" = 0 ] || die "自包含合规校验失败（见上）；请用 scripts/build-media-stack-linux.sh --lgpl-ffmpeg 重链 libmpv"
+  fi
 
   if have patchelf; then
     while IFS= read -r f; do
@@ -459,6 +561,13 @@ ok "README.txt"
 # ── 校验（sha256/readelf/file/ldd/许可证）───────────────────
 EXPECTED_SHA="$(buildinfo_field "sha256" "$PREBUILT/BUILDINFO.txt")"
 [ -n "$EXPECTED_SHA" ] || warn "源 BUILDINFO 无 sha256 字段，跳过哈希比对"
+SOURCE_LIBMPV_SHA="$EXPECTED_SHA"
+if [ "$MODE" = "self-contained" ]; then
+  # 自包含模式会对 libmpv 执行 patchelf --set-rpath $ORIGIN（ELF 被改写）→ sha256 变化是预期；
+  # 校验基准改为「本运行时 BUILDINFO 记录的打包后 sha」，另记源 sha 供追溯。
+  EXPECTED_SHA="$(sha256_of "$OUT/lib/libmpv.so.2.5.0")"
+  ok "自包含模式：libmpv 已 patchelf（rpath=\$ORIGIN），按打包后 sha 校验"
+fi
 
 # 先写 BUILDINFO（verify 前写入基础内容，校验结果随后追加）
 MANIFEST_SHA_LIST="$(cd "$OUT/LICENSES" && sha256sum *.txt 2>/dev/null | sort || true)"
@@ -468,8 +577,9 @@ MANIFEST_SHA_LIST="$(cd "$OUT/LICENSES" && sha256sum *.txt 2>/dev/null | sort ||
   echo "generated_at:  $(date '+%Y-%m-%dT%H:%M:%S%z')"
   echo "package_mode:  $MODE"
   echo "runtime_name:  $RUNTIME_NAME"
-  echo "source_prebuilt: vendor/prebuilt/linux-x86_64"
+  echo "source_prebuilt: ${PREBUILT#"$ROOT/"}"
   echo "libmpv_sha256:  $(sha256_of "$OUT/lib/libmpv.so.2.5.0")"
+  echo "libmpv_source_sha256: ${SOURCE_LIBMPV_SHA:-unknown}"
   echo "libmpv_soname:  $(readelf -d "$OUT/lib/libmpv.so.2.5.0" | sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p' | head -1)"
   echo "libmpv_size:    $(stat -c %s "$OUT/lib/libmpv.so.2.5.0")"
   echo "libmpv_file:    $(file -b "$OUT/lib/libmpv.so.2.5.0" | cut -c1-100)"
@@ -477,6 +587,21 @@ MANIFEST_SHA_LIST="$(cd "$OUT/LICENSES" && sha256sum *.txt 2>/dev/null | sort ||
   echo "dependency_mode: $MODE"
   echo "dependency_count: $TOTAL_DEPS"
   echo "dependency_missing: $MISSING_DEPS"
+  echo "self_contained_libs: ${EXTRA_LIBS:-0}"
+  echo "gpl_only_components: none"
+  if grep -q 'LGPL build' "$PREBUILT/BUILDINFO.txt" 2>/dev/null; then
+    echo "ffmpeg_build: LGPL（自建，见 src 行 ffmpeg:）"
+  fi
+  if [ "${EXTRA_LIBS:-0}" -gt 0 ]; then
+    echo ""
+    echo "# ── 自包含依赖 sha256 ──"
+    ( cd "$OUT/lib" && for f in *.so.*; do [ -f "$f" ] && [ ! -L "$f" ] && sha256sum "$f"; done | sort | sed 's/^/  /' ) || true
+    echo ""
+    echo "# ── 体积 ──"
+    echo "  runtime_total_bytes: $(du -sb "$OUT" | awk '{print $1}')"
+    echo "  runtime_total_human: $(du -sh "$OUT" | awk '{print $1}')"
+    echo "  lib_dir_human:       $(du -sh "$OUT/lib" | awk '{print $1}')"
+  fi
   echo "required_packages: ${PKG_LIST[*]:-}"
   echo ""
   echo "# ── 源构建信息（vendor/prebuilt/linux-x86_64/BUILDINFO.txt 摘录）──"

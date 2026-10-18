@@ -309,6 +309,10 @@ WP_MPV_LIB=/usr/lib/libmpv.so.2 ./网盘管理 --demo      # 应能启动（版�
 
 ## 5. FFmpeg / 依赖的 GPL 风险（发行必读）
 
+> ✅ **2026-10-19 更新**：已落地「自建 LGPL FFmpeg 8.0 + 重链 LGPL libmpv + 自包含运行时」，
+> 实测数据见 **§10**。发行请用 `播放器运行时/`（自包含，含 LGPL FFmpeg），
+> 不要用 system-deps 模式链接发行版 GPL FFmpeg。
+
 **事实（本机实测）**：Arch Linux 的 `ffmpeg 2:9.0.2` 是 **GPLv3 构建**：
 
 ```console
@@ -482,9 +486,9 @@ open_to_opened_ms ≈ 18.0ms, open_to_first_frame_ms ≈ 18.0ms
 
 | 脚本 | 作用 | 备注 |
 |---|---|---|
-| `scripts/build-media-stack-linux.sh` | 构建 LGPL libmpv → `vendor/prebuilt/linux-x86_64/` | 需 meson/ninja/FFmpeg 等构建依赖 |
+| `scripts/build-media-stack-linux.sh` | 构建 LGPL libmpv；`--lgpl-ffmpeg` 先自建 LGPL FFmpeg 8.0 再重链 → `vendor/prebuilt/linux-x86_64-lgpl/` | 需 meson/ninja/nasm/FFmpeg 构建依赖；见 §10 |
 | `scripts/build-media-stack-windows.ps1` | Windows 构建骨架（MSYS2 UCRT64） | 文档级，未实测 |
-| `scripts/package-player-runtime-linux.sh` | **运行时打包/校验**（系统依赖/自包含） | 默认 `--system-deps`；`--verify-only` |
+| `scripts/package-player-runtime-linux.sh` | **运行时打包/校验**（系统依赖/自包含） | 默认 `--system-deps`；`--self-contained` 自动收集依赖+合规校验（§10）；`--verify-only` |
 | `scripts/package-player-runtime-windows.ps1` | Windows 运行时结构级生成/校验 | 不下载 DLL；PE 校验需 Windows |
 | `scripts/release-verify-linux.sh` | **发布验收**：静态校验 + 随包库真实加载 + 发布布局模拟 + 短播放 | 退出码可进 CI；见 §8 |
 | `scripts/build-linux.sh --portable` | 构建便携目录并自动拷入 `播放器运行时/` | 已对接 |
@@ -506,14 +510,164 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-window
 
 ---
 
-## 10. 已知限制与后续
+## 10. M6 合规自包含运行时实测（LGPL FFmpeg + libmpv，2026-10-19）
+
+> 目标：解决「vendored libmpv 动态链接发行版 **GPL(v3) FFmpeg** → 随包分发不合规」。
+> 结果：**自建 LGPL FFmpeg 8.0 + 重链 LGPL libmpv v0.41.0 + 108 个依赖全自包含运行时**，
+> 合规校验 PASS，clean-env dlopen/播放/render API 均实测通过。体积 **126 MB**。
+
+### 10.1 结论速览
+
+| 项 | 结果 |
+|---|---|
+| LGPL FFmpeg | ✅ **8.0** 源码构建，configure 输出 `License: LGPL version 2.1 or later`；`vendor/build/ffmpeg-lgpl/` |
+| LGPL libmpv | ✅ mpv **v0.41.0** 用自建 FFmpeg 重链；sha256 `4994092c…`；NEEDED `libavcodec.so.62`（自建 ABI，非系统 .63） |
+| 自包含运行时 | ✅ `播放器运行时/` 126 MB：libmpv + **108 个依赖 .so**（含 7 个 libav*/libsw*）+ 103 个 SONAME 符号链接 |
+| 合规校验 | ✅ `gpl_only_components: none`；无 x264/x265/rubberband/dvd*；7 个 FFmpeg 库均来自自建目录 |
+| ldd 全解析 | ✅ `--verify-only` PASS（0 错误）；`LD_LIBRARY_PATH=播放器运行时/lib ldd`：0 个 not found |
+| 干净 dlopen | ✅ `env -i`（无任何库路径）`ctypes.CDLL(播放器运行时/lib/libmpv.so.2)` → client API 2.5、`mpv_create` 成功 |
+| 依赖来源审计 | ✅ `LD_DEBUG=libs`：系统 `libavcodec` 加载 **0** 次，运行时 `libavcodec` 加载 1 次；运行时库共加载 106 个 |
+| 播放实测 | ✅ mpv-probe：1080p 播放 5s，首帧 38 ms，无错误；render_probe（Mode A）：47 帧/5s、`gl_error=0` |
+| 既有流程回归 | ✅ `--system-deps` 模式仍可用（默认仍用 M0 prebuilt；LGPL 版只用于 self-contained） |
+
+### 10.2 自建 LGPL FFmpeg（8.0）
+
+```bash
+# 一条命令（含下载/configure/make/install；首次约 5-8 分钟，8 核）
+./scripts/build-media-stack-linux.sh --lgpl-ffmpeg
+# 只建 FFmpeg（调试 configure 用）：
+./scripts/build-media-stack-linux.sh --lgpl-ffmpeg --ffmpeg-only
+
+# 等价手工命令
+curl -fL -o ffmpeg-8.0.tar.xz https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz
+tar -xJf ffmpeg-8.0.tar.xz && cd ffmpeg-8.0
+./configure --prefix="$PWD/vendor/build/ffmpeg-lgpl" \
+  --disable-gpl --disable-version3 --disable-nonfree \
+  --disable-doc --disable-programs \
+  --enable-shared --disable-static --enable-pic --disable-debug \
+  --enable-vaapi
+make -j"$(nproc)" && make install
+```
+
+- 依赖：`nasm`（x86 汇编；缺了 configure 直接报错，脚本依赖检查里可加）、gcc/glibc、make；
+- 产物（`vendor/build/ffmpeg-lgpl/lib/`）：`libavcodec.so.62.11.100`(19.4MB) / `libavformat.so.62` /
+  `libavutil.so.60` / `libavfilter.so.11` / `libavdevice.so.62` / `libswresample.so.6` / `libswscale.so.9` + pkgconfig；
+- 构建日志：`${XDG_CACHE_HOME}/wp-media-stack-build/ffmpeg-build.log`（含 `License: LGPL version 2.1 or later`）。
+
+### 10.3 重链 LGPL libmpv v0.41.0
+
+```bash
+PKG_CONFIG_PATH="$PWD/vendor/build/ffmpeg-lgpl/lib/pkgconfig" \
+./scripts/build-media-stack-linux.sh --lgpl-ffmpeg
+# 产物：vendor/prebuilt/linux-x86_64-lgpl/{lib,include,licenses,mpv.pc,BUILDINFO.txt}
+```
+
+meson 选项：`-Dgpl=false -Dlibmpv=true -Dcplayer=false -Drubberband=disabled -Djavascript=disabled`
+（**rubberband 是 GPL 依赖**；**禁用 mpv 内置 JS（libmujs）**——系统 mujs 无 SONAME 会写成绝对路径
+NEEDED，禁用后运行时更干净；本应用不使用 mpv JS 脚本）。
+
+实测数据：
+
+| 字段 | 值 |
+|---|---|
+| mpv | v0.41.0 / client API **2.5** |
+| 产物 | `libmpv.so.2.5.0`，3,401,784 B，sha256 `4994092c2e54dfcde94b158bbe51feebd6a4d4f62b6071082dfab13bf42fe7b4` |
+| FFmpeg ABI | NEEDED `libavcodec.so.62`（FFmpeg 8；系统 FFmpeg 9 是 `.63`，可作为「没有误链系统库」的判据） |
+| 构建信息 | `vendor/prebuilt/linux-x86_64-lgpl/BUILDINFO.txt`（sha256 / NEEDED / ldd / ffmpeg 来源 / configure license） |
+
+### 10.4 自包含运行时打包（自动收集 + 合规校验）
+
+```bash
+./scripts/package-player-runtime-linux.sh --self-contained
+# → ./播放器运行时/（.gitignore 已忽略）：
+#    lib/libmpv.so.2.5.0 + 108 依赖 .so + SONAME 符号链接（rpath=$ORIGIN）
+#    LICENSES/（11 份，含 FFmpeg-LGPL-2.1.txt）、源码获取说明.txt、DEPENDENCIES.txt、BUILDINFO.txt
+```
+
+脚本行为（本次扩展）：
+
+1. **prebuilt 选择**：self-contained 自动优先 `vendor/prebuilt/linux-x86_64-lgpl`；system-deps 仍用 M0 prebuilt；
+2. **依赖自动收集**：从 libmpv 的 `ldd`（带自建 FFmpeg 搜索路径）递归收集全部非 glibc 依赖；
+   **glibc + GPU/驱动栈**（GL/EGL/GBM/DRM/VA/VDPAU/CUDA）保持系统提供，清单写入 BUILDINFO；
+3. **SONAME 符号链接**：按 `readelf SONAME` 建链（如 `libavcodec.so.62 → libavcodec.so.62.11.100`）；
+4. **绝对路径 NEEDED 修正**：如系统 mujs 这类无 SONAME 依赖，`patchelf --replace-needed` 改为 basename 并随包；
+5. **patchelf --set-rpath '$ORIGIN'**：每个库都设；libmpv 被改写 → sha256 走「打包后」校验，
+   源 sha 记在 `libmpv_source_sha256`；
+6. **合规校验**（失败即退出非 0）：libav* 必须来自 `vendor/build/ffmpeg-lgpl/`；打包集合禁
+   `libx264/libx265/libfdk-aac/librubberband/libdvd*`；`ldd` 全解析；clean-env dlopen。
+
+实测产物数据：
+
+| 字段 | 值 |
+|---|---|
+| 体积 | **126 MB**（lib/ 126MB；109 个实体 .so + 102 个 SONAME 符号链接） |
+| 依赖 | 122 项（8 项为系统包：libdrm/libglvnd/libva/libvdpau/libx11/libxcb/expat/mesa），108 项随包 |
+| 合规 | `gpl_only_components: none`；无 GPL-only 组件；7 个 FFmpeg 库来自自建目录 |
+| 许可证 | LICENSES/ 11 份（LGPL-2.1/GPL-2.0/FFmpeg-LGPL-2.1/libass-ISC/libplacebo/libbluray/libaacs/libbdplus/ANGLE/mpv-Copyright + README） |
+
+### 10.5 验证证据（本机实测）
+
+```text
+# ① 干净环境 dlopen（env -i，无任何 LD_LIBRARY_PATH / 系统 FFmpeg 参与）
+dlopen OK client API 2.5 mpv_create=True
+
+# ② ldd 全解析（仅靠 rpath=$ORIGIN，无 LD_LIBRARY_PATH）
+$ env -u LD_LIBRARY_PATH ldd 播放器运行时/lib/libmpv.so.2 | grep -c 'not found'
+0
+$ env -u LD_LIBRARY_PATH ldd 播放器运行时/lib/libmpv.so.2 | grep libavcodec
+  libavcodec.so.62 => .../播放器运行时/lib/libavcodec.so.62
+
+# ③ LD_DEBUG 依赖来源审计（Rust 进程内真实加载）
+system_libavcodec_loaded=0
+runtime_libavcodec_loaded=1
+runtime_lib(已加载数)=106
+system_lib(允许清单外)=（无）
+
+# ④ 播放（mpv-probe，随包运行时，rpath 解析）
+{'state': 'Playing', 'video_size': [1920, 1080], 'duration_secs': 30.0,
+ 'hwdec_current': 'no', 'position_secs': 5.0, 'open_to_first_frame_ms': 38.2,
+ 'mpv_version': 'mpv v0.41.0（client API 2.5）'}  errors: []
+
+# ⑤ Mode A 渲染（render_probe，Xvfb + 随包 libmpv）
+{'state': 'Playing', 'video': [1920,1080], 'frames_rendered': 47, 'first_frame': True,
+ 'gl_error': 0, 'open_to_first_frame_ms': 115.3}
+
+# ⑥ 既有流程回归
+package-player-runtime-linux.sh --system-deps --out /tmp/rt-system  → 通过（默认 M0 prebuilt）
+package-player-runtime-linux.sh --verify-only                        → 校验通过（0 错误）
+```
+
+> 说明：`LD_DEBUG` 里仍会看到少量 `/usr/lib` 库（`libexpat`/`libX11-xcb`/`libxcb-dri3`），
+> 原因是**宿主进程已加载同名库**（Python/GUI 工具链）→ 动态加载器按 SONAME 复用已加载实例，
+> 属正常 ABI 行为；仅 GPU/驱动栈（GL/EGL/GBM/DRM/VA）与 glibc 保留系统提供（必须匹配用户硬件）。
+
+### 10.6 使用方式
+
+- 发行：`./scripts/build-linux.sh --portable` 会把 `播放器运行时/` 拷进便携目录；应用加载顺序
+  见 §2.5（`WP_MPV_LIB` > 随包 `播放器运行时/lib` > 系统兜底）。
+- 开发联调：`WP_MPV_LIB="$PWD/vendor/prebuilt/linux-x86_64-lgpl/lib/libmpv.so.2"`；
+  或自包含运行时 `WP_MPV_LIB="$PWD/播放器运行时/lib/libmpv.so.2"`（依赖走 rpath，无需 LD_LIBRARY_PATH）。
+- 可替换性（LGPL 要求）：用户可把同 ABI 的 `libmpv.so.2` 及其依赖替换进 `播放器运行时/lib/`，无需重编译应用。
+
+### 10.7 本轮踩坑记录（脚本已内置处理）
+
+1. `meson setup --reconfigure` **必须同时传 `-D` 选项**，否则新增选项（本次 `-Djavascript=disabled`）不生效；
+2. 发行版 `libmujs.so` 无 SONAME，mpv NEEDED 会写成**绝对路径** → 自包含需 `patchelf --replace-needed`；
+   更彻底的办法是构建时 `-Djavascript=disabled`；
+3. `patchelf` 改 rpath 会改变 libmpv 的 sha256 → 打包校验要用「打包后 sha + 记录源 sha」；
+4. LGPL 构建里 `-Drubberband=disabled` 必须显式加（系统 librubberband 是 GPL）；
+5. 系统 FFmpeg 9 与自建 FFmpeg 8 的 SONAME 不同（`.63` vs `.62`），可用 NEEDED 快速判定是否误链。
+
+---
+
+## 11. 已知限制与后续
 
 | # | 项 | 说明 / 后续 |
 |---|---|---|
-| P1 | Linux 自包含模式未启用 | 需 LGPL 构建的 FFmpeg 等依赖（或静态链接 + 目标文件）；脚本路径已就绪 |
+| P1 | ~~Linux 自包含模式未启用~~ ✅ 已启用 | `scripts/build-media-stack-linux.sh --lgpl-ffmpeg` + `package-player-runtime-linux.sh --self-contained`；126MB 运行时，见 §10 |
 | P2 | Windows 全链路未实测 | 本机无 Windows；结构级脚本已备，PE/ntldd/ANGLE 验证待 Windows 机器（M0-Win 清单） |
 | P3 | 系统依赖版本漂移 | system-deps 依赖用户发行版版本；DEPENDENCIES.txt 记录构建机版本，发行说明注明「Linux x86_64 + 常见发行版」 |
-| P4 | FFmpeg GPL 构建 | 见 §5；自包含发行前必须换 LGPL FFmpeg 并更新 `FFmpeg-LGPL-2.1.txt`/审计 |
+| P4 | ~~FFmpeg GPL 构建~~ ✅ 已解决（自包含） | 自建 LGPL FFmpeg 8.0 + 重链 libmpv，自包含运行时已含 LGPL FFmpeg 与许可证；见 §10。system-deps 模式仍有 GPL 风险，仅用于开发联调 |
 | P5 | 字体/编解码器 | 字幕字体走系统字体目录；某些私有编码（如 H.266）依赖系统 FFmpeg 能力，不额外打包 |
 | P6 | Windows 便携目录对接 | `build-windows.ps1 -Portable` 尚未自动拷贝 `播放器运行时\`（可在 Windows 侧补一行） |
 | P7 | 运行时体积 | 当前 3.6MB（仅 libmpv）；自包含模式预计 80–150MB（FFmpeg 全家桶），需评估分发方式 |

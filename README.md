@@ -296,7 +296,7 @@ crates/
 | **M1 播放内核** | ✅ 完成（Linux） | GUI 真实 libmpv 播放：`25-真实播放.png`（真实帧满铺，bbox 偏差 ≤1px，00:17/00:20）；`cargo test --workspace` **543 passed / 0 failed**；headless 冒烟 **25/25**（含真实播放 case）；真机桌面零拷贝/4K60/Windows ANGLE 待下一轮 |
 | **M3 真机矩阵** | ✅ 三盘验证 | [PLAYER_REAL_DEVICE_MATRIX.md](docs/PLAYER_REAL_DEVICE_MATRIX.md)：百度/夸克/光鸭 6 用例（含夸克 HLS 173MB、光鸭 727MB）mpv 可播+seek；脚本可复跑 |
 | **流自适应/健壮性** | ✅ 完成 | 首字节 55.8s→0.84s（66×）、mpv 端到端起播 26s→12.2s（2.1×）、seek 优先预读、弱网自适应（预读 128→32MB）、**上游 4xx 连续失败熔断**（百度 31326：41 次换链→≤2，3s 内可读 502）；见 [PLAYER_PERF.md](docs/PLAYER_PERF.md) |
-| **M6 合规运行时** | 🟡 构建完成待收尾 | 自建 **LGPL FFmpeg 8.0** + 重链 LGPL libmpv（libavcodec.so.62）→ 自包含 `播放器运行时/`（126MB/211 libs，patchelf rpath，合规校验 PASS）；发布验收 22 项 PASS（[PLAYER_PACKAGING.md](docs/PLAYER_PACKAGING.md)） |
+| **M6 合规运行时** | ✅ 完成（Linux） | 自建 **LGPL FFmpeg 8.0** + 重链 LGPL libmpv（libavcodec.so.62，sha256 4994092c…）→ 自包含 `播放器运行时/`（126MB/108 依赖 .so，patchelf rpath）**合规校验 PASS**（无 x264/x265/rubberband、7 个 FFmpeg 库全部自建 LGPL、LD_DEBUG 系统 libavcodec 加载 0 次）；干净 env dlopen + 1080p 播放首帧 38–115ms；发布验收 22 项 PASS（[PLAYER_PACKAGING.md](docs/PLAYER_PACKAGING.md)） |
 | **M2 字幕真机** | ✅ 完成 | [PLAYER_SUBTITLE_M0.md](docs/PLAYER_SUBTITLE_M0.md)：外挂 SRT/VTT/ASS、ASS 样式+定位、主+副字幕同屏、内嵌 SRT mkv、**AI 双语注入端到端**（像素级差分证据 15+4 用例） |
 | **M3 GUI 网盘播放** | ✅ 打通 | `26-网盘播放-光鸭mkv.png`（代理流 694MB，seek 120s）、`27-网盘播放-夸克HLS.png`（HLS 直连，seek 60s）、`28-网盘播放-百度不可播提示.png`（31326 可读提示不崩）；`--play-remote/--seek-ms` 验收参数；真网盘用例在 smoke 中默认跳过（`WP_SMOKE_REAL_NET=1` 开启） |
 | 流代理 | ✅ 完成 | [PLAYER_STREAM_M0.md](docs/PLAYER_STREAM_M0.md)：三盘 Range 206、磁盘预读缓存/过期换链、夸克 HLS 决策；性能数据见 [PLAYER_PERF.md](docs/PLAYER_PERF.md)（起播=chunk/带宽、缓存命中 seek 0.2–9.5ms、多连接聚合 4–5×） |
