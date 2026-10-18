@@ -83,3 +83,9 @@ opt-level = 1
 
 [profile.dev]
 opt-level = 0
+
+# 本地补丁：`vendor/glutin-winit` 仅修改 Windows 的 EGL 优先级（ANGLE 优先），
+# 让 eframe/glow 在 Windows 上优先用 ANGLE 创建 GLES 上下文（libmpv render API 硬解互操作需要）。
+# 详见 docs/PLAYER_WINDOWS_ANGLE.md；Linux 行为不变。
+[patch.crates-io]
+glutin-winit = { path = "vendor/glutin-winit" }

@@ -17,8 +17,8 @@
 | **4K 流畅** | 硬解矩阵（VAAPI/NVDEC/Vulkan Video/D3D11VA）+ 零拷贝 GPU 纹理 + mpv 帧同步（report_swap/display-resample）+ **磁盘预读缓存流代理**（隔离网盘抖动、支持秒 seek 回看、链接过期热换） |
 | **蓝光原盘** | ISO/BDMV 主标题播放用 v0.41 稳定 libbluray 路径；**交互菜单（HDMV/BD-J）** 需 mpv master（0.42-dev）的 overlay 渲染，以「独立 feature + 固定 commit」提供；**加密 UHD（AACS 2.x）无开源解密方案**，仅未加密/已解密备份可播 |
 | **源码可控** | 媒体栈 `vendor/` 固定版本源码 + 一键构建脚本（Linux/Windows），Rust 层 100% 自有；LGPL 动态链接 → 应用保持 MIT；提供可替换 `.so/.dll` 与补丁目录；GPL 构建作为可选 profile（换取 X11 窗口 VO/DVD 菜单等） |
-| **AI** | `wp-ai` 独立 crate + Provider 抽象（本地 whisper.cpp / llama.cpp / candle / ONNX 与 OpenAI 兼容远端），重活进程隔离 + 任务优先级，先做 P1 字幕翻译、P2 ASR 生成字幕，再扩展摘要/问答/画面增强 |
-| **弹幕（后续加入）** | 独立 `wp-danmaku` crate + 双渲染后端：**Mode A 用 egui 覆盖层**（可交互/可动态换样式），**Mode B 用预生成 ASS 弹幕轨**（跨模式兜底）；布局引擎（车道碰撞/密度限制/4K 坐标换算）在 Rust 侧；数据源本地优先（同名 XML/JSON/ASS 自动加载 + 播放器弹幕库），在线源/发送/AI 弹幕列为可选扩展 |
+| **AI** | `wp-ai` 独立 crate + Provider 抽象（本地 whisper.cpp / llama.cpp / candle / ONNX 与 OpenAI 兼容远端），**本地/远端可分别启停、按 priority 设置优先级与回退**（用户已确认两者都要），重活进程隔离，先做 P1 字幕翻译、P2 ASR，再扩展摘要/问答/画面增强 |
+| **弹幕** | 独立 `wp-danmaku` crate + 双渲染后端：**Mode A 用 egui 覆盖层**（完整交互），ASS 弹幕轨作为跨引擎兜底；布局引擎（车道碰撞/密度限制/4K 坐标换算）在 Rust 侧；**数据源=本地+在线（用户已确认）**；交互含悬停/发送/搜索跳转（v2.1）；弹幕/字幕层级可配置、AI 弹幕（翻译/精华）列入后续版本 |
 
 **一句话架构**：`egui 应用（UI/字幕/弹幕/AI）` → 自研 Rust 控制层（`wp-player`）→ **libmpv 媒体内核（pinned LGPL 构建）** → 平台渲染模式（GL render API / 原生窗口）；
 网盘/本地/ISO 统一经 **`wp-stream` 磁盘缓存代理** 或 `--http-header-fields` 直连；**字幕/弹幕**通过 mpv 字幕轨（`sub-add`/`sub-reload`/`secondary-sub-*`）+ egui 覆盖层双通道渲染；
@@ -131,6 +131,11 @@ AI 通过 **mpv 属性/命令挂钩（sub-start/sub-text/track-list/sub-add/scre
 
 ## 4. 渲染与性能架构（4K/蓝光流畅的关键）
 
+> ⚠️ **v2.1 决策更新（2026-10-19）**：用户**不接受原生窗口嵌入**，故下表的 **Mode B 不再采用**；
+> Windows 与 Linux 统一走 **Mode A（进程内 GPU 渲染）**；Windows 通过 **ANGLE（EGL/GLES）上下文**
+> 让 libmpv render API 获得 D3D11VA 硬解能力。实现见 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md)
+> 与 `vendor/glutin-winit` 补丁。Mode B 仅作为历史方案保留说明。
+
 ### 4.1 三种显示模式（按平台自动选，可手动覆盖）
 
 | 模式 | 集成方式 | 硬解/HDR | 适用平台 | 优缺点 |
@@ -142,7 +147,9 @@ AI 通过 **mpv 属性/命令挂钩（sub-start/sub-text/track-list/sub-add/scre
 **平台默认策略**：
 - Linux **Wayland** → Mode A（EGL 上下文，VAAPI/NVDEC 零拷贝 dmabuf；egui 可全覆盖）。
 - Linux **X11** → 先试 Mode A（EGL，若驱动/上下文支持 hwdec 直通）；失败/性能不达标 → **需 GPL 构建的 Mode B**（LGPL 构建无 x11 vo，见 §2.2）→ 否则 Mode C。
-- **Windows** → **Mode B 优先**（WGL 下 Mode A 的 D3D11VA 互操作不可靠：mpv 文档要求 `d3d11va` 配 `--gpu-context=d3d11/angle`，而 render API 的上下文由 eframe 提供，默认 WGL；Mode B 用 mpv 自己的 d3d11 context，硬解/HDR 最稳）。
+- **Windows（v2.1）** → **Mode A + ANGLE**：`vendor/glutin-winit` 补丁让 eframe 优先用 ANGLE EGL/GLES 上下文，
+  libmpv render API 在该上下文下尝试 D3D11VA 硬解；无 ANGLE 时自动回退 WGL（软件解码 + 清晰提示）。
+  验证清单见 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md)。
 - 未来：mpv master 已出现 **D3D11 render API**（`MPV_RENDER_API_TYPE_D3D11`、`render_d3d11.h`，0.42-dev），若配合 wgpu/D3D11 合成的 eframe 路线，Windows 可回到 Mode A；列 M4 评估。
 
 > ⚠️ M0 必须实测的矩阵见任务计划 E1~E6：**Mode A×Linux X11/Wayland×4K HEVC 硬解**、**Mode B×Windows×4K/HDR**、两种模式的帧同步与 CPU/GPU 占用。
@@ -177,7 +184,8 @@ AI 通过 **mpv 属性/命令挂钩（sub-start/sub-text/track-list/sub-add/scre
 | 场景 | 方案 | 状态 |
 |---|---|---|
 | **BDMV 目录 / ISO 主标题** | `--bluray-device=<iso或目录>` + `bd://`；用 libbluray 列出 titles（`bd_get_titles`）→ 用户在「碟片标题」对话框选 title/章节/角度 → `bd://mpls/XXXXX` 播放 | v0.41 稳定支持（`--bluray-device`、`--bluray-angle`；v0.41 `stream_bluray.c` 已能识别 `bd://menu` 标题与 `BD_EVENT_MENU`） |
-| **交互菜单（HDMV/BD-J）** | mpv master 的 overlay 渲染：`bd_register_overlay_proc`（HDMV IG plane）+ `bd_register_argb_overlay_proc`（BD-J）+ `disc-menu-active` 属性 → 我们的 UI 显示「菜单中」并转发遥控/点击 | **0.42-dev 才有完整画面渲染**；以 `bluray-menu` feature 固定 commit 构建，单独发布标注「实验」 |
+| **交互菜单（HDMV/BD-J）** | （**v2.1：用户确认 v1 不需要交互菜单，仅要求主标题流畅**）保留 mpv master overlay 方案作为未来可选项，不进入 v1 范围 | 未来可选 |
+| **主标题默认选择** | libbluray `bd_get_main_title()` / 最长 title；播放页「碟片标题」列表可选章节/音轨/字幕 | v1 必做 |
 | **AACS 加密** | libaacs（AACS 1.0，LGPL）+ 用户自备 `keydb.cfg`；libbdplus（BD+，LGPL） | 支持普通蓝光（需用户提供密钥）；**AACS 2.x / UHD 4K 蓝光无开源解密实现** → 加密 UHD 盘不可播；未加密/已解密备份（BDMV/MKV）可播 |
 | 封面/元数据 | libbluray meta_data（片名/语言）→ 播放页展示 | 可选 |
 
@@ -503,16 +511,29 @@ pub fn build_bilingual_ass(original: &[Cue], translated: &[Cue], opts: &AssOptio
 
 ---
 
-## 13. 阶段计划摘要
+## 13. 已确认决策（2026-10-19，用户拍板）
+
+| # | 问题 | 决策 | 对架构的影响 |
+|---|---|---|---|
+| 1 | Windows 窗口形态 | **不接受原生窗口嵌入** | 移除 Mode B 主方案；Windows 走 Mode A + ANGLE（见 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md)，`vendor/glutin-winit` 已打补丁） |
+| 2 | 蓝光范围 | **只需主标题流畅** | v1 不做 BD-J/HDMV 交互菜单；`bluray-menu` 特性转为未来可选项；v0.41.0 固定版本即可 |
+| 3 | AI 本地/远端 | **两者都要**，可分别启用/停用、设置优先级 | `wp-ai` 按 priority 选择与回退；UI 提供 provider 开关/优先级；离线/在线均可 |
+| 4 | Windows 运行时体积 | **接受 60–100MB** | 发行包内置 `播放器运行时/`（libmpv + 依赖 DLL + ANGLE + LICENSES） |
+| 5 | 功能优先级 | 确认顺序 | 4K+字幕+网盘 → AI 字幕翻译 → ASR → 摘要/问答 → OCR/超分 |
+| 6 | 弹幕数据源 | **在线 + 本地** | `wp-danmaku` 增加在线 Provider（可选配置/缓存/合规提示），本地同名文件/弹幕库保留 |
+| 7 | 弹幕交互 | **显示+开关+样式+屏蔽+悬停/发送/搜索跳转** | 交互弹幕用 egui 覆盖层（Mode A）；发送默认写本地库、在线发送可选；搜索/时间轴热力图纳入 UI |
+| 8 | 弹幕/字幕层级 & AI 弹幕 | 层级**可配置**；AI 弹幕（翻译/精华）**列入后续版本** | 层级配置进播放器设置；AI 弹幕任务进 `wp-ai` 路线（M7） |
+
+## 14. 阶段计划摘要
 
 详细任务见 [PLAYER_TASKS.md](PLAYER_TASKS.md)（v2）。总体：
 
-- **M0 技术验证（必做，6–10 人日）**：LGPL media-stack 构建（Linux/Windows）；eframe + render API 收帧；4K HEVC 硬解矩阵；字幕格式矩阵（含 PGS/双字幕）；BD ISO 主标题/菜单探测；流代理缓存原型；**ASS 弹幕轨 + 副字幕轨叠加实测**；AI 挂钩 spike。
+- **M0 技术验证（必做，6–10 人日）**：LGPL media-stack 构建（Linux/Windows）；eframe + render API 收帧；4K HEVC 硬解矩阵（Linux EGL/VAAPI + **Windows ANGLE/D3D11VA**）；字幕格式矩阵（含 PGS/双字幕）；BD ISO **主标题**探测（菜单不做）；流代理缓存原型；ASS 弹幕轨 + 副字幕轨叠加实测；AI 挂钩 spike。
 - **M1 播放核心**（8–12）：`wp-media-mpv` + `wp-player` + Mode A/B 渲染桥 + 状态机 + 4K 性能达标。
 - **M2 完整字幕**（6–8）：字幕控制/双字幕/样式/外挂自动加载/持久化 + 字幕矩阵。
 - **M3 源接入**（8–10）：网盘（代理/换链/缓存）、本地、ISO/BDMV 标题选择、播放列表、入口接线。
 - **M4 AI 基础设施 + 字幕翻译**（8–12）：`wp-ai` worker/provider/缓存 + P1 双语翻译。
-- **M5 弹幕系统**（8–12）：`wp-danmaku` 模型/解析/布局引擎 + egui 覆盖层 + ASS 弹幕轨 + 本地弹幕库/自动加载 + 屏蔽/密度/时间轴/面板；Mode A/B 双模式验证。
+- **M5 弹幕系统**（10–14）：`wp-danmaku` 模型/解析（本地+在线 Provider）/车牌布局引擎 + egui 覆盖层（悬停/发送/搜索跳转/时间轴热力图）+ ASS 弹幕轨兜底 + 本地弹幕库/自动加载 + 屏蔽/密度/层级配置。
 - **M6 性能/打包/验收**（6–8）：Windows/Linux 运行时打包、许可合规、性能基线、文档、回归。
-- **M7 AI/弹幕进阶**（10–18，按需）：ASR 字幕（P2）、摘要/问答（P3）、OCR/超分（P4）、**在线弹幕源 / 弹幕翻译 / 弹幕精华**。
+- **M7 AI/弹幕进阶**（10–18，按需）：ASR 字幕（P2）、摘要/问答（P3）、OCR/超分（P4）、**AI 弹幕（翻译/精华）**。
 - 合计约 **55–85 人日**（单人 3–4 个月；两人 6–8 周）。M0 结论可能调整后续估算。
