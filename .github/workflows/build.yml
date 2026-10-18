@@ -1,0 +1,81 @@
+name: build
+
+# 跨平台构建验证：Linux + Windows 10/11 同一套代码。
+# 触发：push / PR / 手动。产物：两个平台的绿色版 zip。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: windows-latest
+            target: win64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Linux 系统依赖（egui 运行时/构建）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev xvfb fonts-noto-cjk
+
+      - name: 编译（release）
+        run: cargo build --release -p wp-gui
+
+      - name: 单元测试
+        run: cargo test --release -p wp-core -p wp-net -p wp-drive -p wp-transfer
+
+      - name: 无头 GUI 冒烟 + 截图（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x scripts/smoke-headless.sh
+          ./scripts/smoke-headless.sh
+
+      - name: 打包（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p 出/网盘管理-${{ matrix.target }}
+          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys,os;m=json.load(sys.stdin);print(os.path.join(m["target_directory"],"release","网盘管理"))')" 出/网盘管理-${{ matrix.target }}/
+          cp -r docs 出/网盘管理-${{ matrix.target }}/
+          cp README.md 出/网盘管理-${{ matrix.target }}/
+          touch 出/网盘管理-${{ matrix.target }}/portable
+          cd 出 && zip -r 网盘管理-${{ matrix.target }}.zip 网盘管理-${{ matrix.target }}
+
+      - name: 打包（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $src = Join-Path $meta.target_directory "release\网盘管理.exe"
+          $out = "出\网盘管理-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Copy-Item $src (Join-Path $out "网盘管理.exe")
+          Copy-Item docs (Join-Path $out "docs") -Recurse
+          Copy-Item README.md $out
+          New-Item -ItemType File -Path (Join-Path $out "portable") | Out-Null
+          Compress-Archive -Path $out -DestinationPath "出\网盘管理-${{ matrix.target }}.zip" -Force
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 网盘管理-${{ matrix.target }}
+          path: 出/*.zip

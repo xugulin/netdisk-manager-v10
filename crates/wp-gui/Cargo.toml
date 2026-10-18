@@ -1,0 +1,27 @@
+[package]
+name = "wp-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "网盘管理"
+path = "src/main.rs"
+
+[dependencies]
+wp-core.workspace = true
+wp-net.workspace = true
+wp-drive.workspace = true
+wp-drive-baidu.workspace = true
+wp-drive-quark.workspace = true
+wp-drive-guangya.workspace = true
+wp-transfer.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+dirs.workspace = true

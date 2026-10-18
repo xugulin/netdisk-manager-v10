@@ -1,0 +1,8 @@
+# 本机 cargo 源替换（CARGO_HOME 被重定向到 共享基座/重活/构建/cargo-home，
+# 全局 ~/.cargo/config.toml 的源替换会失效 ⇒ 必须在本仓放一份，见共享基座经验）。
+# 换到其它机器若访问不了该镜像，删掉本文件即可回落 crates.io。
+[source.crates-io]
+replace-with = "ustc"
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"

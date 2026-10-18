@@ -1,0 +1,17 @@
+[package]
+name = "wp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+rand.workspace = true
+aho-corasick = "1"
+pinyin = { version = "0.10", features = ["plain"] }
+md-5.workspace = true
