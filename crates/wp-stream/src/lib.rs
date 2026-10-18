@@ -66,6 +66,21 @@ pub struct StreamConfig {
     pub request_timeout_secs: u64,
     /// 上游建连超时（秒）。
     pub connect_timeout_secs: u64,
+    /// 弱网自适应分块/首字节（task-18，默认开）：
+    /// 冷读**先回响应头**，再用 `startup_first_bytes` 小块直发首字节（不必等整个 4MB 块），
+    /// 之后按 `chunk_bytes` 稳定分块；实测带宽低于 `adaptive_weak_mbps` 时自动降级预读窗口。
+    /// `false` = 旧语义（首块就绪才回响应头）。
+    pub adaptive_chunk: bool,
+    /// 首字节引导块大小（默认 1MB；0 = 关闭引导，等价旧行为）。
+    pub startup_first_bytes: u64,
+    /// seek 优先（默认开）：客户端跳转时暂停后台预读，把带宽让给 seek 目标块。
+    pub seek_priority: bool,
+    /// seek 后暂停后台预读的时长（毫秒，默认 400；弱网自动 ×2）。
+    pub seek_pause_ms: u64,
+    /// 观测带宽低于该值（Mbps）判为弱网（默认 20.0）。
+    pub adaptive_weak_mbps: f64,
+    /// 弱网时本会话预读窗口上限（默认 32MB）。
+    pub weak_readahead_bytes: u64,
 }
 
 impl Default for StreamConfig {
@@ -82,6 +97,14 @@ impl Default for StreamConfig {
             max_link_restarts: 3,
             request_timeout_secs: 30,
             connect_timeout_secs: 10,
+            // task-18 弱网自适应：首字节 1MB 小块先流式回给播放器，再按 4MB 稳定分块；
+            // 弱网（<20Mbps）自动把预读窗口降到 32MB，减少与 seek 抢带宽。
+            adaptive_chunk: true,
+            startup_first_bytes: 1024 * 1024,
+            seek_priority: true,
+            seek_pause_ms: 400,
+            adaptive_weak_mbps: 20.0,
+            weak_readahead_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -119,6 +142,16 @@ pub struct StreamStats {
     pub errors: u64,
     /// 是否整个文件都已缓存。
     pub complete: bool,
+    /// 是否观测到弱网（首字节引导实测带宽低于阈值，task-18）。
+    pub weak_network: bool,
+    /// 本会话实际预读窗口（弱网会降级，task-18）。
+    pub effective_readahead_bytes: u64,
+    /// seek 触发后台预读暂停的次数（task-18 诊断）。
+    pub seek_pauses: u64,
+    /// 首字节引导累计发送字节（task-18 诊断）。
+    pub bootstrap_bytes: u64,
+    /// 最近一次首字节引导实测带宽（Mbps）。
+    pub bootstrap_mbps: f64,
 }
 
 /// 本地流代理。

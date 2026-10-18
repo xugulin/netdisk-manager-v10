@@ -80,6 +80,7 @@ async fn run() -> Result<(), String> {
         max_link_restarts: 3,
         request_timeout_secs: 30,
         connect_timeout_secs: 10,
+        ..StreamConfig::default()
     };
     let link_for_check = link.clone();
     let proxy = StreamProxy::new(cfg);

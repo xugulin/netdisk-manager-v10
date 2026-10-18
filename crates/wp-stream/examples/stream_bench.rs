@@ -55,6 +55,8 @@ enum Mode {
     Weak,
     Hls,
     Matrix,
+    /// 代理 + 系统 mpv 直连冒烟（测「代理起播」端到端耗时）
+    Mpv,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +74,10 @@ struct Options {
     limit_bps: u64,
     seek_bytes: u64,
     out: Option<PathBuf>,
+    /// task-18：自适应首字节/分块（默认开）
+    adaptive: bool,
+    startup_first: u64,
+    seek_priority: bool,
 }
 
 impl Default for Options {
@@ -90,6 +96,9 @@ impl Default for Options {
             limit_bps: 0,
             seek_bytes: 1024 * 1024,
             out: None,
+            adaptive: true,
+            startup_first: 1024 * 1024,
+            seek_priority: true,
         }
     }
 }
@@ -172,6 +181,7 @@ fn parse_args() -> Result<Options, String> {
                     "weak" => Mode::Weak,
                     "hls" => Mode::Hls,
                     "matrix" => Mode::Matrix,
+                    "mpv" => Mode::Mpv,
                     other => return Err(format!("未知 mode：{other}")),
                 };
             }
@@ -192,6 +202,13 @@ fn parse_args() -> Result<Options, String> {
             }
             "--limit-bps" => opts.limit_bps = parse_bps(&next()?)?,
             "--seek-bytes" => opts.seek_bytes = parse_size(&next()?)?,
+            "--adaptive" => match next()?.as_str() {
+                "on" | "1" | "true" => opts.adaptive = true,
+                "off" | "0" | "false" => opts.adaptive = false,
+                other => return Err(format!("--adaptive 需 on/off，得到 {other}")),
+            },
+            "--startup-first" => opts.startup_first = parse_size(&next()?)?,
+            "--no-seek-priority" => opts.seek_priority = false,
             "--out" => opts.out = Some(PathBuf::from(next()?)),
             "--help" | "-h" => {
                 print_help();
@@ -218,7 +235,7 @@ fn print_help() {
 用法：stream_bench <direct-link.json> [远端路径] [选项]
 
 选项：
-  --mode <all|seq|prefetch|seek|paced|weak|hls|matrix>  默认 all
+  --mode <all|seq|prefetch|seek|paced|weak|hls|matrix|mpv>  默认 all
   --chunk <4M>        代理分块大小
   --readahead <64M>   预读窗口（0=关闭）
   --parallel <2>      并行预取连接数
@@ -228,6 +245,9 @@ fn print_help() {
   --seconds <12>      paced/weak 模拟播放时长
   --limit-bps <0>     >0 时启用本地限速中继（弱网模拟），如 20M/50M
   --seek-bytes <1M>   每次 seek 读取窗口
+  --adaptive <on|off> 自适应首字节/分块（默认 on；task-18）
+  --startup-first <1M> 首字节引导块大小（0=关闭）
+  --no-seek-priority  关闭 seek 优先（默认开）
   --out <path>        结果 JSON 写入文件
 "#
     );
@@ -728,6 +748,9 @@ async fn seek_test(
         readahead_bytes: 0,
         max_cache_bytes: opts.lru,
         parallel_fetches: opts.parallel.max(1),
+        adaptive_chunk: opts.adaptive,
+        startup_first_bytes: opts.startup_first,
+        seek_priority: opts.seek_priority,
         ..StreamConfig::default()
     };
     let bench = Bench::new(cold_cfg)?;
@@ -788,6 +811,9 @@ async fn seek_test(
         readahead_bytes: opts.readahead,
         max_cache_bytes: opts.lru,
         parallel_fetches: opts.parallel.max(1),
+        adaptive_chunk: opts.adaptive,
+        startup_first_bytes: opts.startup_first,
+        seek_priority: opts.seek_priority,
         ..StreamConfig::default()
     };
     let bench2 = Bench::new(warm_cfg)?;
@@ -1053,6 +1079,9 @@ async fn run_matrix(
             readahead_bytes: readahead,
             max_cache_bytes: opts.lru,
             parallel_fetches: parallel.max(1),
+            adaptive_chunk: opts.adaptive,
+            startup_first_bytes: opts.startup_first,
+            seek_priority: opts.seek_priority,
             ..StreamConfig::default()
         };
 
@@ -1201,6 +1230,9 @@ async fn run() -> Result<(), String> {
             "parallel": opts.parallel,
             "lru_bytes": opts.lru,
             "play_bps": opts.play_bps,
+            "adaptive_chunk": opts.adaptive,
+            "startup_first_bytes": opts.startup_first,
+            "seek_priority": opts.seek_priority,
         },
     });
 
@@ -1229,8 +1261,79 @@ async fn run() -> Result<(), String> {
         readahead_bytes: opts.readahead,
         max_cache_bytes: opts.lru,
         parallel_fetches: opts.parallel.max(1),
+        adaptive_chunk: opts.adaptive,
+        startup_first_bytes: opts.startup_first,
+        seek_priority: opts.seek_priority,
         ..StreamConfig::default()
     };
+
+    // mpv 端到端冒烟：代理 URL + 系统 mpv（headless）→ 起播耗时（区分代理慢 vs 渲染慢）
+    if opts.mode == Mode::Mpv {
+        let bench = Bench::new(make_cfg("mpv"))?;
+        let t = Instant::now();
+        let handle = bench.open(link.clone(), &opts.remote_path).await?;
+        let open_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let url = handle.url.clone();
+        let frames = 2u32;
+        let (rc, log) = tokio::task::spawn_blocking(move || {
+            let out = std::process::Command::new("mpv")
+                .args([
+                    "--no-config",
+                    "--vo=null",
+                    "--ao=null",
+                    "--ytdl=no",
+                    "--msg-level=all=info",
+                    "--network-timeout=120",
+                    &format!("--frames={frames}"),
+                ])
+                .arg(&url)
+                .output();
+            match out {
+                Ok(o) => {
+                    let mut log = String::from_utf8_lossy(&o.stderr).to_string();
+                    log.push_str(&String::from_utf8_lossy(&o.stdout));
+                    (o.status.code().unwrap_or(-1), log)
+                }
+                Err(e) => (-2, format!("spawn mpv 失败：{e}")),
+            }
+        })
+        .await
+        .map_err(|e| format!("mpv 任务失败：{e}"))?;
+        let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let stats = bench.proxy.stats(&handle.token).unwrap_or_default();
+        let hits: Vec<String> = log
+            .lines()
+            .filter(|l| {
+                l.contains("VO:")
+                    || l.contains("AO:")
+                    || l.contains("Failed")
+                    || l.contains("error")
+            })
+            .take(8)
+            .map(|s| s.chars().take(160).collect())
+            .collect();
+        result["mpv"] = serde_json::json!({
+            "frames": frames,
+            "exit_code": rc,
+            "cold_start_ms": round1(elapsed_ms),
+            "proxy_open_ms": round1(open_ms),
+            "adaptive_chunk": opts.adaptive,
+            "startup_first_bytes": opts.startup_first,
+            "stats": {
+                "bootstrap_bytes": stats.bootstrap_bytes,
+                "bootstrap_mbps": round1(stats.bootstrap_mbps),
+                "weak_network": stats.weak_network,
+                "effective_readahead_bytes": stats.effective_readahead_bytes,
+                "downloaded_bytes": stats.downloaded_bytes,
+                "errors": stats.errors,
+            },
+            "log_hits": hits,
+        });
+        bench.proxy.close(&handle.token);
+        bench.finish().await;
+        let _ = std::fs::remove_dir_all(&base_dir);
+        return emit(result, opts.out.as_deref());
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))

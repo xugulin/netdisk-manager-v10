@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -308,6 +308,13 @@ fn test_config(cache_dir: &Path, chunk: u64, readahead: u64) -> StreamConfig {
         max_link_restarts: 3,
         request_timeout_secs: 5,
         connect_timeout_secs: 3,
+        // 现有用例保持旧语义（首块就绪才回头），自适应/seek 优先由 task-18 新用例单独开关
+        adaptive_chunk: false,
+        startup_first_bytes: 0,
+        seek_priority: false,
+        seek_pause_ms: 400,
+        adaptive_weak_mbps: 20.0,
+        weak_readahead_bytes: 32 * 1024 * 1024,
     }
 }
 
@@ -938,4 +945,363 @@ async fn read_http_response(stream: &mut TcpStream) -> (u16, HashMap<String, Str
     }
     body.truncate(len);
     (status, headers, body)
+}
+
+// ───────────────────────── task-18：自适应首字节 / seek 优先测试 ─────────────────────────
+
+use std::sync::atomic::AtomicUsize as T18AtomicUsize;
+
+/// 可控速率的上游：每请求固定延迟 + 限速写 body + 最大并发（串行/并行）。
+struct RateUpstream {
+    url: String,
+    hits: Arc<T18AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RateUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct RateState {
+    body: Arc<Vec<u8>>,
+    delay: Duration,
+    rate_bps: u64,
+    sem: Option<Arc<tokio::sync::Semaphore>>,
+    hits: Arc<T18AtomicUsize>,
+}
+
+impl RateUpstream {
+    async fn start(body: Vec<u8>, delay: Duration, rate_bps: u64, concurrency: usize) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(T18AtomicUsize::new(0));
+        let st = Arc::new(RateState {
+            body: Arc::new(body),
+            delay,
+            rate_bps,
+            sem: if concurrency == 0 {
+                None
+            } else {
+                Some(Arc::new(tokio::sync::Semaphore::new(concurrency)))
+            },
+            hits: hits.clone(),
+        });
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let st = st.clone();
+                tokio::spawn(async move {
+                    serve_rate_conn(stream, st).await;
+                });
+            }
+        });
+        Self {
+            url: format!("http://127.0.0.1:{port}/file"),
+            hits,
+            task,
+        }
+    }
+}
+
+async fn serve_rate_conn(mut stream: TcpStream, st: Arc<RateState>) {
+    let Some(req) = read_mock_request(&mut stream).await else {
+        return;
+    };
+    st.hits.fetch_add(1, Ordering::SeqCst);
+    let _permit = match &st.sem {
+        Some(sem) => match sem.clone().acquire_owned().await {
+            Ok(p) => Some(p),
+            Err(_) => return,
+        },
+        None => None,
+    };
+    if !st.delay.is_zero() {
+        tokio::time::sleep(st.delay).await;
+    }
+    let total = st.body.len() as u64;
+    let (start, end) = match req.headers.get("range") {
+        Some(r) => match range::parse_range_header(r) {
+            Ok(spec) => match range::resolve_range(spec, total) {
+                Ok((s, e)) => (s, e),
+                Err(_) => {
+                    let resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    return;
+                }
+            },
+            Err(_) => (0, total.saturating_sub(1)),
+        },
+        None => (0, total.saturating_sub(1)),
+    };
+    let payload = st.body[start as usize..=end as usize].to_vec();
+    let resp = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: {}\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        range::content_range(start, end, total),
+        payload.len()
+    );
+    if stream.write_all(resp.as_bytes()).await.is_err() {
+        return;
+    }
+    if st.rate_bps == 0 {
+        let _ = stream.write_all(&payload).await;
+    } else {
+        // 按速率分片写出：每片 ≤32KB
+        let mut off = 0usize;
+        let t0 = Instant::now();
+        while off < payload.len() {
+            let piece = (payload.len() - off).min(32 * 1024);
+            if stream.write_all(&payload[off..off + piece]).await.is_err() {
+                return;
+            }
+            off += piece;
+            let due = Duration::from_secs_f64(off as f64 * 8.0 / st.rate_bps as f64);
+            if let Some(wait) = due.checked_sub(t0.elapsed()) {
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+    let _ = stream.shutdown().await;
+}
+
+fn adaptive_config(
+    dir: &Path,
+    chunk: u64,
+    readahead: u64,
+    adaptive: bool,
+    startup_first: u64,
+    seek_priority: bool,
+) -> StreamConfig {
+    StreamConfig {
+        cache_dir: dir.to_path_buf(),
+        readahead_bytes: readahead,
+        max_cache_bytes: 128 * 1024 * 1024,
+        chunk_bytes: chunk,
+        parallel_fetches: 2,
+        max_link_restarts: 2,
+        request_timeout_secs: 20,
+        connect_timeout_secs: 3,
+        adaptive_chunk: adaptive,
+        startup_first_bytes: startup_first,
+        seek_priority,
+        seek_pause_ms: 400,
+        adaptive_weak_mbps: 20.0,
+        weak_readahead_bytes: 8 * 1024 * 1024,
+    }
+}
+
+async fn read_range_via_proxy(url: &str, start: u64, end: u64) -> (u16, Vec<u8>, Duration) {
+    let t0 = Instant::now();
+    let resp = client()
+        .get(url)
+        .header("Range", format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap().to_vec();
+    (status, body, t0.elapsed())
+}
+
+#[test]
+fn default_config_enables_task18_adaptive_defaults() {
+    let cfg = StreamConfig::default();
+    assert!(cfg.adaptive_chunk, "默认应开启自适应分块/首字节");
+    assert_eq!(cfg.startup_first_bytes, 1024 * 1024);
+    assert!(cfg.seek_priority, "默认应开启 seek 优先");
+    assert_eq!(cfg.seek_pause_ms, 400);
+    assert_eq!(cfg.adaptive_weak_mbps, 20.0);
+    assert_eq!(cfg.weak_readahead_bytes, 32 * 1024 * 1024);
+    // Lead 调优后的默认值保持
+    assert_eq!(cfg.chunk_bytes, 4 * 1024 * 1024);
+    assert_eq!(cfg.readahead_bytes, 128 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn adaptive_first_byte_served_before_first_chunk_completes() {
+    let tmp = TempDir::new("t18-bootstrap");
+    let data = body_of(6 * 1024 * 1024);
+    // 2MB/s：完整 4MB 首块需要 ~2s；256KB 引导块应 ~0.15s
+    let up = RateUpstream::start(data.clone(), Duration::from_millis(10), 2 * 1024 * 1024, 0).await;
+    let provider = MockProvider::new(up.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(adaptive_config(
+        tmp.path(),
+        4 * 1024 * 1024,
+        0,
+        true,
+        256 * 1024,
+        false,
+    ));
+    let handle = proxy.open_with_provider(provider, "/v.mp4").await.unwrap();
+
+    let (status, body, elapsed) = read_range_via_proxy(&handle.url, 0, 65535).await;
+    assert_eq!(status, 206);
+    assert_eq!(body.as_slice(), &data[0..=65535]);
+    assert!(
+        elapsed < Duration::from_millis(1200),
+        "自适应首字节应先于完整首块返回：实际 {elapsed:?}（4MB@2MB/s 约需 2s）"
+    );
+    let stats = proxy.stats(&handle.token).unwrap();
+    assert!(
+        stats.bootstrap_bytes >= 65536,
+        "应记录首字节引导发送：{stats:?}"
+    );
+    assert!(stats.bootstrap_mbps > 0.0);
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn adaptive_disabled_waits_for_full_first_chunk() {
+    let tmp = TempDir::new("t18-legacy");
+    let data = body_of(6 * 1024 * 1024);
+    let up = RateUpstream::start(data.clone(), Duration::from_millis(10), 2 * 1024 * 1024, 0).await;
+    let provider = MockProvider::new(up.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(adaptive_config(
+        tmp.path(),
+        4 * 1024 * 1024,
+        0,
+        false,
+        0,
+        false,
+    ));
+    let handle = proxy.open_with_provider(provider, "/v.mp4").await.unwrap();
+    let (status, body, elapsed) = read_range_via_proxy(&handle.url, 0, 65535).await;
+    assert_eq!(status, 206);
+    assert_eq!(body.as_slice(), &data[0..=65535]);
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "关闭自适应时应等完整 4MB 首块：实际 {elapsed:?}"
+    );
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn adaptive_small_range_does_not_fetch_full_chunk() {
+    let tmp = TempDir::new("t18-small");
+    let data = body_of(6 * 1024 * 1024);
+    let up = RateUpstream::start(data.clone(), Duration::from_millis(10), 2 * 1024 * 1024, 0).await;
+    let provider = MockProvider::new(up.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(adaptive_config(
+        tmp.path(),
+        4 * 1024 * 1024,
+        0,
+        true,
+        1024 * 1024,
+        false,
+    ));
+    let handle = proxy.open_with_provider(provider, "/v.mp4").await.unwrap();
+    let (status, body, _) = read_range_via_proxy(&handle.url, 0, 1023).await;
+    assert_eq!(status, 206);
+    assert_eq!(body.as_slice(), &data[0..=1023]);
+    let stats = proxy.stats(&handle.token).unwrap();
+    // 小 Range 只需引导 1KB，不应触发 4MB 整块下载
+    assert_eq!(stats.bootstrap_bytes, 1024);
+    assert_eq!(
+        stats.downloaded_bytes, 1024,
+        "小 Range 不应额外拉 4MB 块：{stats:?}"
+    );
+    assert_eq!(stats.buffered_bytes, 0, "缓存不应被小请求污染");
+    assert_eq!(
+        up.hits.load(Ordering::SeqCst),
+        1,
+        "小 Range 只应有一次上游请求（引导），不应拉整块"
+    );
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn adaptive_body_correct_across_bootstrap_and_chunks() {
+    let tmp = TempDir::new("t18-full");
+    let data = body_of(9 * 1024 * 1024 + 12345);
+    let up = RateUpstream::start(data.clone(), Duration::from_millis(0), 0, 0).await;
+    let provider = MockProvider::new(up.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(adaptive_config(
+        tmp.path(),
+        4 * 1024 * 1024,
+        0,
+        true,
+        512 * 1024,
+        false,
+    ));
+    let handle = proxy.open_with_provider(provider, "/v.mp4").await.unwrap();
+    // 全量读：跨 bootstrap → 首块 → 后续块
+    let resp = client().get(&handle.url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let full = resp.bytes().await.unwrap();
+    assert_eq!(full.len(), data.len());
+    assert_eq!(full.as_ref(), data.as_slice());
+    // 跨块 Range 再校验一次（应命中缓存）
+    let (status, body, _) =
+        read_range_via_proxy(&handle.url, 4 * 1024 * 1024 - 100, 8 * 1024 * 1024).await;
+    assert_eq!(status, 206);
+    assert_eq!(
+        body.as_slice(),
+        &data[4 * 1024 * 1024 - 100..=8 * 1024 * 1024]
+    );
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn adaptive_weak_network_detected_and_readahead_downgraded() {
+    let tmp = TempDir::new("t18-weak");
+    let data = body_of(2 * 1024 * 1024);
+    // 256KB/s ≈ 2Mbps << 20Mbps 弱网阈值
+    let up = RateUpstream::start(data.clone(), Duration::from_millis(0), 256 * 1024, 0).await;
+    let provider = MockProvider::new(up.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(adaptive_config(
+        tmp.path(),
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        true,
+        128 * 1024,
+        false,
+    ));
+    let handle = proxy.open_with_provider(provider, "/v.mp4").await.unwrap();
+    let (status, body, _) = read_range_via_proxy(&handle.url, 0, 65535).await;
+    assert_eq!(status, 206);
+    assert_eq!(body.as_slice(), &data[0..=65535]);
+    let stats = proxy.stats(&handle.token).unwrap();
+    assert!(stats.weak_network, "低速首字节应判为弱网：{stats:?}");
+    assert_eq!(
+        stats.effective_readahead_bytes,
+        8 * 1024 * 1024,
+        "弱网应把预读窗口降级到 weak_readahead_bytes"
+    );
+    assert!(stats.bootstrap_mbps < 20.0);
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn seek_priority_pauses_prefetch_without_counting_errors() {
+    let tmp = TempDir::new("t18-seek");
+    let data = body_of(24 * 1024 * 1024);
+    let up = RateUpstream::start(data.clone(), Duration::from_millis(20), 0, 0).await;
+    let provider = MockProvider::new(up.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(adaptive_config(
+        tmp.path(),
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        false,
+        0,
+        true,
+    ));
+    let handle = proxy.open_with_provider(provider, "/v.mp4").await.unwrap();
+    // 触发预读
+    let _ = read_range_via_proxy(&handle.url, 0, 65535).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // 远距离 seek（> chunk_bytes）
+    let (status, body, _) =
+        read_range_via_proxy(&handle.url, 20 * 1024 * 1024, 20 * 1024 * 1024 + 65535).await;
+    assert_eq!(status, 206);
+    assert_eq!(
+        body.as_slice(),
+        &data[20 * 1024 * 1024..=20 * 1024 * 1024 + 65535]
+    );
+    let stats = proxy.stats(&handle.token).unwrap();
+    assert!(stats.seek_pauses >= 1, "seek 应触发预读暂停：{stats:?}");
+    assert_eq!(stats.errors, 0, "取消的预读任务不应计为错误：{stats:?}");
+    cleanup(&proxy).await;
 }

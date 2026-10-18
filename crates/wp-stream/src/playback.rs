@@ -396,6 +396,12 @@ mod tests {
             max_link_restarts: 2,
             request_timeout_secs: 5,
             connect_timeout_secs: 3,
+            adaptive_chunk: false,
+            startup_first_bytes: 0,
+            seek_priority: false,
+            seek_pause_ms: 400,
+            adaptive_weak_mbps: 20.0,
+            weak_readahead_bytes: 32 * 1024 * 1024,
         }
     }
 

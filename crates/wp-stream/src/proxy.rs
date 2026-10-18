@@ -49,15 +49,38 @@ struct EffectiveConfig {
     readahead_bytes: u64,
     parallel_fetches: usize,
     max_link_restarts: usize,
+    /// 弱网自适应分块/首字节（task-18）
+    adaptive_chunk: bool,
+    /// 冷读首字节引导块大小（0 = 关闭引导，恢复旧语义）
+    startup_first_bytes: u64,
+    /// seek 时暂停后台预读
+    seek_priority: bool,
+    /// seek 后预读暂停时长（毫秒）
+    seek_pause_ms: u64,
+    /// 低于该带宽（Mbps）判为弱网
+    adaptive_weak_mbps: f64,
+    /// 弱网时预读窗口上限
+    weak_readahead_bytes: u64,
 }
 
 impl EffectiveConfig {
     fn from(config: &StreamConfig) -> Self {
+        let adaptive = config.adaptive_chunk;
         Self {
             chunk_bytes: config.chunk_bytes.max(1),
             readahead_bytes: config.readahead_bytes,
             parallel_fetches: config.parallel_fetches.max(1),
             max_link_restarts: config.max_link_restarts,
+            adaptive_chunk: adaptive,
+            startup_first_bytes: if adaptive {
+                config.startup_first_bytes
+            } else {
+                0
+            },
+            seek_priority: config.seek_priority,
+            seek_pause_ms: config.seek_pause_ms.max(50),
+            adaptive_weak_mbps: config.adaptive_weak_mbps.max(0.0),
+            weak_readahead_bytes: config.weak_readahead_bytes,
         }
     }
 }
@@ -185,6 +208,14 @@ impl ProxyInner {
             served: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            seek_gen: AtomicU64::new(0),
+            prefetch_pause_until_ms: AtomicU64::new(0),
+            priority_chunk: AtomicU64::new(u64::MAX),
+            weak: AtomicBool::new(false),
+            effective_readahead: AtomicU64::new(self.cfg.readahead_bytes),
+            bootstrap_mbps: AtomicU64::new(0f64.to_bits()),
+            seek_pauses: AtomicU64::new(0),
+            bootstrap_bytes: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             started: Instant::now(),
         });
@@ -547,6 +578,22 @@ pub(crate) struct Session {
     restarts: AtomicU64,
     /// 错误次数。
     errors: AtomicU64,
+    /// seek/预读代次：客户端跳转时 +1，旧预读任务据此取消（task-18）。
+    seek_gen: AtomicU64,
+    /// 预读暂停截止（相对 started 的毫秒；now < 该值时预读不发起新下载）。
+    prefetch_pause_until_ms: AtomicU64,
+    /// 播放器当前正在等待的块（u64::MAX = 无）。
+    priority_chunk: AtomicU64,
+    /// 是否观测到弱网（首字节引导带宽低于阈值）。
+    weak: AtomicBool,
+    /// 本会话实际预读窗口（弱网会降级为 weak_readahead_bytes）。
+    effective_readahead: AtomicU64,
+    /// 最近一次首字节引导实测带宽（f64 bits，Mbps）。
+    bootstrap_mbps: AtomicU64,
+    /// seek 暂停预读次数（诊断）。
+    seek_pauses: AtomicU64,
+    /// 首字节引导累计发送字节（诊断）。
+    bootstrap_bytes: AtomicU64,
     closed: AtomicBool,
     started: Instant,
 }
@@ -568,10 +615,18 @@ impl Session {
             upstream_restarts: self.restarts.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             complete: self.cache.is_complete(),
+            weak_network: self.weak.load(Ordering::Relaxed),
+            effective_readahead_bytes: self.effective_readahead.load(Ordering::Relaxed),
+            seek_pauses: self.seek_pauses.load(Ordering::Relaxed),
+            bootstrap_bytes: self.bootstrap_bytes.load(Ordering::Relaxed),
+            bootstrap_mbps: f64::from_bits(self.bootstrap_mbps.load(Ordering::Relaxed)),
         }
     }
 
     /// 处理一次 GET/HEAD（Range 可选）。
+    ///
+    /// task-18 首字节优化：自适应开启时**先回响应头**，再用 `startup_first_bytes` 小块直发首字节，
+    /// 之后按 `chunk_bytes` 稳定分块（旧语义=首块就绪才回头，仅在 `adaptive_chunk=false` 保留）。
     async fn serve(
         self: &Arc<Self>,
         stream: &mut TcpStream,
@@ -622,8 +677,13 @@ impl Session {
         };
         let len = if self.total == 0 { 0 } else { end - start + 1 };
 
-        // 2) GET 先保证第一块可用，这样上游错误能干净地回 502（而不是发完头再断流）。
+        // 2) 记录播放位置 + seek 让路（暂停后台预读）
         if !head_only && self.total > 0 {
+            self.note_request(start);
+        }
+
+        // 3) 旧语义（自适应关闭）：先确保首块就绪，上游错误能干净回 502。
+        if !head_only && self.total > 0 && !self.cfg.adaptive_chunk {
             let first_chunk = start / self.cache.chunk_bytes().max(1);
             if let Err(e) = self.ensure_chunk(first_chunk).await {
                 self.errors.fetch_add(1, Ordering::Relaxed);
@@ -638,10 +698,9 @@ impl Session {
                 )
                 .await;
             }
-            self.position.store(start, Ordering::Relaxed);
         }
 
-        // 3) 响应头
+        // 4) 响应头（自适应开启时立即回 headers，不等首块）
         let mut headers: Vec<(String, String)> = vec![
             ("Content-Type".to_string(), self.content_type.clone()),
             ("Accept-Ranges".to_string(), "bytes".to_string()),
@@ -669,8 +728,87 @@ impl Session {
             return Ok(());
         }
 
-        // 4) 流式回源（按块：先确保块就绪，再从磁盘顺序读）
-        self.stream_range(stream, start, end).await
+        // 5) 首字节引导：冷读/seek 到未缓存块时，先直发一小段（不整块等待）
+        let chunk_bytes = self.cache.chunk_bytes().max(1);
+        let first_chunk = start / chunk_bytes;
+        let mut pos = start;
+        if self.cfg.adaptive_chunk
+            && self.cfg.startup_first_bytes > 0
+            && !matches!(self.cache.chunk_state(first_chunk), ChunkState::Ready)
+        {
+            let want = (end - start + 1).min(self.cfg.startup_first_bytes);
+            if want > 0 {
+                match self.bootstrap_stream(stream, start, start + want - 1).await {
+                    Ok(sent) => pos = start + sent as u64,
+                    Err(e) => {
+                        wp_core::log_debug!("wp-stream", "首字节引导失败，回退分块等待（{e}）")
+                    }
+                }
+            }
+        }
+        // 6) 剩余部分走缓存分块流（确保块就绪后从磁盘顺序读）
+        if pos <= end {
+            self.stream_range(stream, pos, end).await
+        } else {
+            stream.flush().await
+        }
+    }
+
+    /// 记录一次客户端读取：更新播放位置；明显跳转时暂停后台预读、把目标块设为优先。
+    fn note_request(&self, start: u64) {
+        let chunk_bytes = self.cache.chunk_bytes().max(1);
+        let prev = self.position.swap(start, Ordering::Relaxed);
+        let idx = start / chunk_bytes;
+        self.priority_chunk.store(idx, Ordering::Relaxed);
+        let jump = prev.abs_diff(start);
+        if self.cfg.seek_priority && jump > chunk_bytes {
+            self.seek_gen.fetch_add(1, Ordering::Relaxed);
+            let pause = if self.weak.load(Ordering::Relaxed) {
+                self.cfg.seek_pause_ms.saturating_mul(2)
+            } else {
+                self.cfg.seek_pause_ms
+            };
+            let now = self.started.elapsed().as_millis() as u64;
+            self.prefetch_pause_until_ms
+                .store(now.saturating_add(pause), Ordering::Relaxed);
+            self.seek_pauses.fetch_add(1, Ordering::Relaxed);
+            wp_core::log_debug!("wp-stream", "seek 到 {start}，暂停后台预读 {pause}ms");
+        }
+    }
+
+    /// 「先回 headers 再流式回正文」的首字节引导：直接向上游取一小段（不经缓存），
+    /// 同时用实测带宽识别弱网并降级本会话预读窗口。
+    async fn bootstrap_stream(
+        &self,
+        stream: &mut TcpStream,
+        start: u64,
+        end: u64,
+    ) -> io::Result<usize> {
+        let t0 = Instant::now();
+        let bytes = self
+            .fetch_range_bytes(start, end, None)
+            .await
+            .map_err(|e| io::Error::other(format!("首字节引导失败：{e}")))?;
+        let n = bytes.len();
+        let mbps = n as f64 * 8.0 / t0.elapsed().as_secs_f64().max(0.001) / 1_000_000.0;
+        self.bootstrap_mbps.store(mbps.to_bits(), Ordering::Relaxed);
+        self.bootstrap_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.downloaded.fetch_add(n as u64, Ordering::Relaxed);
+        stream.write_all(&bytes).await?;
+        if self.cfg.adaptive_chunk
+            && mbps < self.cfg.adaptive_weak_mbps
+            && !self.weak.swap(true, Ordering::Relaxed)
+        {
+            let eff = self.cfg.weak_readahead_bytes.min(self.cfg.readahead_bytes);
+            self.effective_readahead.store(eff, Ordering::Relaxed);
+            wp_core::log_info!(
+                "wp-stream",
+                "观测到弱网（首字节带宽 {mbps:.1}Mbps < {:.1}Mbps），预读窗口降级为 {}MB",
+                self.cfg.adaptive_weak_mbps,
+                eff / (1024 * 1024)
+            );
+        }
+        Ok(n)
     }
 
     async fn stream_range(
@@ -687,6 +825,11 @@ impl Session {
             self.ensure_chunk(idx)
                 .await
                 .map_err(|e| io::Error::other(format!("上游读取失败：{e}")))?;
+            // 播放器已拿到目标块 → 解除 seek 暂停，恢复后台预读
+            if idx == self.priority_chunk.load(Ordering::Relaxed) {
+                self.priority_chunk.store(u64::MAX, Ordering::Relaxed);
+                self.prefetch_pause_until_ms.store(0, Ordering::Relaxed);
+            }
             let (cs, ce) = self
                 .cache
                 .chunk_range(idx)
@@ -720,53 +863,66 @@ impl Session {
     // ───────────────────────── 缓存/上游 ─────────────────────────
 
     async fn ensure_chunk(self: &Arc<Self>, idx: u64) -> Result<()> {
+        self.ensure_chunk_gen(idx, None).await
+    }
+
+    /// `gen = Some(预读代次)`：任务开始前校验代次，seek 后旧预读任务自动取消（task-18）。
+    async fn ensure_chunk_gen(self: &Arc<Self>, idx: u64, gen: Option<u64>) -> Result<()> {
         let me = self.clone();
         self.cache
-            .ensure_chunk(idx, move || async move { me.download_chunk(idx).await })
+            .ensure_chunk(
+                idx,
+                move || async move { me.download_chunk(idx, gen).await },
+            )
             .await
     }
 
-    async fn download_chunk(self: &Arc<Self>, idx: u64) -> Result<()> {
+    async fn download_chunk(self: &Arc<Self>, idx: u64, gen: Option<u64>) -> Result<()> {
         let Some((start, end)) = self.cache.chunk_range(idx) else {
             return Err(Error::other(format!("缓存块越界：{idx}")));
         };
+        if let Some(g) = gen {
+            if g != self.seek_gen.load(Ordering::Relaxed) {
+                return Err(Error::Canceled("预读任务已被 seek 取消".into()));
+            }
+        }
+        let data = self.fetch_range_bytes(start, end, gen).await?;
+        let n = data.len() as u64;
+        self.cache.write_chunk(idx, data).await?;
+        self.downloaded.fetch_add(n, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 上游单段 Range 拉取（带换链重试；`gen` 用于预读取消检查）。
+    async fn fetch_range_bytes(&self, start: u64, end: u64, gen: Option<u64>) -> Result<Vec<u8>> {
         let expect = (end - start + 1) as usize;
         let mut attempt: usize = 0;
         loop {
+            if let Some(g) = gen {
+                if g != self.seek_gen.load(Ordering::Relaxed) {
+                    return Err(Error::Canceled("预读任务已被 seek 取消".into()));
+                }
+            }
             let (generation, link) = self.link_snapshot().await?;
-            let result = self.client.get_range(&link, start, end).await;
-            match result {
+            match self.client.get_range(&link, start, end).await {
                 Ok(raw) if raw.status == 206 => {
-                    if raw.body.len() != expect {
-                        // 数据不完整按可重试处理
-                    } else {
-                        self.cache.write_chunk(idx, raw.body).await?;
-                        self.downloaded.fetch_add(expect as u64, Ordering::Relaxed);
-                        return Ok(());
+                    if raw.body.len() == expect {
+                        return Ok(raw.body);
                     }
                 }
                 Ok(raw) if raw.status == 200 && raw.upstream_ignored_range => {
                     if raw.body.len() == expect {
-                        wp_core::log_warn!(
-                            "wp-stream",
-                            "上游忽略 Range（200 回退整文件裁剪）：{} 块 {idx}",
-                            self.display
-                        );
-                        self.cache.write_chunk(idx, raw.body).await?;
-                        self.downloaded.fetch_add(expect as u64, Ordering::Relaxed);
-                        return Ok(());
+                        return Ok(raw.body);
                     }
                 }
                 Ok(raw) if raw.status == 416 => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
                     return Err(Error::other(format!(
-                        "上游 416：请求块 {idx} 超出文件大小（本地记录 total={}）",
+                        "上游 416：请求范围 {start}-{end} 超出文件大小（本地 total={}）",
                         self.total
                     )));
                 }
-                Ok(raw) if raw.is_auth_expired() || raw.is_transient() => {
-                    // 换链后再试
-                }
+                Ok(raw) if raw.is_auth_expired() || raw.is_transient() => {}
                 Ok(raw) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
                     return Err(Error::other(format!(
@@ -775,15 +931,12 @@ impl Session {
                         raw.error_snippet.trim()
                     )));
                 }
-                Err(_) => {
-                    // 超时/网络错误 → 换链后重试
-                }
+                Err(_) => {}
             }
-
             if attempt >= self.cfg.max_link_restarts {
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 return Err(Error::network(format!(
-                    "上游连续失败（已换链 {attempt} 次），块 {idx} 读取放弃"
+                    "上游连续失败（已换链 {attempt} 次），范围 {start}-{end} 读取放弃"
                 )));
             }
             attempt += 1;
@@ -830,7 +983,10 @@ impl Session {
         tokio::spawn(async move { me.prefetch_loop().await });
     }
 
-    /// 后台预读：从播放位置起维护 `readahead_bytes` 窗口，多连接预取缺失块。
+    /// 后台预读：从播放位置起维护 `effective_readahead` 窗口，多连接预取缺失块。
+    ///
+    /// task-18：seek 时暂停（`prefetch_pause_until_ms`）、代次取消（`seek_gen`）、
+    /// 弱网自动降窗（`effective_readahead`）、播放器等待中的块让路。
     async fn prefetch_loop(self: Arc<Self>) {
         let sem = Arc::new(Semaphore::new(self.cfg.parallel_fetches.max(1)));
         loop {
@@ -840,19 +996,36 @@ impl Session {
             if self.cache.is_complete() {
                 return;
             }
+            let now_ms = self.started.elapsed().as_millis() as u64;
+            if now_ms < self.prefetch_pause_until_ms.load(Ordering::Relaxed) {
+                tokio::time::sleep(PREFETCH_TICK).await;
+                continue;
+            }
+            let gen = self.seek_gen.load(Ordering::Relaxed);
+            let window = self.effective_readahead.load(Ordering::Relaxed);
+            if window == 0 {
+                tokio::time::sleep(PREFETCH_TICK).await;
+                continue;
+            }
             let pos = self
                 .position
                 .load(Ordering::Relaxed)
                 .min(self.total.saturating_sub(1));
-            let window_end = (pos + self.cfg.readahead_bytes).min(self.total);
+            let window_end = pos.saturating_add(window).min(self.total);
             let chunk_bytes = self.cache.chunk_bytes().max(1);
             let first = pos / chunk_bytes;
             let last = window_end.saturating_sub(1) / chunk_bytes;
+            let priority = self.priority_chunk.load(Ordering::Relaxed);
             let mut spawned = 0usize;
             let mut idx = first;
             while idx <= last {
                 if idx >= self.cache.chunk_count() {
                     break;
+                }
+                if idx == priority {
+                    // 播放器请求路径会优先下载该块，预读不抢
+                    idx += 1;
+                    continue;
                 }
                 match self.cache.chunk_state(idx) {
                     ChunkState::Ready | ChunkState::Loading | ChunkState::Failed(_) => {}
@@ -864,7 +1037,11 @@ impl Session {
                         let me = self.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let _ = me.ensure_chunk(idx).await;
+                            // 预读代次取消：seek 后旧任务不再下载
+                            if me.seek_gen.load(Ordering::Relaxed) != gen {
+                                return;
+                            }
+                            let _ = me.ensure_chunk_gen(idx, Some(gen)).await;
                         });
                     }
                 }

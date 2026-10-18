@@ -17,7 +17,8 @@
 | 预读 | 预读窗口填满时间受网络限制（20s 超时内填 23–32MB 到 64–128MB 目标）；**多连接聚合有效**：单流 ~3–5Mbps，parallel=2 预读聚合 ≈ 21.8Mbps（4–5×） |
 | 参数建议（4K 40–100Mbps） | **chunk=4MB（弱网 1–2MB）· readahead=128MB（≈8.5–25s 缓冲）· parallel=4（弱网 2）· LRU=50GB（4K 重度；现有 20GB 保留为默认）** |
 | HLS | 正常网络 m3u8 0.65–1.07s、首分片 1.0s（7.7Mbps）、40% seek 2.2s/2.2MB；mpv 实测起播 4.7s、seek 19.9s（详见 `PLAYER_STREAM_M0.md` §9）。HLS 无缓存，seek 成本=重新拉分片 |
-| 发现的问题 | ① 弱网下**预读会与 seek 抢带宽**（矩阵 ra=128M 冷 seek 16.4s vs ra=0 4.1s）；② 起播受「首块就绪才回首字节」策略约束（=chunk/带宽）。两项均给出调参/后续优化建议，**未改冻结 API** |
+| 发现的问题 | ① 弱网下**预读会与 seek 抢带宽**（矩阵 ra=128M 冷 seek 16.4s vs ra=0 4.1s）；② 起播受「首块就绪才回首字节」策略约束（=chunk/带宽）。两项已由 **task-18 生产优化**解决/缓解（见 §7） |
+| task-18 优化效果 | **先回 headers + 1MB 首字节引导 + seek 优先预读（默认开）**：冷起播首字节 55.8s → **0.84s**（同窗口劣化网络，约 66×）；**mpv 端到端起播 26.0s → 12.2s**（2.1×）；弱网自动降预读窗口（64→32MB）。见 §7 |
 
 ---
 
@@ -81,7 +82,15 @@ cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
 # 4) 夸克 HLS（is_hls=true 的直链 JSON）
 cargo run -p wp-stream --example stream_bench -- /tmp/link-quark-hls.json --mode hls
 
-# 5) 只测起播（不同分块对比，readahead=0 消除预读干扰）
+# 5) task-18 前后对比：自适应开关 / seek 优先 / mpv 端到端
+cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
+    --mode seq --readahead 0 --read-bytes 1M --adaptive on
+cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
+    --mode seq --readahead 0 --read-bytes 1M --adaptive off
+# mpv（系统 mpv headless 播代理 URL 2 帧，测端到端起播）
+cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json --mode mpv --adaptive on
+
+# 6) 只测起播（不同分块对比，readahead=0 消除预读干扰）
 cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
     --mode seq --readahead 0 --read-bytes 1M --chunk 1M
 cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
@@ -174,7 +183,11 @@ cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
 | `readahead_bytes` | 64 MB | **128 MB**（≈8.5–25s @4K 40–100Mbps）；4K HDR/蓝光原盘 **192–256 MB**（≈17–51s）；弱网 **32–64 MB** | 架构目标缓冲 20–60s；128MB/60Mbps≈17s；256MB/100Mbps≈20.5s。注意弱网预读抢 seek 带宽（§3.4）→ 弱网降窗 |
 | `parallel_fetches` | 2 | **4**（正常网络）；弱网 2 | 实测单流 3–5Mbps，parallel=2 聚合 ≈21.8Mbps，p4 填充最快（§3.1/§3.4）：CDN 常按单连接限速，多连接聚合 2–5× |
 | `max_cache_bytes` | 20 GB | 默认保留 20GB；**4K 重度用户 50GB**（≈1.9h @60Mbps）；蓝光原盘/收藏 100GB | 4K 60Mbps≈27GB/h；20GB≈45min；SSD 缓存命中 seek 0.2–9.5ms（§3.3），值得保留 |
-| 其他 | — | ① 弱网/移动端可做「**自适应分块**」：打开时用 1MB 快速起播，稳定后升 4MB；② 弱网下**预读应让位于 seek**（可暂停/取消预读任务，或 seek 目标所在块优先下载）；③ HLS 4K 需 ≥1.5× 码率稳定带宽，mpv 加 `--cache=yes --demuxer-max-bytes≈64-128MB` | §3.4 冷 seek 竞争、§3.5 卡顿、§3.6 HLS |
+| `adaptive_chunk` | **开**（task-18 新增） | 建议保持开：冷读先回 headers + `startup_first_bytes`（默认 1MB）小块引导，随后按 chunk 稳定分块；弱网自动降预读 | §7 前后对比（起播最大 66×、mpv 端到端 2.1×） |
+| `startup_first_bytes` | **1MB**（新增） | 普通网络 1MB；极端弱网/移动可 256–512KB（起播≈first_bytes/带宽） | §7.2 |
+| `seek_priority` / `seek_pause_ms` | **开 / 400ms**（新增） | 保持开：seek 时暂停后台预读 400ms（弱网自动 ×2），目标块优先，之后自动恢复 | §7.3 + 单测/端到端测试 |
+| `weak_readahead_bytes` | 32MB（新增） | 观测带宽 <`adaptive_weak_mbps`（默认 20Mbps）时预读窗口自动降到该值 | §7.4 真机已验证 weak_network=true、窗口 64→32MB |
+| 其他 | — | ① HLS 4K 需 ≥1.5× 码率稳定带宽，mpv 加 `--cache=yes --demuxer-max-bytes≈64-128MB`（见 §8）；② 弱网 seek 后预读自动暂停，播放器无需额外处理 | §3.6 / §8 |
 
 **4K 场景推荐组合**：
 * 家庭千兆/局域网（≥100Mbps）：`chunk 4–8MB · readahead 128–256MB · parallel 4 · LRU 50GB`
@@ -205,3 +218,63 @@ cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
 3. 弱网由本地 token-bucket 模拟（不含 RTT/丢包），仅验证带宽受限行为；真实弱网建议后续加 `tc netem`（需 root）或代理侧注入延迟。
 4. 矩阵长跑曾因环境资源抖动失败一次（本地代理连接层），已用短跑替代；重跑命令已提供。
 5. 后续优化项：自适应分块起播、seek 优先调度、HLS 分片预取（可选）。这些需要动生产代码，建议在 M6 性能/验收阶段统一评估。
+
+---
+
+## 7. task-18 生产优化：自适应首字节 + seek 优先预读（前后对比）
+
+> 背景：§3 数据暴露两个生产可优化点——① 起播 = 首块下载时间（`chunk/带宽`）；② 弱网下预读与 seek 抢带宽。
+> task-18 已在 `crates/wp-stream` 生产代码落地（默认开启，`StreamConfig` 只增字段、不破坏旧语义）。
+
+### 7.1 改动
+
+| 能力 | 行为 |
+|---|---|
+| **首字节策略**（`adaptive_chunk`，默认开） | GET 时**先回响应头**，再用 `startup_first_bytes`（默认 1MB）向上一小段直发首字节（不写缓存/不等整块）；之后按 `chunk_bytes`（4MB）稳定分块。小 Range 请求（如 mpv 探测的 64KB）只直发所需字节，**不再触发 4MB 整块下载**。`adaptive_chunk=false` 保留旧语义（首块就绪才回头） |
+| **弱网自适应** | 首字节引导时实测带宽：< `adaptive_weak_mbps`（20Mbps）→ `StreamStats.weak_network=true`，预读窗口自动降为 `weak_readahead_bytes`（32MB）；弱网 seek 暂停时长 ×2 |
+| **seek 优先/可取消预读** | 客户端跳转（偏移差 > chunk）时：`seek_gen += 1` 取消旧预读任务（协作式取消，开始前校验代次）、暂停后台预读 `seek_pause_ms`（400ms，弱网 ×2）、播放器等待的块优先；目标块就绪后自动恢复预读。回看命中仍是毫秒级 |
+| **诊断字段**（`StreamStats` 新增） | `weak_network` / `effective_readahead_bytes` / `seek_pauses` / `bootstrap_bytes` / `bootstrap_mbps` |
+
+测试：`cargo test -p wp-stream` **59 全绿**（29 单元 + 28 端到端 + 2 doc；新增 7 个 task-18 测试：首字节先于整块、关闭自适应回旧语义、小 Range 不拉整块、跨引导/分块正文正确、弱网降窗、seek 暂停且不误计错误、默认值）。
+
+### 7.2 真机前后对比（光鸭 727MB mkv；⚠ 测试窗口网络进一步劣化：直连 2–7.5Mbps 且波动）
+
+| 场景 | 优化前（`adaptive off`） | 优化后（默认开） | 改善 |
+|---|---|---|---|
+| 冷起播（全新会话 `Range: bytes=0-64KB` 首字节） | 55,794 ms | **837 ms** | **~66×** |
+| 顺序读响应头到达（=首块等待） | 64,866 ms | **0.5 ms**（立即回头） | 首字节不再等整块 |
+| 顺序读正文首字节（1MB 引导@劣化网络） | 64,869 ms | 14,389 ms | ~4.5×（=引导块/带宽） |
+| **mpv headless 端到端起播**（系统 mpv `--vo=null --ao=null --frames=2` 播代理 URL） | **26,017 ms** | **12,160 ms** | **2.1×** |
+| 弱网判定/降窗 | — | `weak_network=true`、预读 64MB→**32MB**（真机） | 自动 |
+
+复跑：`stream_bench … --mode seq --readahead 0 --read-bytes 1M --adaptive on|off`、`--mode mpv`（见 §2）。
+
+### 7.3 seek 优先（e2e 测试验证 + 设计）
+
+- 测试 `seek_priority_pauses_prefetch_without_counting_errors`：远距 seek 后 `seek_pauses≥1`、`errors==0`，正文正确；
+- 取消采用**代次检查**（开始下载前校验 `seek_gen`），在飞单块不强行中断（≤chunk 大小），避免半写块；
+- 弱网下预读窗口已降级（32MB），叠加 seek 暂停，进一步减少抢带宽。
+
+### 7.4 弱网限速对比（本地 20Mbps 中继，chunk=4MB）
+
+| 场景 | off | on |
+|---|---|---|
+| 起播首字节（Range 0-64KB） | 6,213 ms | **2,655 ms**（2.3×） |
+| 弱网判定 | — | `weak_network=true` |
+
+> 说明：该窗口真实公网常低于 20Mbps 限速值，paced 卡顿计数波动大（两侧均 3 次），仅首字节/判定结论可靠。
+
+---
+
+## 8. HLS 侧建议（wp-stream 不改 HLS，播放器直连）
+
+夸克大文件走云端转码 HLS（`is_hls=true`），wp-stream 只做决策与 URL/headers 透传；mpv 直连时建议：
+
+```bash
+mpv --no-config     --http-header-fields="Cookie: …" --user-agent "…" --referrer "https://pan.quark.cn/"     --cache=yes --demuxer-max-bytes=128MiB --demuxer-readahead-secs=30     "<m3u8 URL>"
+```
+
+* `--cache=yes` + `--demuxer-max-bytes=128MiB`：HLS 无本地磁盘缓存，靠内存缓冲抗抖动（4K 建议 128–256MB）；
+* `--demuxer-readahead-secs=20-30`：提前拉分片，降低起播后卡顿；
+* `--http-header-fields` 注入 Cookie/Referer，`--user-agent` 单独指定（与直链 headers 一致）；
+* 4K HLS 需要 ≥1.5× 码率稳定带宽（60Mbps 4K 码率 → ≥90Mbps 带宽），否则 seek/起播会明显变慢（实测 40% seek 2.2–2.5s/2.2MB 分片）。
