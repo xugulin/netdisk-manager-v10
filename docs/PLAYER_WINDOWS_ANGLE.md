@@ -70,6 +70,20 @@ target-colorspace-hint=auto   # HDR：M0 记录 GL/ANGLE 下是否可直通，�
 RenderBridge 由 `wp-media-mpv` 暴露：用 eframe 当前上下文创建 `mpv_render_context`（`MPV_RENDER_PARAM_OPENGL_INIT_PARAMS` + `get_proc_address`），渲染到 FBO →
 egui 侧用 `egui_glow` paint callback 输出到页面视频矩形；`mpv_render_context_report_swap` 用于帧同步。
 
+## 4.5 CI 实测记录（GitHub Actions Windows runner，2026-10-19）
+
+已在 **GitHub Actions `windows-latest`（MSVC）** 上跑通快速预检 workflow `windows-smoke`（run 39166099450，全部 success）：
+
+| 检查 | 结果 |
+|---|---|
+| PowerShell 4 脚本语法校验 | ✅ `build-media-stack-windows.ps1` / `package-player-runtime-windows.ps1` / `fetch-angle.ps1` / `windows-verify.ps1` |
+| `cargo build --release -p wp-gui -p wp-cli`（Windows MSVC） | ✅ `网盘管理.exe` 19,870,208 B、`wp-cli.exe` 5,718,016 B |
+| `wp-cli --help` | ✅ 版本/usage 正常（中文正常） |
+| `package-player-runtime-windows.ps1 -Generate` 结构自检 | ✅ LICENSES（10 份）/LOAD-ORDER/DEPENDENCIES/BUILDINFO/README 生成；无 media-stack 时可读错误（预期） |
+
+重型 `player-windows` workflow（MSYS2 构建 LGPL FFmpeg + libmpv-2.dll → 打包运行时 → windows-verify）在 CI 上迭代中；
+CI 已验证 Rust 代码可在 Windows 编译运行，剩余为媒体栈构建与 GL/硬解真机项（见 §5 W1–W7）。
+
 ## 5. M0-Win 验证清单（需要在 Windows 机器上跑；Mac 不可替代）
 
 | # | 验证项 | 通过标准 | 一键脚本 `windows-verify.ps1` |
