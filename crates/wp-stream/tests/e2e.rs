@@ -315,6 +315,7 @@ fn test_config(cache_dir: &Path, chunk: u64, readahead: u64) -> StreamConfig {
         seek_pause_ms: 400,
         adaptive_weak_mbps: 20.0,
         weak_readahead_bytes: 32 * 1024 * 1024,
+        failure_breaker_threshold: 2,
     }
 }
 
@@ -1090,6 +1091,7 @@ fn adaptive_config(
         seek_pause_ms: 400,
         adaptive_weak_mbps: 20.0,
         weak_readahead_bytes: 8 * 1024 * 1024,
+        failure_breaker_threshold: 2,
     }
 }
 
@@ -1303,5 +1305,208 @@ async fn seek_priority_pauses_prefetch_without_counting_errors() {
     let stats = proxy.stats(&handle.token).unwrap();
     assert!(stats.seek_pauses >= 1, "seek 应触发预读暂停：{stats:?}");
     assert_eq!(stats.errors, 0, "取消的预读任务不应计为错误：{stats:?}");
+    cleanup(&proxy).await;
+}
+
+// ───────────────────────── task-21：上游 4xx 连续失败熔断 ─────────────────────────
+
+fn breaker_config(
+    dir: &Path,
+    chunk: u64,
+    readahead: u64,
+    threshold: usize,
+    max_restarts: usize,
+) -> StreamConfig {
+    let mut cfg = adaptive_config(dir, chunk, readahead, false, 0, false);
+    cfg.failure_breaker_threshold = threshold;
+    cfg.max_link_restarts = max_restarts;
+    cfg
+}
+
+#[test]
+fn default_config_has_breaker_threshold() {
+    assert_eq!(StreamConfig::default().failure_breaker_threshold, 2);
+}
+
+#[tokio::test]
+async fn permanent_403_trips_breaker_and_stops_prefetch() {
+    let tmp = TempDir::new("t21-perm");
+    let data = body_of(8 * 1024 * 1024);
+    let broken = MockUpstream::start(data.clone(), true).await;
+    broken.state.set_forced_status(Some(403));
+    let provider = MockProvider::new(broken.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(breaker_config(
+        tmp.path(),
+        1024 * 1024,
+        16 * 1024 * 1024,
+        2,
+        2,
+    ));
+    let handle = proxy
+        .open_with_provider(provider.clone(), "/no-access.mp4")
+        .await
+        .unwrap();
+    // 首次请求会触发分块下载失败（502 / 或等待中熔断）
+    let first = client()
+        .get(&handle.url)
+        .header("Range", "bytes=0-65535")
+        .send()
+        .await;
+    if let Ok(resp) = first {
+        let _ = resp.bytes().await;
+    }
+    // 等预读/在途任务收敛到熔断
+    let mut fatal_stats = None;
+    for _ in 0..100 {
+        let st = proxy.stats(&handle.token).unwrap();
+        if st.fatal {
+            fatal_stats = Some(st);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let stats = fatal_stats.expect("永久 403 应触发熔断");
+    assert!(stats.fatal);
+    assert!(
+        stats.fatal_reason.contains("403") && stats.fatal_reason.contains("熔断"),
+        "fatal_reason 应可读：{}",
+        stats.fatal_reason
+    );
+    assert!(stats.consecutive_failures >= 2, "应记录连续失败块数");
+
+    // 熔断后不再发起上游请求/换链：请求数、hits、restarts 都应冻结
+    let calls_at_fatal = provider.calls();
+    let hits_at_fatal = broken.state.hits();
+    let restarts_at_fatal = stats.upstream_restarts;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 后续 GET 直接 502 + 可读原因
+    let resp = client()
+        .get(&handle.url)
+        .header("Range", "bytes=0-65535")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(body.contains("已熔断"), "响应体应含熔断原因：{body}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        provider.calls(),
+        calls_at_fatal,
+        "熔断后不应再换链（direct_link 调用数冻结）"
+    );
+    assert_eq!(
+        broken.state.hits(),
+        hits_at_fatal,
+        "熔断后不应再发起上游请求"
+    );
+    let after = proxy.stats(&handle.token).unwrap();
+    assert_eq!(after.upstream_restarts, restarts_at_fatal);
+    // 换链次数受控：初始 1 次 + 每块 ≤max_restarts 次 × 阈值块数（+并发余量）
+    assert!(
+        provider.calls() <= 1 + 2 * 2 + 2,
+        "换链次数应被熔断限制，实际 {}",
+        provider.calls()
+    );
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn transient_403_with_successful_refresh_does_not_trip() {
+    let tmp = TempDir::new("t21-transient");
+    let data = body_of(1 * 1024 * 1024);
+    let good = MockUpstream::start(data.clone(), true).await;
+    let broken = MockUpstream::start(data.clone(), true).await;
+    broken.state.set_forced_status(Some(403));
+    let provider = MockProvider::with_urls(
+        vec![broken.url.clone(), good.url.clone()],
+        data.len() as u64,
+    );
+    // 阈值 1：如果临时 403 被计数就会立刻熔断；应换链成功后成功播放
+    let proxy = StreamProxy::new(breaker_config(tmp.path(), 256 * 1024, 0, 1, 2));
+    let handle = proxy
+        .open_with_provider(provider.clone(), "/v.mp4")
+        .await
+        .unwrap();
+    let (status, body, _) = read_range_via_proxy(&handle.url, 0, 4095).await;
+    assert_eq!(status, 206);
+    assert_eq!(body.as_slice(), &data[0..=4095]);
+    let stats = proxy.stats(&handle.token).unwrap();
+    assert!(!stats.fatal, "换链成功不应熔断：{stats:?}");
+    assert_eq!(stats.consecutive_failures, 0);
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn timeout_not_counted_as_permission_failure() {
+    let tmp = TempDir::new("t21-timeout");
+    let data = body_of(2 * 1024 * 1024);
+    // 每请求延迟 2.5s，客户端读/建连超时 1s → 超时类失败（UpstreamClient 总预算=max(1,1)+1=2s）
+    let up = RateUpstream::start(data.clone(), Duration::from_millis(2500), 0, 0).await;
+    let provider = MockProvider::new(up.url.clone(), data.len() as u64);
+    let mut cfg = breaker_config(tmp.path(), 256 * 1024, 0, 1, 0);
+    cfg.request_timeout_secs = 1;
+    cfg.connect_timeout_secs = 1;
+    let proxy = StreamProxy::new(cfg);
+    let handle = proxy
+        .open_with_provider(provider, "/slow.mp4")
+        .await
+        .unwrap();
+    let resp = client()
+        .get(&handle.url)
+        .header("Range", "bytes=0-4095")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502, "上游超时应回 502");
+    let stats = proxy.stats(&handle.token).unwrap();
+    assert!(!stats.fatal, "超时/网络类不应计入熔断：{stats:?}");
+    assert!(stats.errors >= 1);
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn breaker_threshold_zero_disables_circuit_breaker() {
+    let tmp = TempDir::new("t21-off");
+    let data = body_of(4 * 1024 * 1024);
+    let broken = MockUpstream::start(data.clone(), true).await;
+    broken.state.set_forced_status(Some(403));
+    let provider = MockProvider::new(broken.url.clone(), data.len() as u64);
+    let mut cfg = breaker_config(tmp.path(), 1024 * 1024, 0, 0, 1);
+    cfg.adaptive_chunk = false;
+    let proxy = StreamProxy::new(cfg);
+    let handle = proxy
+        .open_with_provider(provider, "/no-access.mp4")
+        .await
+        .unwrap();
+    let resp = client()
+        .get(&handle.url)
+        .header("Range", "bytes=0-4095")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let stats = proxy.stats(&handle.token).unwrap();
+    assert!(!stats.fatal, "threshold=0 应关闭熔断：{stats:?}");
+    cleanup(&proxy).await;
+}
+
+#[tokio::test]
+async fn normal_file_never_trips_breaker() {
+    let tmp = TempDir::new("t21-normal");
+    let data = body_of(3 * 1024 * 1024);
+    let mock = MockUpstream::start(data.clone(), true).await;
+    let provider = MockProvider::new(mock.url.clone(), data.len() as u64);
+    // 阈值 1：正常文件一个失败块都没有，绝不能误熔断
+    let proxy = StreamProxy::new(breaker_config(tmp.path(), 256 * 1024, 0, 1, 2));
+    let handle = proxy.open_with_provider(provider, "/v.mp4").await.unwrap();
+    let (status, body, _) = read_range_via_proxy(&handle.url, 0, data.len() as u64 - 1).await;
+    assert_eq!(status, 206);
+    assert_eq!(body.as_slice(), data.as_slice());
+    let stats = proxy.stats(&handle.token).unwrap();
+    assert!(!stats.fatal);
+    assert_eq!(stats.consecutive_failures, 0);
+    assert!(stats.fatal_reason.is_empty());
     cleanup(&proxy).await;
 }

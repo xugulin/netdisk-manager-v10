@@ -61,6 +61,8 @@ struct EffectiveConfig {
     adaptive_weak_mbps: f64,
     /// 弱网时预读窗口上限
     weak_readahead_bytes: u64,
+    /// 权限类 4xx 连续失败熔断阈值（0 = 关闭，task-21）
+    failure_breaker_threshold: usize,
 }
 
 impl EffectiveConfig {
@@ -81,6 +83,7 @@ impl EffectiveConfig {
             seek_pause_ms: config.seek_pause_ms.max(50),
             adaptive_weak_mbps: config.adaptive_weak_mbps.max(0.0),
             weak_readahead_bytes: config.weak_readahead_bytes,
+            failure_breaker_threshold: config.failure_breaker_threshold,
         }
     }
 }
@@ -216,6 +219,9 @@ impl ProxyInner {
             bootstrap_mbps: AtomicU64::new(0f64.to_bits()),
             seek_pauses: AtomicU64::new(0),
             bootstrap_bytes: AtomicU64::new(0),
+            fatal: AtomicBool::new(false),
+            fatal_reason: Mutex::new(None),
+            consecutive_failures: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             started: Instant::now(),
         });
@@ -594,6 +600,12 @@ pub(crate) struct Session {
     seek_pauses: AtomicU64,
     /// 首字节引导累计发送字节（诊断）。
     bootstrap_bytes: AtomicU64,
+    /// 是否已熔断（上游权限类 4xx 连续失败，task-21）。
+    fatal: AtomicBool,
+    /// 熔断原因（可读；GUI 直接展示）。
+    fatal_reason: Mutex<Option<String>>,
+    /// 连续失败的块数（任一成功块清零，task-21）。
+    consecutive_failures: AtomicU64,
     closed: AtomicBool,
     started: Instant,
 }
@@ -601,6 +613,29 @@ pub(crate) struct Session {
 struct LinkState {
     link: DirectLink,
     generation: u64,
+}
+
+/// 上游单段拉取的失败分类（task-21：只有权限类 4xx 才计入熔断）。
+#[derive(Debug, Clone)]
+enum FetchFailure {
+    /// 权限类 4xx（401/403/410）最终失败 → 计入连续失败块
+    Permission { status: u16, snippet: String },
+    /// 其它失败（网络/超时/416/5xx 等）→ 不熔断
+    Other(String),
+    /// 预读被 seek 取消 → 不计错误/不熔断
+    Canceled(String),
+}
+
+impl std::fmt::Display for FetchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchFailure::Permission { status, snippet } => {
+                write!(f, "上游权限失败 HTTP {status}：{snippet}")
+            }
+            FetchFailure::Other(s) => write!(f, "{s}"),
+            FetchFailure::Canceled(s) => write!(f, "{s}"),
+        }
+    }
 }
 
 impl Session {
@@ -620,6 +655,14 @@ impl Session {
             seek_pauses: self.seek_pauses.load(Ordering::Relaxed),
             bootstrap_bytes: self.bootstrap_bytes.load(Ordering::Relaxed),
             bootstrap_mbps: f64::from_bits(self.bootstrap_mbps.load(Ordering::Relaxed)),
+            fatal: self.fatal.load(Ordering::Relaxed),
+            fatal_reason: self
+                .fatal_reason
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_default(),
+            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -634,6 +677,19 @@ impl Session {
         range_header: Option<&str>,
         keep_alive: bool,
     ) -> io::Result<()> {
+        // task-21：已熔断 → 直接可读 502，不再发起任何上游请求（治理重试风暴）
+        if self.fatal.load(Ordering::Relaxed) {
+            let reason = self.fatal_reason_text();
+            return write_text(
+                stream,
+                502,
+                "Bad Gateway",
+                &format!("上游持续拒绝（已熔断）：{reason}"),
+                head_only,
+                false,
+            )
+            .await;
+        }
         // 1) Range 解析/求值
         let mut range: Option<(u64, u64)> = None;
         if let Some(value) = range_header {
@@ -886,24 +942,92 @@ impl Session {
                 return Err(Error::Canceled("预读任务已被 seek 取消".into()));
             }
         }
-        let data = self.fetch_range_bytes(start, end, gen).await?;
+        let data = match self.fetch_range_bytes(start, end, gen).await {
+            Ok(d) => d,
+            Err(FetchFailure::Canceled(m)) => return Err(Error::Canceled(m)),
+            Err(FetchFailure::Permission { status, snippet }) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                let msg = self.record_permission_failure(status, &snippet);
+                return Err(Error::other(msg));
+            }
+            Err(FetchFailure::Other(m)) => return Err(Error::other(m)),
+        };
         let n = data.len() as u64;
         self.cache.write_chunk(idx, data).await?;
         self.downloaded.fetch_add(n, Ordering::Relaxed);
+        // 成功块清零连续失败计数（熔断只针对「连续」失败）
+        self.consecutive_failures.store(0, Ordering::Relaxed);
         Ok(())
     }
 
+    /// 记录一次「权限类 4xx」块失败；达到阈值则熔断并返回可读原因。
+    fn record_permission_failure(&self, status: u16, snippet: &str) -> String {
+        let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let threshold = self.cfg.failure_breaker_threshold;
+        if threshold == 0 {
+            return format!("上游权限失败 HTTP {status}（熔断已关闭）：{snippet}");
+        }
+        if (n as usize) < threshold {
+            return format!("上游权限失败 HTTP {status}（连续 {n}/{threshold} 块）：{snippet}");
+        }
+        if !self.fatal.swap(true, Ordering::Relaxed) {
+            let brief: String = snippet
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect();
+            let reason = if brief.is_empty() {
+                format!("上游持续拒绝 HTTP {status}（已熔断）")
+            } else {
+                format!("上游持续拒绝 HTTP {status}（已熔断）：{brief}")
+            };
+            if let Ok(mut w) = self.fatal_reason.lock() {
+                *w = Some(reason.clone());
+            }
+            // 停止预读 / 取消在途预读任务（代次 + 暂停到永远）
+            self.seek_gen.fetch_add(1, Ordering::Relaxed);
+            self.prefetch_pause_until_ms
+                .store(u64::MAX, Ordering::Relaxed);
+            wp_core::log_warn!("wp-stream", "上游连续 {n} 块权限失败，会话熔断：{reason}");
+        }
+        self.fatal_reason_text()
+    }
+
+    fn fatal_reason_text(&self) -> String {
+        self.fatal_reason
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| "上游持续拒绝".to_string())
+    }
+
     /// 上游单段 Range 拉取（带换链重试；`gen` 用于预读取消检查）。
-    async fn fetch_range_bytes(&self, start: u64, end: u64, gen: Option<u64>) -> Result<Vec<u8>> {
+    /// 失败按 [`FetchFailure`] 分类，供调用方决定是否计入熔断。
+    async fn fetch_range_bytes(
+        &self,
+        start: u64,
+        end: u64,
+        gen: Option<u64>,
+    ) -> std::result::Result<Vec<u8>, FetchFailure> {
         let expect = (end - start + 1) as usize;
         let mut attempt: usize = 0;
+        let mut last_permission: Option<(u16, String)> = None;
         loop {
+            // 已熔断：不再发起换链/请求
+            if self.fatal.load(Ordering::Relaxed) {
+                return Err(FetchFailure::Other(self.fatal_reason_text()));
+            }
             if let Some(g) = gen {
                 if g != self.seek_gen.load(Ordering::Relaxed) {
-                    return Err(Error::Canceled("预读任务已被 seek 取消".into()));
+                    return Err(FetchFailure::Canceled("预读任务已被 seek 取消".to_string()));
                 }
             }
-            let (generation, link) = self.link_snapshot().await?;
+            let (generation, link) = match self.link_snapshot().await {
+                Ok(v) => v,
+                Err(e) => return Err(FetchFailure::Other(e.to_string())),
+            };
             match self.client.get_range(&link, start, end).await {
                 Ok(raw) if raw.status == 206 => {
                     if raw.body.len() == expect {
@@ -917,15 +1041,18 @@ impl Session {
                 }
                 Ok(raw) if raw.status == 416 => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(Error::other(format!(
+                    return Err(FetchFailure::Other(format!(
                         "上游 416：请求范围 {start}-{end} 超出文件大小（本地 total={}）",
                         self.total
                     )));
                 }
-                Ok(raw) if raw.is_auth_expired() || raw.is_transient() => {}
+                Ok(raw) if raw.is_auth_expired() => {
+                    last_permission = Some((raw.status, raw.error_snippet.trim().to_string()));
+                }
+                Ok(raw) if raw.is_transient() => {}
                 Ok(raw) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(Error::other(format!(
+                    return Err(FetchFailure::Other(format!(
                         "上游返回异常状态 {}：{}",
                         raw.status,
                         raw.error_snippet.trim()
@@ -935,12 +1062,17 @@ impl Session {
             }
             if attempt >= self.cfg.max_link_restarts {
                 self.errors.fetch_add(1, Ordering::Relaxed);
-                return Err(Error::network(format!(
+                if let Some((status, snippet)) = last_permission {
+                    return Err(FetchFailure::Permission { status, snippet });
+                }
+                return Err(FetchFailure::Other(format!(
                     "上游连续失败（已换链 {attempt} 次），范围 {start}-{end} 读取放弃"
                 )));
             }
             attempt += 1;
-            self.refresh_link(generation).await?;
+            if let Err(e) = self.refresh_link(generation).await {
+                return Err(FetchFailure::Other(format!("换链失败：{e}")));
+            }
         }
     }
 
@@ -990,7 +1122,7 @@ impl Session {
     async fn prefetch_loop(self: Arc<Self>) {
         let sem = Arc::new(Semaphore::new(self.cfg.parallel_fetches.max(1)));
         loop {
-            if self.closed.load(Ordering::Relaxed) {
+            if self.closed.load(Ordering::Relaxed) || self.fatal.load(Ordering::Relaxed) {
                 return;
             }
             if self.cache.is_complete() {

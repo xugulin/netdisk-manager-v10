@@ -81,6 +81,12 @@ pub struct StreamConfig {
     pub adaptive_weak_mbps: f64,
     /// 弱网时本会话预读窗口上限（默认 32MB）。
     pub weak_readahead_bytes: u64,
+    /// 上游权限类 4xx 连续失败熔断阈值（默认 2；0 = 关闭熔断）。
+    ///
+    /// 同一会话连续 N 个分块因 401/403/410（权限/链接失效类）失败 → 会话 `fatal`：
+    /// 停止预读、不再换链，后续 GET 直接 502 + 可读原因，治理「永久 403 重试风暴」
+    /// （超时/网络类错误不计入，仍走 normal 换链重试）。
+    pub failure_breaker_threshold: usize,
 }
 
 impl Default for StreamConfig {
@@ -105,6 +111,7 @@ impl Default for StreamConfig {
             seek_pause_ms: 400,
             adaptive_weak_mbps: 20.0,
             weak_readahead_bytes: 32 * 1024 * 1024,
+            failure_breaker_threshold: 2,
         }
     }
 }
@@ -152,6 +159,12 @@ pub struct StreamStats {
     pub bootstrap_bytes: u64,
     /// 最近一次首字节引导实测带宽（Mbps）。
     pub bootstrap_mbps: f64,
+    /// 是否已熔断（上游权限类 4xx 连续失败，task-21）。
+    pub fatal: bool,
+    /// 熔断原因（可读，GUI 直接显示；未熔断为空串）。
+    pub fatal_reason: String,
+    /// 当前连续失败的块数（成功块会清零；熔断阈值为 `failure_breaker_threshold`）。
+    pub consecutive_failures: u64,
 }
 
 /// 本地流代理。

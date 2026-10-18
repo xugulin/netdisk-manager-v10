@@ -78,6 +78,10 @@ struct Options {
     adaptive: bool,
     startup_first: u64,
     seek_priority: bool,
+    /// 4xx 熔断阈值（task-21；0=关闭）
+    breaker: usize,
+    /// 单块最多换链次数
+    max_restarts: usize,
 }
 
 impl Default for Options {
@@ -99,6 +103,8 @@ impl Default for Options {
             adaptive: true,
             startup_first: 1024 * 1024,
             seek_priority: true,
+            breaker: 2,
+            max_restarts: 3,
         }
     }
 }
@@ -209,6 +215,16 @@ fn parse_args() -> Result<Options, String> {
             },
             "--startup-first" => opts.startup_first = parse_size(&next()?)?,
             "--no-seek-priority" => opts.seek_priority = false,
+            "--breaker-threshold" => {
+                opts.breaker = next()?
+                    .parse()
+                    .map_err(|_| "breaker-threshold 需为整数（0=关闭）".to_string())?
+            }
+            "--max-restarts" => {
+                opts.max_restarts = next()?
+                    .parse()
+                    .map_err(|_| "max-restarts 需为整数".to_string())?
+            }
             "--out" => opts.out = Some(PathBuf::from(next()?)),
             "--help" | "-h" => {
                 print_help();
@@ -248,6 +264,8 @@ fn print_help() {
   --adaptive <on|off> 自适应首字节/分块（默认 on；task-18）
   --startup-first <1M> 首字节引导块大小（0=关闭）
   --no-seek-priority  关闭 seek 优先（默认开）
+  --breaker-threshold <2>  权限类 4xx 连续失败熔断阈值（0=关闭，task-21）
+  --max-restarts <3>  单块最多换链次数
   --out <path>        结果 JSON 写入文件
 "#
     );
@@ -549,26 +567,29 @@ async fn seq_read(
 ) -> Result<serde_json::Value, String> {
     let want = read_bytes.min(total);
     let t0 = Instant::now();
-    let mut resp = bench.client.get(url).send().await.map_err(|e| {
-        format!(
-            "顺序读请求失败：{e}（connect={}, timeout={}）",
-            e.is_connect(),
-            e.is_timeout()
-        )
-    })?;
-    if resp.status().as_u16() != 200 {
-        // 偶发连接层抖动重试一次
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        resp = bench.client.get(url).send().await.map_err(|e| {
-            format!(
-                "顺序读请求失败（重试）：{e}（connect={}, timeout={}）",
-                e.is_connect(),
-                e.is_timeout()
-            )
-        })?;
-        if resp.status().as_u16() != 200 {
-            return Err(format!("顺序读期望 200，实际 {}", resp.status()));
+    let resp = match bench.client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let st = bench.proxy.stats(&token_of(url)).unwrap_or_default();
+            return Ok(serde_json::json!({
+                "error": format!(
+                    "顺序读请求失败：{e}（connect={}, timeout={}）",
+                    e.is_connect(), e.is_timeout()
+                ),
+                "stats": stats_json(&st),
+            }));
         }
+    };
+    if resp.status().as_u16() != 200 {
+        let status = resp.status().as_u16();
+        let snippet = resp.text().await.unwrap_or_default();
+        let st = bench.proxy.stats(&token_of(url)).unwrap_or_default();
+        return Ok(serde_json::json!({
+            "status": status,
+            "error": format!("顺序读期望 200，实际 {status}"),
+            "body_snippet": snippet.chars().take(200).collect::<String>(),
+            "stats": stats_json(&st),
+        }));
     }
     let headers_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let mut resp = resp;
@@ -615,6 +636,9 @@ async fn seq_read(
         "prefetch_downloaded_bytes": stats.downloaded_bytes,
         "upstream_restarts": stats.upstream_restarts,
         "errors": stats.errors,
+        "fatal": stats.fatal,
+        "fatal_reason": stats.fatal_reason,
+        "consecutive_failures": stats.consecutive_failures,
         "read_error": read_error,
     }))
 }
@@ -631,12 +655,21 @@ async fn baseline_direct(
     for (k, v) in &link.headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("直连基线请求失败：{e}"))?;
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(serde_json::json!({
+                "error": format!("直连基线请求失败：{e}"),
+                "headers_ms": round1(t0.elapsed().as_secs_f64() * 1000.0),
+            }))
+        }
+    };
     if !resp.status().is_success() {
-        return Err(format!("直连基线返回 {}", resp.status()));
+        return Ok(serde_json::json!({
+            "status": resp.status().as_u16(),
+            "error": format!("直连基线返回 HTTP {}", resp.status()),
+            "headers_ms": round1(t0.elapsed().as_secs_f64() * 1000.0),
+        }));
     }
     let headers_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let mut resp = resp;
@@ -668,6 +701,17 @@ async fn baseline_direct(
         "throughput_mbps": round2(got as f64 * 8.0 / secs / 1_000_000.0),
         "read_error": read_error,
     }))
+}
+
+fn stats_json(st: &wp_stream::StreamStats) -> serde_json::Value {
+    serde_json::json!({
+        "downloaded_bytes": st.downloaded_bytes,
+        "upstream_restarts": st.upstream_restarts,
+        "errors": st.errors,
+        "fatal": st.fatal,
+        "fatal_reason": st.fatal_reason,
+        "consecutive_failures": st.consecutive_failures,
+    })
 }
 
 fn token_of(url: &str) -> String {
@@ -751,6 +795,8 @@ async fn seek_test(
         adaptive_chunk: opts.adaptive,
         startup_first_bytes: opts.startup_first,
         seek_priority: opts.seek_priority,
+        failure_breaker_threshold: opts.breaker,
+        max_link_restarts: opts.max_restarts,
         ..StreamConfig::default()
     };
     let bench = Bench::new(cold_cfg)?;
@@ -814,6 +860,8 @@ async fn seek_test(
         adaptive_chunk: opts.adaptive,
         startup_first_bytes: opts.startup_first,
         seek_priority: opts.seek_priority,
+        failure_breaker_threshold: opts.breaker,
+        max_link_restarts: opts.max_restarts,
         ..StreamConfig::default()
     };
     let bench2 = Bench::new(warm_cfg)?;
@@ -1082,6 +1130,8 @@ async fn run_matrix(
             adaptive_chunk: opts.adaptive,
             startup_first_bytes: opts.startup_first,
             seek_priority: opts.seek_priority,
+            failure_breaker_threshold: opts.breaker,
+            max_link_restarts: opts.max_restarts,
             ..StreamConfig::default()
         };
 
@@ -1233,6 +1283,8 @@ async fn run() -> Result<(), String> {
             "adaptive_chunk": opts.adaptive,
             "startup_first_bytes": opts.startup_first,
             "seek_priority": opts.seek_priority,
+            "failure_breaker_threshold": opts.breaker,
+            "max_link_restarts": opts.max_restarts,
         },
     });
 
@@ -1264,6 +1316,8 @@ async fn run() -> Result<(), String> {
         adaptive_chunk: opts.adaptive,
         startup_first_bytes: opts.startup_first,
         seek_priority: opts.seek_priority,
+        failure_breaker_threshold: opts.breaker,
+        max_link_restarts: opts.max_restarts,
         ..StreamConfig::default()
     };
 
@@ -1397,14 +1451,23 @@ async fn run() -> Result<(), String> {
         let handle = bench
             .open(effective_link.clone(), &opts.remote_path)
             .await?;
-        let (_, ttfb, total_ms) =
-            read_range(&bench.client, &handle.url, 0, 65535.min(total - 1)).await?;
-        result["startup_first_range"] = serde_json::json!({
-            "range": format!("bytes=0-{}", 65535.min(total - 1)),
-            "ttfb_ms": round1(ttfb),
-            "total_ms": round1(total_ms),
-            "note": "代理对 GET 先确保首块(默认4MB)就绪才回响应头，故 ttfb≈首块下载时间",
-        });
+        match read_range(&bench.client, &handle.url, 0, 65535.min(total - 1)).await {
+            Ok((_, ttfb, total_ms)) => {
+                result["startup_first_range"] = serde_json::json!({
+                    "range": format!("bytes=0-{}", 65535.min(total - 1)),
+                    "ttfb_ms": round1(ttfb),
+                    "total_ms": round1(total_ms),
+                    "note": "自适应开启时先回 headers；关闭时 ttfb≈首块下载时间",
+                })
+            }
+            Err(e) => {
+                let st = bench.proxy.stats(&handle.token).unwrap_or_default();
+                result["startup_first_range"] = serde_json::json!({
+                    "error": e,
+                    "stats": stats_json(&st),
+                });
+            }
+        }
         bench.finish().await;
     }
 

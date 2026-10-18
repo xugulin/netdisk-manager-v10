@@ -402,6 +402,7 @@ mod tests {
             seek_pause_ms: 400,
             adaptive_weak_mbps: 20.0,
             weak_readahead_bytes: 32 * 1024 * 1024,
+            failure_breaker_threshold: 2,
         }
     }
 

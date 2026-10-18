@@ -18,6 +18,7 @@
 | 参数建议（4K 40–100Mbps） | **chunk=4MB（弱网 1–2MB）· readahead=128MB（≈8.5–25s 缓冲）· parallel=4（弱网 2）· LRU=50GB（4K 重度；现有 20GB 保留为默认）** |
 | HLS | 正常网络 m3u8 0.65–1.07s、首分片 1.0s（7.7Mbps）、40% seek 2.2s/2.2MB；mpv 实测起播 4.7s、seek 19.9s（详见 `PLAYER_STREAM_M0.md` §9）。HLS 无缓存，seek 成本=重新拉分片 |
 | 发现的问题 | ① 弱网下**预读会与 seek 抢带宽**（矩阵 ra=128M 冷 seek 16.4s vs ra=0 4.1s）；② 起播受「首块就绪才回首字节」策略约束（=chunk/带宽）。两项已由 **task-18 生产优化**解决/缓解（见 §7） |
+| task-21 熔断 | 上游**权限类 4xx（401/403/410）连续失败**（默认 2 块）→ 会话 `fatal`：停预读/停换链、后续 GET 立即 502 + 可读原因；百度 31326 真机换链 6→3 次、errors 15→7、立即显示「上游持续拒绝 HTTP 403（已熔断）」；超时/网络类不熔断。见 §9 |
 | task-18 优化效果 | **先回 headers + 1MB 首字节引导 + seek 优先预读（默认开）**：冷起播首字节 55.8s → **0.84s**（同窗口劣化网络，约 66×）；**mpv 端到端起播 26.0s → 12.2s**（2.1×）；弱网自动降预读窗口（64→32MB）。见 §7 |
 
 ---
@@ -284,3 +285,54 @@ mpv --no-config     --http-header-fields="Cookie: …" --user-agent "…" --refe
 * `--demuxer-readahead-secs=20-30`：提前拉分片，降低起播后卡顿；
 * `--http-header-fields` 注入 Cookie/Referer，`--user-agent` 单独指定（与直链 headers 一致）；
 * 4K HLS 需要 ≥1.5× 码率稳定带宽（60Mbps 4K 码率 → ≥90Mbps 带宽），否则 seek/起播会明显变慢（实测 40% seek 2.2–2.5s/2.2MB 分片）。
+
+---
+
+## 9. 上游权限类 4xx 连续失败熔断（task-21）
+
+> 背景：百度某文件永久 403 `error_code:31326 user is not authorized` 时，旧代理对**每个分块**都重试 3 次换链、后台预读又不断发起新块 → GUI 侧观测到 **41 次换链 / 0 下载 / 一直「打开中」**（重试风暴，耗带宽和日志）。
+
+### 9.1 行为
+
+| 项 | 行为 |
+|---|---|
+| 触发 | 同一会话**连续 N 个分块**（`StreamConfig.failure_breaker_threshold`，默认 **2**，0=关闭）因**权限类 4xx（401/403/410）最终失败**（已换链重试后仍失败） |
+| 不计入 | 超时 / 网络错误 / 5xx / 416 —— 仍走原「最多 3 次换链」逻辑，不熔断 |
+| 清零 | 任一成功下载的块会把 `consecutive_failures` 清零（只针对「连续」失败） |
+| fatal 后 | ① 立即停止后台预读（并 bump 代次让在途预读任务放弃）；② **不再发起换链/上游请求**；③ 后续 GET 立即返回 `502` + 可读原因（如「上游持续拒绝 HTTP 403（已熔断）：{"error_code":31326,...}」）；④ `errors/restarts` 冻结 |
+| 恢复 | 关闭会话重新 `open`（新会话）即重置；也可调大阈值/置 0 关闭熔断 |
+
+### 9.2 新增诊断字段（GUI 直接显示，替代一直「打开中」）
+
+```text
+StreamStats.fatal: bool                 // 是否已熔断
+StreamStats.fatal_reason: String        // 可读原因（未熔断为空串）
+StreamStats.consecutive_failures: u64   // 当前连续失败块数
+```
+
+GUI 建议：`fatal=true` 时状态行显示「熔断：{fatal_reason}」，并停止 loading 动画（PlaybackSource 打开后首帧前即可轮询 stats）。
+
+### 9.3 真机验证（百度 `/video_20260322_154432.mp4`，2.4GB，31326 权限 403）
+
+工具：`stream_bench <link.json> --mode seq --read-bytes 1M --chunk 1M --readahead 128M --parallel 4 --adaptive off --max-restarts 3 --breaker-threshold 0|2`
+
+| 配置 | upstream_restarts | errors | consecutive_failures | fatal | 端到端耗时 |
+|---|---|---|---|---|---|
+| 熔断关闭（threshold=0，旧行为） | 6 | 15 | 7 | ❌ false | 5 s（仍在重试） |
+| 熔断开启（threshold=2，默认） | **3** | **7** | 3 | ✅ **true** | **3 s**，GET 立即 502 |
+
+熔断原因（响应体/`fatal_reason` 原文节选）：
+
+```text
+上游持续拒绝 HTTP 403（已熔断）：{"error_code":31326,"error_msg":"user is not authorized, hitcode:119","request_id":...}
+```
+
+> 注：GUI 侧长会话（播放器持续请求 + 预读不停）旧版观测到 41 次换链；本工具每个阶段新建会话（会话级熔断），故绝对次数更小。核心指标是 **fatal 后 `errors/restarts/hits` 冻结、GET 立即返回可读 502**（测试 `permanent_403_trips_breaker_and_stops_prefetch` 已断言冻结）。
+
+### 9.4 测试（新增 6 个，task-21）
+
+`default_config_has_breaker_threshold` / `permanent_403_trips_breaker_and_stops_prefetch`（换链/请求数冻结 + 502 可读 + prefetch 停止）/
+`transient_403_with_successful_refresh_does_not_trip`（换链成功不误熔断）/
+`timeout_not_counted_as_permission_failure`（超时不熔断）/
+`breaker_threshold_zero_disables_circuit_breaker` /
+`normal_file_never_trips_breaker`（正常文件不受影响）。
