@@ -91,7 +91,7 @@ fn parse_timing_line(line: &str) -> Option<(i64, i64)> {
     let (left, right) = line.split_once("-->")?;
     let start = parse_timestamp(left.trim())?;
     // 结束时间后面可能跟 cue settings（`line:0 position:10% align:start`）
-    let end_token = right.trim().split_whitespace().next()?;
+    let end_token = right.split_whitespace().next()?;
     let end = parse_timestamp(end_token)?;
     Some((start, end))
 }

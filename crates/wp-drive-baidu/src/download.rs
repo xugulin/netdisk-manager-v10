@@ -75,6 +75,7 @@ pub(crate) async fn direct_link(d: &BaiduDrive, path: &str) -> Result<DirectLink
         expire_at: None,
         size,
         file_name,
+        is_hls: false,
     })
 }
 

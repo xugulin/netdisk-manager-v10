@@ -83,7 +83,7 @@ fn parse_timing_line(line: &str) -> Option<(i64, i64)> {
     let (left, right) = line.split_once("-->")?;
     let start = parse_srt_timestamp(left.trim())?;
     // 结束时间后可能跟 VTT 风格设置（`align:start`）或 SRT 坐标（`X1:...`），取第一个 token
-    let end_token = right.trim().split_whitespace().next()?;
+    let end_token = right.split_whitespace().next()?;
     let end = parse_srt_timestamp(end_token)?;
     Some((start, end))
 }

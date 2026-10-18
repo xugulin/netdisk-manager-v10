@@ -158,7 +158,7 @@ pub fn dedupe_cues(cues: &[Cue]) -> Vec<Cue> {
 }
 
 /// 某一时刻正在显示的 cue（线性扫描；播放器每帧热路径请用 [`CueTracker`]）。
-pub fn active_cues<'a>(cues: &'a [Cue], time_ms: i64) -> Vec<&'a Cue> {
+pub fn active_cues(cues: &[Cue], time_ms: i64) -> Vec<&Cue> {
     cues.iter()
         .filter(|c| c.start_ms <= time_ms && c.end_ms > time_ms)
         .collect()

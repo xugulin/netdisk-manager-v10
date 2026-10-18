@@ -1,140 +1,235 @@
-//! 弹幕子系统（纯逻辑）：模型/解析/车道布局/ASS 生成。
+//! 弹幕子系统（纯逻辑）：模型/解析/车道布局/ASS 生成/屏蔽过滤。
 //!
 //! 渲染在 GUI 侧：Mode A 用 egui 覆盖层（`wp-gui`），Mode B 用本 crate 生成的 ASS
 //! 作为副字幕轨交给 mpv 渲染。任务 T22–T27。
+//!
+//! # 能力
+//! - **解析/导出**：B 站 XML（往返）、JSON（B 站 API / 弹幕库 / 普通数组）、ASS 导入
+//! - **布局引擎**：[`layout`] 滚动车道防追尾（[`scroll_overlap`] 几何判定）、顶部/底部
+//!   固定车道、密度上限策略（[`DensityPolicy`]）、1080p/4K 相对坐标一致
+//! - **ASS 生成**：[`generate_ass`] 滚动 `\move`、固定 `\pos`、颜色 `&HBBGGRR&`、
+//!   字号按高度换算、透明度；[`generate_ass_windowed`] 时间窗裁剪（分片 `sub-reload`）
+//! - **过滤**：[`DanmakuFilter`] 关键词/通配符/用户/类型屏蔽、重复折叠、密度曲线
+//!
+//! # 快速上手
+//! ```
+//! use wp_danmaku::{parse_bilibili_xml, export_bilibili_xml, layout, generate_ass, LayoutConfig};
+//!
+//! let xml = r#"<i><d p="1.5,1,25,16777215,0,0,user,1">你好</d></i>"#;
+//! let doc = parse_bilibili_xml(xml).unwrap();
+//! assert_eq!(doc.comments.len(), 1);
+//! let xml2 = export_bilibili_xml(&doc);
+//! assert!(xml2.contains("1.500,1,25,16777215"));
+//!
+//! let placed = layout(&doc.comments, &LayoutConfig::hd1080());
+//! let ass = generate_ass(&placed, &LayoutConfig::hd1080());
+//! assert!(ass.contains("\\move("));
+//! ```
 
-use serde::{Deserialize, Serialize};
+#![forbid(unsafe_code)]
+#![deny(missing_debug_implementations)]
+
+pub mod filter;
+pub mod layout;
+pub mod model;
+pub mod parse_ass_import;
+pub mod parse_bilibili;
+pub mod parse_json;
+pub mod render_ass;
+pub mod text;
+pub mod time;
+
+pub use filter::{dedupe_comments, density_curve, glob_match, DanmakuFilter, FilterReason};
+pub use layout::{geometry, layout_with_policy, scroll_overlap, text_width_ratio, PlacedTimeline};
+pub use model::{
+    comment_weight, AssRenderOptions, Comment, DanmakuDoc, DanmakuMode, DanmakuSource,
+    DensityPolicy, LayoutConfig, LayoutGeometry, LayoutStats, PlacedComment,
+};
+pub use parse_ass_import::import_ass;
+pub use parse_bilibili::{export_bilibili_xml, parse_bilibili_xml, parse_p_attr};
+pub use parse_json::{export_json, parse_json};
+pub use render_ass::{
+    ass_color, escape_danmaku_text, export_ass, generate_ass_windowed, generate_ass_with_options,
+    play_res,
+};
+pub use text::{
+    clean_danmaku_text, strip_ass_tags, unescape_ass_text_single_line, xml_escape, xml_unescape,
+};
+pub use time::{format_ass_timestamp, ms_to_seconds_string, parse_ass_timestamp, seconds_to_ms};
+
 use wp_core::{Error, Result};
 
-/// 弹幕显示模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum DanmakuMode {
-    /// 滚动（右→左）。
-    #[default]
-    Scroll,
-    /// 顶部固定。
-    Top,
-    /// 底部固定。
-    Bottom,
+/// 车道布局（T23）：默认密度策略（超限丢弃新弹幕），返回渲染用的相对坐标。
+///
+/// 见 [`PlacedComment`]：`y_ratio`/`width_ratio` 为相对视频宽高 0~1，
+/// 1080p 与 4K 结果一致。
+pub fn layout(comments: &[Comment], cfg: &LayoutConfig) -> Vec<PlacedComment> {
+    layout::layout(comments, cfg)
 }
 
-/// 单条弹幕。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Comment {
-    /// 出现时间（毫秒，相对视频起点）。
-    pub time_ms: i64,
-    pub mode: DanmakuMode,
-    /// RGB 颜色（0xRRGGBB）。
-    pub color: u32,
-    /// 字号（以 1080p 为基准的相对字号，默认 25）。
-    pub font_size: f32,
-    pub text: String,
-    /// 发送者（可选）。
-    pub user: Option<String>,
+/// 布局 + 统计（面板诊断用）。
+pub fn layout_with_stats(
+    comments: &[Comment],
+    cfg: &LayoutConfig,
+    policy: DensityPolicy,
+) -> (Vec<PlacedComment>, LayoutStats) {
+    layout::layout_with_policy(comments, cfg, policy)
 }
 
-impl Default for Comment {
-    fn default() -> Self {
-        Self {
-            time_ms: 0,
-            mode: DanmakuMode::Scroll,
-            color: 0xFFFFFF,
-            font_size: 25.0,
-            text: String::new(),
-            user: None,
-        }
+/// 生成 ASS 弹幕轨（T25）：滚动 `\move`、固定 `\pos`、颜色/字号/透明度。
+pub fn generate_ass(placed: &[PlacedComment], cfg: &LayoutConfig) -> String {
+    render_ass::generate_ass(placed, cfg)
+}
+
+/// 猜测弹幕文件格式（本地同名 XML/JSON/ASS 自动加载用）。
+pub fn guess_format(path: &str, content: &str) -> Option<DanmakuSource> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "xml" => return Some(DanmakuSource::BilibiliXml),
+        "json" | "jsonl" => return Some(DanmakuSource::LocalFile),
+        "ass" | "ssa" => return Some(DanmakuSource::LocalFile),
+        _ => {}
+    }
+    let head = content.trim_start();
+    if head.starts_with("<?xml") || head.starts_with("<i") {
+        Some(DanmakuSource::BilibiliXml)
+    } else if head.starts_with('{')
+        || head.starts_with('[')
+        || (content.contains("[Events]") && content.contains("Dialogue:"))
+    {
+        Some(DanmakuSource::LocalFile)
+    } else {
+        None
     }
 }
 
-/// 弹幕来源。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum DanmakuSource {
-    #[default]
-    LocalFile,
-    BilibiliXml,
-    Online(String),
-    Generated,
-}
-
-/// 弹幕文档。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct DanmakuDoc {
-    pub source: DanmakuSource,
-    pub comments: Vec<Comment>,
-}
-
-/// 布局配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LayoutConfig {
-    pub video_width: u32,
-    pub video_height: u32,
-    /// 滚动弹幕穿越屏幕时长（毫秒）。
-    pub scroll_duration_ms: i64,
-    /// 顶部/底部固定弹幕停留时长（毫秒）。
-    pub fixed_duration_ms: i64,
-    /// 同屏最大弹幕数。
-    pub density_limit: usize,
-    /// 显示区域（0~1，留出上下边）。
-    pub area_top: f32,
-    pub area_bottom: f32,
-    /// 字号缩放。
-    pub font_scale: f32,
-    /// 速度倍率（>1 更快）。
-    pub speed: f32,
-}
-
-impl Default for LayoutConfig {
-    fn default() -> Self {
-        Self {
-            video_width: 3840,
-            video_height: 2160,
-            scroll_duration_ms: 8000,
-            fixed_duration_ms: 4000,
-            density_limit: 160,
-            area_top: 0.03,
-            area_bottom: 0.25,
-            font_scale: 1.0,
-            speed: 1.0,
-        }
+/// 按扩展名/内容自动解析弹幕文件（XML/JSON/ASS）。
+pub fn parse_auto(path: Option<&str>, content: &str) -> Result<DanmakuDoc> {
+    let path = path.unwrap_or("");
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "xml" => return parse_bilibili_xml(content),
+        "json" | "jsonl" => return parse_json(content),
+        "ass" | "ssa" => return import_ass(content),
+        _ => {}
+    }
+    let head = content.trim_start();
+    if head.starts_with("<?xml") || head.starts_with("<i") {
+        parse_bilibili_xml(content)
+    } else if head.starts_with('{') || head.starts_with('[') {
+        parse_json(content)
+    } else if content.contains("[Events]") && content.contains("Dialogue:") {
+        import_ass(content)
+    } else {
+        Err(Error::unsupported("无法识别的弹幕文件格式"))
     }
 }
 
-/// 布局后的弹幕（供 egui 渲染或 ASS 生成）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlacedComment {
-    pub comment: Comment,
-    /// 车道序号（0 起）。
-    pub lane: usize,
-    /// y 坐标（相对视频高度 0~1，文本顶部）。
-    pub y_ratio: f32,
-    /// 文本宽度（相对视频宽度 0~1，估算值）。
-    pub width_ratio: f32,
-    /// 渲染开始/结束（毫秒，已含固定/滚动时长）。
-    pub start_ms: i64,
-    pub end_ms: i64,
+/// 合并多份弹幕文档：按时间排序 + 可选时间窗去重。
+pub fn merge_docs(docs: &[DanmakuDoc], dedupe_window_ms: Option<i64>) -> DanmakuDoc {
+    let mut comments: Vec<Comment> = docs
+        .iter()
+        .flat_map(|doc| doc.comments.iter().cloned())
+        .collect();
+    comments.sort_by_key(|c| c.time_ms);
+    if let Some(window) = dedupe_window_ms {
+        comments = filter::dedupe_comments(&comments, window);
+    }
+    DanmakuDoc::from_comments(comments)
 }
 
-/// 解析 B 站 XML 弹幕（T22 实现）。
-pub fn parse_bilibili_xml(_xml: &str) -> Result<DanmakuDoc> {
-    Err(Error::unsupported("B站 XML 解析尚未实现（T22 任务）"))
+/// 规范化文档：负时间裁剪、字号/颜色合法化、按时间排序。
+pub fn normalize_doc(doc: &mut DanmakuDoc) {
+    doc.normalize();
 }
 
-/// 解析 JSON 弹幕（T22 实现）。
-pub fn parse_json(_json: &str) -> Result<DanmakuDoc> {
-    Err(Error::unsupported("JSON 弹幕解析尚未实现（T22 任务）"))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// 车道布局（T23 实现）。
-pub fn layout(_comments: &[Comment], _cfg: &LayoutConfig) -> Vec<PlacedComment> {
-    Vec::new()
-}
+    #[test]
+    fn full_pipeline_xml_to_ass() {
+        let xml = r#"<?xml version="1.0"?><i>
+<d p="1.0,1,25,16777215,0,0,u1,1">滚动</d>
+<d p="2.0,5,25,16711680,0,0,u2,2">顶部红</d>
+<d p="3.0,4,25,255,0,0,0,3">底部</d>
+</i>"#;
+        let doc = parse_bilibili_xml(xml).unwrap();
+        assert_eq!(doc.comments.len(), 3);
+        let cfg = LayoutConfig::hd1080();
+        let placed = layout(&doc.comments, &cfg);
+        assert_eq!(placed.len(), 3);
+        let ass = generate_ass(&placed, &cfg);
+        assert!(ass.contains("\\move("));
+        assert!(ass.contains("\\pos("));
+        assert!(ass.contains("\\c&H0000FF&")); // 红
+                                               // 导出 XML 再解析
+        let xml2 = export_bilibili_xml(&doc);
+        let doc2 = parse_bilibili_xml(&xml2).unwrap();
+        assert_eq!(doc2.comments.len(), doc.comments.len());
+    }
 
-/// 生成 ASS 弹幕轨（T25 实现）。
-pub fn generate_ass(_placed: &[PlacedComment], _cfg: &LayoutConfig) -> String {
-    String::new()
-}
+    #[test]
+    fn auto_parse_by_extension_and_content() {
+        let xml = r#"<i><d p="1.0,1,25,16777215,0,0,0,1">x</d></i>"#;
+        assert_eq!(parse_auto(Some("a.xml"), xml).unwrap().comments.len(), 1);
+        assert!(parse_auto(Some("a.bin"), xml).is_ok());
+        let json = r#"[{"time_ms": 1000, "text": "j"}]"#;
+        assert_eq!(parse_auto(Some("a.json"), json).unwrap().comments.len(), 1);
+        let ass = "[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,{\\move(1,1,2,2)}x\n";
+        assert_eq!(parse_auto(Some("a.ass"), ass).unwrap().comments.len(), 1);
+        assert!(parse_auto(Some("a.txt"), "garbage").is_err());
+        assert_eq!(guess_format("a.xml", ""), Some(DanmakuSource::BilibiliXml));
+        assert_eq!(guess_format("a.json", ""), Some(DanmakuSource::LocalFile));
+        assert_eq!(guess_format("a.txt", "garbage"), None);
+    }
 
-/// 导出 B 站 XML（T22 实现）。
-pub fn export_bilibili_xml(_doc: &DanmakuDoc) -> String {
-    String::new()
+    #[test]
+    fn merge_and_dedupe_docs() {
+        let a = DanmakuDoc::from_comments(vec![
+            Comment::new(2000, DanmakuMode::Scroll, "重复"),
+            Comment::new(1000, DanmakuMode::Scroll, "a"),
+        ]);
+        let b = DanmakuDoc::from_comments(vec![
+            Comment::new(2500, DanmakuMode::Scroll, "重复"),
+            Comment::new(3000, DanmakuMode::Scroll, "b"),
+        ]);
+        let merged = merge_docs(&[a.clone(), b.clone()], None);
+        assert_eq!(merged.comments.len(), 4);
+        // 按时间排序
+        assert_eq!(merged.comments[0].time_ms, 1000);
+        // 5s 窗口内“重复”折叠
+        let merged = merge_docs(&[a, b], Some(5000));
+        assert_eq!(merged.comments.len(), 3);
+        assert!(merged
+            .comments
+            .iter()
+            .all(|c| c.text != "重复" || c.time_ms == 2000));
+    }
+
+    #[test]
+    fn filter_then_layout() {
+        let comments = vec![
+            Comment::new(0, DanmakuMode::Scroll, "正常"),
+            Comment::new(0, DanmakuMode::Scroll, "广告内容"),
+        ];
+        let filter = DanmakuFilter {
+            keywords: vec!["广告".into()],
+            ..DanmakuFilter::new()
+        };
+        let kept = filter.apply(&comments);
+        assert_eq!(kept.len(), 1);
+        let placed = layout(&kept, &LayoutConfig::hd1080());
+        assert_eq!(placed[0].comment.text, "正常");
+    }
+
+    #[test]
+    fn normalize_doc_wrapper() {
+        let mut doc = DanmakuDoc::from_comments(vec![
+            Comment::new(2000, DanmakuMode::Scroll, "b"),
+            Comment::new(1000, DanmakuMode::Scroll, "a"),
+        ]);
+        normalize_doc(&mut doc);
+        assert_eq!(doc.comments[0].text, "a");
+    }
 }

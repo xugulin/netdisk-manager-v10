@@ -287,19 +287,15 @@ pub fn parse_ass_document(text: &str) -> AssDocument {
         if !found_first_dialogue {
             header_lines.push(line.to_string());
             match section.as_str() {
-                "[events]" => {
-                    if starts_with_ci(trimmed, "Format:") {
-                        events_fields = Some(parse_field_list(trimmed));
-                    }
+                "[events]" if starts_with_ci(trimmed, "Format:") => {
+                    events_fields = Some(parse_field_list(trimmed));
                 }
-                "[v4+ styles]" | "[v4 styles]" => {
-                    if starts_with_ci(trimmed, "Style:") {
-                        let name = style_name_of(trimmed).to_string();
-                        styles.push(AssStyle {
-                            name,
-                            line: trimmed.to_string(),
-                        });
-                    }
+                "[v4+ styles]" | "[v4 styles]" if starts_with_ci(trimmed, "Style:") => {
+                    let name = style_name_of(trimmed).to_string();
+                    styles.push(AssStyle {
+                        name,
+                        line: trimmed.to_string(),
+                    });
                 }
                 _ => {}
             }
@@ -551,7 +547,7 @@ pub fn align_translations<'a>(original: &[Cue], translated: &'a [Cue]) -> Vec<Op
                     .saturating_mul(2)
                     .saturating_sub(start_diff)
                     .saturating_sub(end_diff);
-                if best.map_or(true, |(_, s)| score > s) {
+                if best.is_none_or(|(_, s)| score > s) {
                     best = Some((t, score));
                 }
             }

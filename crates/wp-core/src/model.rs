@@ -310,6 +310,9 @@ pub struct DirectLink {
     pub size: u64,
     #[serde(default)]
     pub file_name: String,
+    /// 是否为 HLS（m3u8）流：如夸克大文件走云端转码 HLS，播放器/流代理需直连（不走 Range 代理）。
+    #[serde(default)]
+    pub is_hls: bool,
 }
 
 /// 分享信息。

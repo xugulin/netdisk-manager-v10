@@ -529,6 +529,7 @@ impl Drive for FakeDrive {
             expire_at: Some(wp_core::util::now_ts() + 3600),
             size: e.size,
             file_name: e.name,
+            is_hls: false,
         })
     }
 

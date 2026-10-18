@@ -75,6 +75,7 @@ pub(crate) fn parse_direct_link(
         expire_at,
         size,
         file_name,
+        is_hls: false,
     })
 }
 

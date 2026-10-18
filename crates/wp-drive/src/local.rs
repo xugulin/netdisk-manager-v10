@@ -335,6 +335,7 @@ impl Drive for LocalDrive {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default(),
+            is_hls: false,
         })
     }
 
