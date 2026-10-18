@@ -287,6 +287,19 @@ crates/
 - **任务计划**：[docs/PLAYER_TASKS.md](docs/PLAYER_TASKS.md)
   （M0 技术验证 → M1 播放内核 → M2 完整字幕 → M3 源接入/ISO → M4 AI 基建+翻译 → M5 弹幕 → M6 打包验收 → M7 进阶；
   约 50–72 人日，待确认后开工）
+
+### 进度（2026-10-19）
+
+| 里程碑 | 状态 | 证据 |
+|---|---|---|
+| **M0 技术验证** | ✅ 完成 | [PLAYER_M0_RESULTS.md](docs/PLAYER_M0_RESULTS.md)：LGPL libmpv 一键构建（3.3MB/3min）、Mode A render API 出帧+UI 同帧合成、ASS 弹幕副字幕轨、VAAPI copy-back（4K HEVC CPU 0.76→0.27 核）、HLS 真机播放+seek |
+| **M1 播放内核** | ✅ 基本完成 | GUI 已接真实 libmpv：`25-真实播放.png`（真实帧渲染 1920x1080，hwdec=vaapi-copy）；`cargo test --workspace` **543 passed / 0 failed**；headless 冒烟 **24/24**；真机桌面零拷贝/4K60 指标待下一轮 |
+| 流代理 | ✅ 完成 | [PLAYER_STREAM_M0.md](docs/PLAYER_STREAM_M0.md)：三盘 Range 206、磁盘预读缓存/过期换链、夸克 HLS 决策 |
+| 夸克大文件 | ✅ 完成 | [PLAYER_QUARK_STREAM.md](docs/PLAYER_QUARK_STREAM.md)：23018 突破 → 云端转码 HLS 真机可播可 seek |
+| 字幕/弹幕内核 | ✅ 完成 | 字幕 59+5、弹幕 80+6 测试；格式矩阵与集成素材在 `出/验收截图/字幕弹幕/` |
+| AI 子系统 | ✅ 基础完成 | [PLAYER_AI.md](docs/PLAYER_AI.md)：远端/本地 LLM、本地 whisper ASR、翻译→双语 ASS 闭环（wp-ai 67 测试 all-features） |
+| 蓝光主标题 | ⏳ 下一轮 | 需未加密 ISO/BDMV 样本做 E6 |
+| Windows ANGLE | ⏳ 需 Windows 测试机 | 方案见 [PLAYER_WINDOWS_ANGLE.md](docs/PLAYER_WINDOWS_ANGLE.md) |
 - **第一轮调研记录**：[docs/PLAYER_RESEARCH.md](docs/PLAYER_RESEARCH.md)
   （只读研究 tealinux-iso / VLC；含 VLC 嵌入 API、许可证、Tea Linux 发行范式；附第二轮 mpv 补充事实）
 
