@@ -1,4 +1,4 @@
-# wp-ai —— AI 子系统（字幕翻译 P1 + 本地 ASR P2 已落地）
+# wp-ai —— AI 子系统（字幕翻译 P1 + 本地 ASR P2 + 集成闭环已落地）
 
 播放优先的 AI 地基：**本地 + 远端 Provider 可分别启停/调优先级**，任务队列（优先级/取消/超时/
 并发上限/播放期策略），JSON 结果缓存（文件指纹+模型+目标语言+任务类型），字幕翻译管线与 ASR 管线。
@@ -8,6 +8,7 @@
 | 字幕翻译（P1，双语） | 远端 OpenAI 兼容 + 本地 llama-server/vLLM/Ollama | ✅ |
 | 文本生成/摘要问答（P3 基础） | 同上 | ✅ |
 | 语音转写生成字幕（P2） | 本地 `whisper-cli`（whisper.cpp 外部进程） | ✅ 管线完整，真模型未在 CI 跑 |
+| 集成闭环：翻译 → 双语 ASS 文件（漏译统计/降级）、ffmpeg 抽 16k wav（ASR 前置） | `wp_ai::integration` | ✅ |
 | 语音转写（P2 远端） | 远端 OpenAI 兼容 `/audio/transcriptions` | ⏳ 未实现（当前返回 Unsupported 并回退） |
 | OCR/超分（P4） | ONNX | ⏳ 未实现 |
 
@@ -84,6 +85,35 @@ whisper-cli -m models/ggml-medium.bin -f audio.wav -l zh -t 8 -osrt -of /tmp/out
 `kill_on_drop` 终止。错误可读（找不到 CLI/模型未配置/非零退出含 stderr/输出为空）。
 **限制**：单测用伪造 shell 脚本覆盖命令行拼装/SRT 解析/超时/失败路径；真实模型精度与速度需本机联调。
 
+## 集成闭环（GUI 一个调用拿到成品双语 ASS）
+
+```rust
+use wp_ai::{AiCache, TranslateOptions};
+use wp_ai::integration::translate_doc_and_write_ass;
+use wp_subtitle::AssOptions;
+
+let result = translate_doc_and_write_ass(
+    &registry, &cache, &fingerprint, &doc,
+    &TranslateOptions::default(),      // 源/目标语言 + 术语表
+    &AssOptions::default(),            // 字体/字号/双语布局
+    std::path::Path::new("/tmp/bilingual.ass"),
+).await?;
+// result: { path, total, matched, missing, provider_id, cached, degraded, errors, coverage() }
+if result.degraded { /* 翻译失败已降级为原文字幕 */ }
+```
+
+ASR 前置抽音轨（视频 → 16kHz 单声道 wav）：
+
+```rust
+use wp_ai::integration::{extract_audio_for_asr, cleanup_temp_audio};
+let wav = extract_audio_for_asr(video_path).await?;   // 外部 ffmpeg，超时 kill、缺 ffmpeg → NotFound
+// pipeline::transcribe_file_to_subtitle(&registry, &cache, &fp, &wav, "zh").await …
+cleanup_temp_audio(&wav);
+```
+
+详细集成说明（GUI 伪代码、mpv `sub-add`/`sub-reload`、真机评估方案）见
+[docs/PLAYER_AI.md](../../docs/PLAYER_AI.md)。
+
 ## 代码用法
 
 ### 字幕翻译（带缓存/降级）
@@ -134,8 +164,8 @@ while let Some(event) = events.recv().await { /* Done/Failed/Canceled/Rejected *
 ## 测试
 
 ```bash
-cargo test -p wp-ai                 # 35 单测 + 2 doc test（本地 mock HTTP，不联网）
-cargo test -p wp-ai --all-features  # 51 单测（+ 本地 LLM mock HTTP / 伪 whisper-cli 脚本）
+cargo test -p wp-ai                 # 51 单测 + 4 doc test（本地 mock HTTP/伪造进程，不联网）
+cargo test -p wp-ai --all-features  # 67 单测（+ 本地 LLM mock HTTP / 伪 whisper-cli 脚本）
 cargo clippy -p wp-ai --all-features --all-targets  # 0 warning
 ```
 
@@ -144,4 +174,6 @@ cargo clippy -p wp-ai --all-features --all-targets  # 0 warning
 - 重活最终要跑独立 worker 进程（架构 §7）；当前 `service` 是进程内 tokio 队列，语义已对齐
   （id/优先级/取消/超时/事件），后续把 `execute_task` 换成 IPC 即可，GUI 接口不变。
 - 远端 ASR（`/audio/transcriptions`）、P3 摘要问答增强、P4 OCR/超分待做。
+- **真机翻译质量/时延待真机**（本机无 API key、无本地权重）：样本与方法见
+  [docs/PLAYER_AI.md](../../docs/PLAYER_AI.md) §7。
 - 真实大模型/whisper 模型未纳入 CI（无密钥、无权重）；单测全部使用本地 mock HTTP 与伪造 CLI 脚本。

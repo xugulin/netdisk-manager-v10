@@ -23,6 +23,7 @@
 //! | 结果缓存 | [`cache::AiCache`]（JSON 文件、原子写、LRU 上限） |
 //! | 字幕翻译管线 | [`pipeline::translate_subtitle_document`]（分批、术语表、缓存、失败降级原文） |
 //! | ASR 字幕管线 | [`pipeline::transcribe_to_subtitle`] / [`pipeline::transcribe_file_to_subtitle`]（whisper.cpp、缓存、失败降级） |
+//! | 集成闭环 | [`integration`]：翻译 → 双语 ASS → 原子写文件（漏译统计/失败降级）；ffmpeg 抽 16kHz wav（ASR 前置） |
 //!
 //! ## 配置示例
 //!
@@ -116,6 +117,7 @@
 //! P1 字幕翻译（已完成）→ P2 ASR 生成字幕（本版完成本地 whisper-cli 管线；远端 ASR 待接）→ P3 摘要/问答 → P4 OCR/超分。
 
 pub mod cache;
+pub mod integration;
 pub mod mock;
 pub mod pipeline;
 pub mod provider;
@@ -133,6 +135,11 @@ use std::time::Duration;
 use wp_core::{Error, Result};
 
 pub use cache::{fingerprint_bytes, fingerprint_file_metadata, AiCache, CacheKey};
+pub use integration::{
+    extract_audio_ffmpeg, extract_audio_ffmpeg_with, extract_audio_for_asr,
+    translate_doc_and_write_ass, translate_to_bilingual_ass, translate_to_bilingual_ass_report,
+    BilingualResult, FfmpegOptions,
+};
 pub use mock::MockProvider;
 pub use pipeline::{
     build_translated_doc, transcribe_file_to_subtitle, transcribe_to_subtitle,
