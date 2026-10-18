@@ -56,6 +56,15 @@ if [ "$PORTABLE" = "1" ]; then
   [ -x "$CLI_BIN" ] && cp "$CLI_BIN" "$OUT/wp-cli"
   cp -r docs "$OUT/docs" 2>/dev/null || true
   cp README.md "$OUT/README.md" 2>/dev/null || true
+  # 图标 / desktop 文件 / 桌面集成安装脚本
+  if [ -d assets/icons ]; then
+    mkdir -p "$OUT/图标"
+    cp assets/icons/netdisk-manager*.png assets/icons/netdisk-manager.svg \
+       assets/icons/netdisk-manager.ico assets/icons/preview.png assets/icons/hero.png \
+       "$OUT/图标/" 2>/dev/null || true
+    cp assets/netdisk-manager.desktop "$OUT/图标/" 2>/dev/null || true
+  fi
+  cp scripts/install-desktop.sh "$OUT/安装桌面图标.sh" 2>/dev/null && chmod +x "$OUT/安装桌面图标.sh" || true
   # 绿色版标记：数据写在可执行文件旁（U 盘/解压即用）
   : > "$OUT/portable"
   echo "==> 绿色版目录：$OUT"

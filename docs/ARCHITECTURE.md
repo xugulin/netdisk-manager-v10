@@ -144,6 +144,7 @@ fonts.rs       中文字体探测与注入、QR PNG → 纹理
 widgets.rs     卡片/徽标/按钮/进度条/空态/文件图标等通用小部件
 pages/         browser / transfers / tools / guard_page / logs / settings / about
 thumbs.rs      缩略图缓存（异步拉取 → 解码 → egui 纹理，列表/详情共用）
+../../assets/  应用图标（SVG/多尺寸 PNG/ICO）、desktop 模板、品牌横幅
 dialogs.rs     全部模态对话框（Modal）
 ```
 

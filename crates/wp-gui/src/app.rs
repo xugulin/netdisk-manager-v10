@@ -485,6 +485,8 @@ pub struct App {
     pub tools: ToolsState,
     /// 文件列表缩略图缓存（图片/视频预览）
     pub thumbs: crate::thumbs::ThumbCache,
+    /// 应用 logo 纹理（顶栏 / 关于页；懒加载一次）
+    pub logo: Option<egui::TextureHandle>,
     pub guard_new_word: String,
     pub guard_new_instance_word: String,
     pub loading_accounts: bool,
@@ -646,6 +648,7 @@ impl App {
                 ..Default::default()
             },
             thumbs: crate::thumbs::ThumbCache::default(),
+            logo: None,
             guard_new_word: String::new(),
             guard_new_instance_word: String::new(),
             loading_accounts: false,
@@ -1597,6 +1600,18 @@ impl eframe::App for App {
         self.tick_transfers(false);
         self.poll_logs();
         self.thumbs.pump(&ctx);
+        // 应用 logo（内嵌 64px PNG）：首帧加载一次
+        if self.logo.is_none() {
+            const LOGO_PNG: &[u8] = include_bytes!("../../../assets/icons/netdisk-manager-64.png");
+            if let Ok(img) = image::load_from_memory(LOGO_PNG) {
+                let rgba = img.to_rgba8();
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [rgba.width() as usize, rgba.height() as usize],
+                    rgba.as_raw(),
+                );
+                self.logo = Some(ctx.load_texture("app-logo", color, egui::TextureOptions::LINEAR));
+            }
+        }
         // 验收模式：第 4 帧阻塞等待网络数据（真实账号截图时让列表/缩略图先加载完）
         if self.frames == 4 {
             if let Some(ms) = self.dev.wait_ms {
@@ -1800,8 +1815,14 @@ impl App {
     fn topbar(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
         ui.horizontal_centered(|ui| {
+            if let Some(logo) = &self.logo {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    logo.id(),
+                    egui::vec2(24.0, 24.0),
+                )));
+            }
             ui.label(
-                egui::RichText::new("☁ 网盘管理")
+                egui::RichText::new("网盘管理")
                     .size(17.0)
                     .strong()
                     .color(t.accent),

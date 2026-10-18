@@ -1,5 +1,7 @@
 # 网盘管理 · Rust 重写版（V10）
 
+![网盘管理 · NetDisk Manager](assets/icons/hero.png)
+
 > 只读学习工作区里的四个 Python 项目
 > （[百度网盘适配器](../百度网盘适配器) / [夸克网盘适配器](../夸克网盘适配器) / [光鸭云盘适配器](../光鸭云盘适配器) / [网盘管理_V2](../网盘管理_V2)）
 > 之后，**用 Rust 从最底层协议重写**的图形界面网盘管理工具。
@@ -51,7 +53,26 @@
 
 Windows：双击 `网盘管理.exe`（无控制台窗口；日志在数据目录的 `日志/` 下）。
 
-### 2.2 从源码构建
+### 2.2 安装到桌面（Linux）
+
+图标、desktop 文件与安装脚本都在 `assets/icons/`，一条命令完成桌面集成：
+
+```bash
+# 绿色版自带的安装脚本（装到当前用户，无需 sudo）
+./出/网盘管理-linux-x64/安装桌面图标.sh
+
+# 或者：系统级安装 / 指定二进制 / 卸载
+sudo ./scripts/install-desktop.sh --prefix /usr/local
+./scripts/install-desktop.sh 出/网盘管理-linux-x64/网盘管理
+./scripts/install-desktop.sh --uninstall
+```
+
+装好后应用菜单搜索「**网盘管理**」即可启动（图标走 hicolor 主题，窗口类名 `wangpan-v10`）。
+手工安装也可以：把 `assets/icons/netdisk-manager.svg` 复制到
+`~/.local/share/icons/hicolor/scalable/apps/`，把 `assets/netdisk-manager.desktop`
+复制到 `~/.local/share/applications/`（`Exec` 改成你的二进制绝对路径）。
+
+### 2.3 从源码构建
 
 **Linux**
 
@@ -72,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Portable
 > 两个构建脚本都用 `cargo metadata` 解析真实产物路径，
 > 兼容 `CARGO_TARGET_DIR` 被环境变量重定向的机器（本机就是这种情况）。
 
-### 2.3 无头冒烟验收（CI 同款）
+### 2.4 无头冒烟验收（CI 同款）
 
 ```bash
 ./scripts/build-linux.sh
@@ -87,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Portable
                                                                   # delete/move/share/crosscopy/details/filepicker
 ```
 
-### 2.4 命令行入口 `wp-cli`（真机联调 / 脚本化）
+### 2.5 命令行入口 `wp-cli`（真机联调 / 脚本化）
 
 GUI 之外还有同一套适配器的 CLI，适合批量验证、自动化和无显示环境（所有结果输出 JSON）：
 
@@ -109,7 +130,7 @@ GUI 之外还有同一套适配器的 CLI，适合批量验证、自动化和无
 
 （`--data-dir <目录>` 与 GUI 共用数据目录。）
 
-### 2.5 自动化验收结果（本机实测）
+### 2.6 自动化验收结果（本机实测）
 
 | 项 | 结果 |
 |---|---|
@@ -222,7 +243,23 @@ crates/
 * 能直连 crates.io：删除 `.cargo/config.toml` 即可；
 * 用其它镜像：把文件里的 `registry` 换掉。
 
-## 8. 目录
+## 8. 图标与品牌
+
+![图标多尺寸预览](assets/icons/preview.png)
+
+| 文件 | 说明 |
+|---|---|
+| `assets/icons/netdisk-manager.svg` | 主图标矢量源（≥48px 使用） |
+| `assets/icons/netdisk-manager-small.svg` | 小尺寸专用版（16~32px 去掉星环与星屑，保证可辨识） |
+| `assets/icons/netdisk-manager-{16,24,32,48,64,128,256,512,1024}.png` | 多尺寸 PNG（hicolor 主题 / 打包用） |
+| `assets/icons/netdisk-manager.ico` | Windows 可执行文件图标（多尺寸 ICO） |
+| `assets/netdisk-manager.desktop` | Desktop Entry 模板（安装脚本会替换 Exec 路径） |
+| `assets/icons/hero.png` / `preview.png` | 品牌横幅 / 多尺寸预览（文档用） |
+
+图标设计：深空极光底（蓝→紫）+ 白色云朵（内含负空间上传箭头）+ 行星环上三颗「网盘星」
+（百度蓝 / 夸克紫 / 光鸭橙）——**一个云，管三盘**。
+
+## 9. 目录
 
 ```
 网盘管理_V10/

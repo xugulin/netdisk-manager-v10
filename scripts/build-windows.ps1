@@ -40,6 +40,13 @@ if ($Portable) {
   if (Test-Path $cli) { Copy-Item $cli (Join-Path $out "wp-cli.exe") }
   Copy-Item "docs" (Join-Path $out "docs") -Recurse -ErrorAction SilentlyContinue
   Copy-Item "README.md" $out -ErrorAction SilentlyContinue
+  if (Test-Path "assets/icons") {
+    $iconOut = Join-Path $out "图标"
+    New-Item -ItemType Directory -Force -Path $iconOut | Out-Null
+    Copy-Item "assets/icons/netdisk-manager.ico" $iconOut -ErrorAction SilentlyContinue
+    Copy-Item "assets/icons/netdisk-manager*.png" $iconOut -ErrorAction SilentlyContinue
+    Copy-Item "assets/icons/hero.png","assets/icons/preview.png" $iconOut -ErrorAction SilentlyContinue
+  }
   # 绿色版标记：数据写在 exe 旁（U 盘/解压即用）
   New-Item -ItemType File -Path (Join-Path $out "portable") | Out-Null
   Write-Host "==> 绿色版目录：$out" -ForegroundColor Green

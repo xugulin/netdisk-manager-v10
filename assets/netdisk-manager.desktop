@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=网盘管理
+Name[en]=NetDisk Manager
+GenericName=网盘管理
+GenericName[en]=Cloud Drive Manager
+Comment=百度 / 夸克 / 光鸭 一站式网盘管理工具
+Comment[en]=All-in-one manager for Baidu, Quark and Guangya cloud drives
+Exec=网盘管理 %U
+Icon=netdisk-manager
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=网盘;云盘;百度;夸克;光鸭;cloud;drive;netdisk;upload;download;
+StartupNotify=true
+StartupWMClass=wangpan-v10

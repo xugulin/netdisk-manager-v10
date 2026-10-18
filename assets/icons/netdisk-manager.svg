@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  网盘管理 / NetDisk Manager — 应用图标（≥48px）
+  构图：深空极光底（蓝→紫），白色云朵居中，云内负空间切出上传箭头；
+  云下方一条行星环，环上三颗「网盘星」= 百度蓝 / 夸克紫 / 光鸭橙，寓意「一个云，管三盘」。
+  16~32px 请用 netdisk-manager-small.svg（去掉星环与星屑，放大云朵箭头）。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3D5AFE"/>
+      <stop offset="0.48" stop-color="#6C4DF6"/>
+      <stop offset="1" stop-color="#A64BF0"/>
+    </linearGradient>
+    <radialGradient id="auroraCyan" cx="0.10" cy="0.94" r="0.60">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="auroraPink" cx="0.94" cy="0.08" r="0.55">
+      <stop offset="0" stop-color="#FF6BD6" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#FF6BD6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="sheen" cx="0.24" cy="0.16" r="0.72">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="cloud" x1="0.18" y1="0" x2="0.78" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.62" stop-color="#F4F8FF"/>
+      <stop offset="1" stop-color="#DEE7FF"/>
+    </linearGradient>
+    <linearGradient id="cloudInner" x1="0" y1="0.45" x2="0" y2="1">
+      <stop offset="0" stop-color="#8FA6FF" stop-opacity="0"/>
+      <stop offset="1" stop-color="#6E82DA" stop-opacity="0.28"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.05"/>
+      <stop offset="0.16" stop-color="#FFFFFF" stop-opacity="0.40"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.26"/>
+      <stop offset="0.84" stop-color="#FFFFFF" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.05"/>
+    </linearGradient>
+    <filter id="blur16" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+    <filter id="blur7" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+    <mask id="cloudMask">
+      <rect width="512" height="512" fill="#000"/>
+      <path fill="#fff" d="M 110 296
+        C 110 252 140 222 182 218
+        C 192 180 228 152 270 152
+        C 316 152 354 184 362 228
+        C 386 240 402 264 402 292
+        C 402 322 378 344 346 344
+        L 150 344
+        C 124 344 110 324 110 296 Z"/>
+      <path fill="#000" d="M 256 180
+        L 298 242 L 270 242
+        L 270 306 Q 270 314 262 314
+        L 250 314 Q 242 314 242 306
+        L 242 242 L 214 242 Z"/>
+    </mask>
+  </defs>
+
+  <!-- 底板 -->
+  <rect width="512" height="512" rx="118" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="118" fill="url(#auroraCyan)"/>
+  <rect width="512" height="512" rx="118" fill="url(#auroraPink)"/>
+  <rect width="512" height="512" rx="118" fill="url(#sheen)"/>
+  <g opacity="0.09">
+    <path d="M -70 400 L 310 -100 L 430 -100 L 50 400 Z" fill="#FFFFFF" filter="url(#blur16)"/>
+  </g>
+  <rect x="3" y="3" width="506" height="506" rx="116" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.20" stroke-width="3"/>
+
+  <!-- 行星环（整椭圆，上半被云遮住） -->
+  <ellipse cx="256" cy="306" rx="188" ry="60" fill="none" stroke="url(#ring)" stroke-width="8"/>
+
+  <!-- 云外柔光 -->
+  <path d="M 110 296 C 110 252 140 222 182 218 C 192 180 228 152 270 152
+           C 316 152 354 184 362 228 C 386 240 402 264 402 292
+           C 402 322 378 344 346 344 L 150 344 C 124 344 110 324 110 296 Z"
+        fill="#FFFFFF" opacity="0.13" filter="url(#blur16)"/>
+
+  <!-- 云本体 + 负空间上传箭头 -->
+  <g mask="url(#cloudMask)">
+    <rect width="512" height="512" fill="url(#cloud)"/>
+    <rect width="512" height="512" fill="url(#cloudInner)"/>
+    <path d="M 182 218 C 192 180 228 152 270 152 C 302 152 328 166 344 188
+             C 314 176 284 180 262 195 C 236 212 220 236 216 262
+             C 200 248 190 234 182 218 Z" fill="#FFFFFF" opacity="0.6"/>
+  </g>
+
+  <!-- 三颗网盘星（环下弧） -->
+  <g>
+    <circle cx="79" cy="327" r="22" fill="#2E6BE6" opacity="0.50" filter="url(#blur7)"/>
+    <circle cx="256" cy="366" r="22" fill="#8B5CF6" opacity="0.50" filter="url(#blur7)"/>
+    <circle cx="433" cy="327" r="23" fill="#FF9F1C" opacity="0.50" filter="url(#blur7)"/>
+    <circle cx="79" cy="327" r="15" fill="#2E6BE6" stroke="#FFFFFF" stroke-width="4.5"/>
+    <circle cx="256" cy="366" r="14" fill="#8B5CF6" stroke="#FFFFFF" stroke-width="4.5"/>
+    <circle cx="433" cy="327" r="17" fill="#FF9F1C" stroke="#FFFFFF" stroke-width="4.5"/>
+    <circle cx="74" cy="321" r="3.6" fill="#FFFFFF" opacity="0.72"/>
+    <circle cx="251" cy="361" r="3.2" fill="#FFFFFF" opacity="0.70"/>
+    <circle cx="427" cy="320" r="4.2" fill="#FFFFFF" opacity="0.72"/>
+  </g>
+
+  <!-- 星屑 -->
+  <g fill="#FFFFFF">
+    <circle cx="112" cy="126" r="2.8" opacity="0.42"/>
+    <circle cx="398" cy="108" r="2.4" opacity="0.38"/>
+    <path d="M 150 96 L 152.2 103.2 L 159.4 105.4 L 152.2 107.6 L 150 114.8 L 147.8 107.6 L 140.6 105.4 L 147.8 103.2 Z"
+          opacity="0.75"/>
+  </g>
+</svg>

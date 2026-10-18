@@ -7,6 +7,19 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# ── 品牌资产完整性检查（图标 / desktop / 安装脚本）
+for f in assets/icons/netdisk-manager.svg \
+         assets/icons/netdisk-manager-small.svg \
+         assets/icons/netdisk-manager-256.png \
+         assets/icons/netdisk-manager.ico \
+         assets/netdisk-manager.desktop \
+         scripts/install-desktop.sh; do
+  if [ ! -f "$ROOT/$f" ]; then
+    echo "❌ 缺少品牌资产：$f" >&2
+    exit 1
+  fi
+done
+
 OUT="$ROOT/出/验收截图"
 mkdir -p "$OUT"
 rm -f "$OUT"/*.png

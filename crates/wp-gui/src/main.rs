@@ -31,6 +31,27 @@ use app::{App, DevOptions};
 use wp_core::config::AppConfig;
 use wp_core::Paths;
 
+/// 应用图标（窗口/任务栏用；内嵌 256px PNG，无需外部资源文件）。
+fn app_icon() -> std::sync::Arc<eframe::egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../../../assets/icons/netdisk-manager-256.png");
+    match image::load_from_memory(PNG) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            std::sync::Arc::new(eframe::egui::IconData {
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+            })
+        }
+        Err(_) => std::sync::Arc::new(eframe::egui::IconData {
+            rgba: vec![0u8, 0, 0, 0],
+            width: 1,
+            height: 1,
+        }),
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut dev = DevOptions::default();
@@ -153,7 +174,8 @@ fn main() -> eframe::Result<()> {
         .with_title(format!("{} v{}", wp_core::APP_NAME, wp_core::APP_VERSION))
         .with_inner_size([window_size[0].max(960.0), window_size[1].max(600.0)])
         .with_min_inner_size([960.0, 600.0])
-        .with_app_id("wangpan-v10");
+        .with_app_id("wangpan-v10")
+        .with_icon(app_icon());
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()

@@ -12,7 +12,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("☁ 网盘管理 · Rust 重写版").size(22.0).strong().color(t.accent));
+                if let Some(logo) = &app.logo {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                        logo.id(),
+                        egui::vec2(56.0, 56.0),
+                    )));
+                    ui.add_space(4.0);
+                }
+                ui.label(RichText::new("网盘管理 · Rust 重写版").size(22.0).strong().color(t.accent));
                 ui.label(
                     RichText::new(format!("v{}", wp_core::APP_VERSION))
                         .size(13.0)
