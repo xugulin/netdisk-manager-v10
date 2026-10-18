@@ -14,10 +14,10 @@
 | 本地流代理 | **可用**：`127.0.0.1:0` + `/s/<token>`，GET/HEAD、单段 Range、keep-alive、416/400 语义齐全 |
 | 真机代理冒烟 | **三盘通过**：首段/中段 206 + **字节级与直链一致** + 重复请求命中磁盘缓存（不再请求上游）+ 0 错误 |
 | 百度注意点 | 直链是 **302 → `*.baidupcs.com`** 两段式，必须跟随重定向；`direct_link` 给的 URL 本身不带 Range 签名，跟随后的 CDN URL 才真正服务 Range |
-| 夸克注意点 | **HEAD 返回 403**（预签名直链只签 GET），但 **GET Range 正常 206** → 代理/探测以 Range 为准，不以 HEAD 为准；`>~100MB` 文件 `direct_link` 返回 `23018 download file size limit`，大视频改走 **HLS**（`DirectLink.is_hls=true`，本代理直连不代理） |
+| 夸克注意点 | **HEAD 返回 403**（预签名直链只签 GET），但 **GET Range 正常 206** → 代理/探测以 Range 为准，不以 HEAD 为准；`>~100MB` 文件 `direct_link` 返回 `23018 download file size limit`，大视频改走 **HLS**（`DirectLink.is_hls=true`，本代理直连不代理）。**HLS 分支已接通并真机冒烟通过**（2026-10-19，见 §9） |
 | 光鸭注意点 | 直链带 `expire_at`（约 6h），无 headers（签名全在 URL）；代理已实现 **到期前 45s 主动换链** |
 | 百度不可下载文件 | 根目录 `/video_20260322_154432.mp4`（2.4GB）对该账号所有请求返回 `403 {"error_code":31326,"error_msg":"user is not authorized"}` —— 属**文件权限/归属**问题（非 Range 问题），探测改用同盘可下载的 >10MB 视频 |
-| 测试 | `cargo test -p wp-stream`：**44 个测试全绿**（22 单元 + 21 端到端 mock + 1 doc-test），不联网 |
+| 测试 | `cargo test -p wp-stream`：**52 个测试全绿**（29 单元 + 21 端到端 mock + 2 doc-test），不联网 |
 
 ---
 
@@ -257,5 +257,134 @@ running 1 test  ... test result: ok. 1 passed
 ## 7. M0-E1 判定
 
 **PASS**：三盘（百度/夸克/光鸭）单段 Range 均返回 206 且 `Content-Range` 正确；本地代理在三盘真机直链上完成
-「首段/中段 206 + 字节与上游一致 + 重复请求磁盘缓存命中 + 0 错误」全链路冒烟。夸克大文件 HLS 直连契约已就位，
-待夸克侧把 `direct_link` 的 23018 分支接到 HLS 后即可做一条真实 HLS 冒烟。
+「首段/中段 206 + 字节与上游一致 + 重复请求磁盘缓存命中 + 0 错误」全链路冒烟。夸克大文件 HLS 分支已接通，
+并完成真机冒烟：m3u8 拉取 200、mpv 直连解码 5 帧、seek 到 39.5s 成功（详见 §9）。
+
+---
+
+## 8. 播放链路集成（`wp_stream::playback`）
+
+GUI / wp-media 不再自己写 `if is_hls`，统一调用一个决策函数：
+
+```rust
+use wp_stream::{resolve_playback, PlaybackSource};
+
+match resolve_playback(&proxy, drive, "/目录/视频.mp4").await? {
+    PlaybackSource::Proxied { handle } => {
+        // 普通文件：把 handle.url 交给 mpv/VLC；播放结束 proxy.close(&handle.token)
+        player.open(&handle.url);
+    }
+    PlaybackSource::DirectHls { url, headers, display, size } => {
+        // HLS（夸克大文件云端转码）：直连 m3u8，Cookie/Referer/UA 注入播放器
+        // mpv: --http-header-fields="Cookie: …" --user-agent=… --referrer=…
+        player.open_with_headers(&url, &headers);
+    }
+}
+```
+
+* `resolve_playback(proxy, Arc<dyn Drive>, path)`：取直链 → `is_hls` 为真返回 `DirectHls`（**不启动代理**），
+  否则用**同一条直链**走 `proxy.open_link_with_provider`（经 `open_with_link`，不会二次取链）返回 `Proxied`。
+* `PlaybackSource::{url(), headers(), display(), size(), is_hls(), token(), summary()}` 提供统一读取，无需解构。
+* 取链错误（需要登录 / 无权限 / 夸克 23018 等）原样透传，文案保持适配器给出的可读信息；
+  `is_hls=true` 但 URL 为空时返回明确错误。
+* 便捷入口 `resolve_playback_with_provider` / `resolve_from_link`（已持有直链时直接决策）。
+* 单测（mock Drive，不联网）覆盖：HLS 分支（不建代理会话、headers 透传）、普通分支（真起代理并 Range 读通、
+  只取一次直链）、错误透传（23018 文案）、HLS 空 URL、display 回退、provider 入口两分支。
+
+真机验证（同一决策函数，注入 `wp-cli link` 得到的真实直链）：
+
+| 盘 | 样本 | 决策结果 | 代理会话 | 首段验证 |
+|---|---|---|---|---|
+| 夸克 | `/video_20260903_171534.mp4`（173MB，>100MB 触发 HLS） | **DirectHls**（m3u8 + 4 headers） | 0 | —（HLS 直连，见 §9） |
+| 百度 | `/来自：V2408A/DCIM/1074058976_1734538851561.mp4`（16.3MB） | Proxied | 1 | 206 / 1024B |
+| 光鸭 | `/来自：分享/东京复仇者/东京复仇者.S01E25.2021.1080p.mkv`（727MB） | Proxied | 1 | 206 / 1024B |
+| 夸克 | `/来自：分享/IDM.zip`（12.5MB） | Proxied | 1 | 206 / 1024B |
+
+---
+
+## 9. HLS 冒烟（夸克大文件云端转码，真机）
+
+> 背景：夸克 `>~100MB` 文件 `direct_link` 返回 `23018 download file size limit`；
+> 夸克适配器已改走云端转码 HLS（`DirectLink.is_hls=true` + m3u8 URL + Cookie headers）。
+> 本节记录 wp-stream 播放决策 + mpv 直连冒烟的真机证据（2026-10-19）。
+
+**样本**：`/video_20260903_171534.mp4`，173,709,677 B（810x1440 H.264 + AAC，HLS 时长 98.764s）。
+
+### 9.1 取直链（quark 适配器 → HLS）
+
+```bash
+wp-cli --data-dir 出/真机联调数据 --drive quark link "/video_20260903_171534.mp4"
+```
+
+关键输出（敏感值已省略）：
+
+```json
+{
+  "is_hls": true,
+  "url": "https://video-play-h-sz.drive.quark.cn/qv/…/ih45tp6si0x0nxjs/media.m3u8?auth_key=…",
+  "size": 173709677,
+  "expire_at": 1792357508,
+  "file_name": "video_20260903_171534.mp4",
+  "headers": ["user-agent", "referer", "accept", "cookie"]
+}
+```
+
+### 9.2 播放决策（`resolve_playback` 的真实链路）
+
+```bash
+# 打印 resolve_playback 决策结果（HLS 分支不应创建代理会话）
+cargo run -p wp-stream --example playback_real -- /tmp/quark-hls-link.json "/video_20260903_171534.mp4"
+```
+
+```json
+{ "kind": "hls", "is_hls": true, "proxy_sessions": 0,
+  "url": "https://video-play-h-sz.drive.quark.cn/…/media.m3u8?auth_key=…",
+  "display": "video_20260903_171534.mp4", "size": 173709677,
+  "header_names": ["user-agent", "referer", "accept", "cookie"] }
+```
+
+### 9.3 m3u8 / 媒体信息校验
+
+```bash
+curl -sS -L -H "Cookie: …" -H "Referer: https://pan.quark.cn/" -H "User-Agent: …" \
+  "https://video-play-h-sz.drive.quark.cn/…/media.m3u8?auth_key=…"
+# → HTTP 200, content-type: application/vnd.apple.mpegurl，
+#   #EXT-X-VERSION:3 / #EXT-X-PLAYLIST-TYPE:VOD / #EXT-X-TARGETDURATION:5
+#   22 个分片（#EXTINF 合计 98.764s），无 master playlist（直接是 media playlist）
+
+ffprobe -v error -headers "Cookie: …" -show_entries stream=codec_type,codec_name,width,height -show_entries format=duration -of json "<m3u8>"
+# → h264 810x1440 + aac，format.duration = 98.764000
+```
+
+### 9.4 mpv 直连播放 + seek（headless）
+
+```bash
+# 播放 5 帧
+mpv --no-config --vo=null --ao=null --ytdl=no --frames=5 \
+  --http-header-fields="Cookie: …" \
+  --user-agent "…" --referrer "https://pan.quark.cn/" \
+  "https://video-play-h-sz.drive.quark.cn/…/media.m3u8?auth_key=…"
+
+# seek 到 40%（39.5s）再播 5 帧
+mpv --no-config --vo=null --ao=null --ytdl=no --frames=5 --start=39.5 --msg-level=all=v \
+  --http-header-fields="Cookie: …" \
+  --user-agent "…" --referrer "https://pan.quark.cn/" \
+  "https://video-play-h-sz.drive.quark.cn/…/media.m3u8?auth_key=…"
+```
+
+| 用例 | 退出码 | 耗时 | 关键日志/结果 |
+|---|---|---|---|
+| 直连播放 5 帧 | 0 | ~4.7s | `VO: [null] 810x1440 yuv420p`、`AO: [null] 44100Hz stereo 2ch floatp` |
+| seek 39.5s 后播 5 帧 | 0 | ~19.9s | `[lavf] queuing seek to 39.533556` → `[cplayer] hr-seek, skipping to 39.500000` → `[lavf] seek done` → 后续打开 `media-…-9/10/11.ts` 分片 → `VO/AO` 正常解码 |
+
+说明：
+* seek 耗时明显高于起播，是 HLS VOD 需要按分片重新拉流的固有开销（mpv 原生 HLS，无代理分片缓存）；
+* 首次误用 `--start=120`（大于实际时长 98.764s）会直接 EOF，属目标越界，不是链路问题；本表已用 39.5s 正确复测；
+* 冒烟命令里 Cookie/UA 等敏感头运行时从 `link` JSON 注入，**不写入仓库**；文档只记录头名与流程。
+
+### 9.5 结论
+
+* 夸克大文件播放链路：`direct_link` → `is_hls=true` → `wp_stream::resolve_playback` 返回 `DirectHls(m3u8+headers)`
+  → mpv `--http-header-fields` 直连 **可播、可 seek**；wp-stream 不创建代理会话（`proxy_sessions=0`）。
+* 上层集成时：`PlaybackSource::DirectHls` 直接把 `url`+`headers` 交播放器；普通文件用 `Proxied.handle.url`。
+

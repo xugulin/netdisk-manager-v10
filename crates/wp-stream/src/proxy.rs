@@ -131,6 +131,16 @@ impl ProxyInner {
         remote_path: &str,
     ) -> Result<StreamHandle> {
         let link = provider.direct_link(remote_path).await?;
+        self.open_with_link(provider, remote_path, link).await
+    }
+
+    /// 用已取到的直链打开流（不再请求 `direct_link`；HLS 直链仍返回 direct 句柄）。
+    pub(crate) async fn open_with_link(
+        &self,
+        provider: Arc<dyn LinkProvider>,
+        remote_path: &str,
+        link: DirectLink,
+    ) -> Result<StreamHandle> {
         let display = if link.file_name.is_empty() {
             wp_core::util::base_name(remote_path)
         } else {

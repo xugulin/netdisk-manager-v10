@@ -27,6 +27,7 @@
 //! * `probe`：Range 能力探测。
 
 mod cache;
+pub mod playback;
 mod probe;
 mod proxy;
 pub mod range;
@@ -35,10 +36,12 @@ mod upstream;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use wp_core::model::DirectLink;
 use wp_core::{Error, Result};
 use wp_drive::Drive;
 
 pub use cache::{cache_key, CacheConfig, CacheEntry, CacheManager, ChunkState};
+pub use playback::{resolve_playback, resolve_playback_with_provider, PlaybackSource};
 pub use probe::{probe_range, probe_with_provider, ProbeStep, RangeProbe};
 pub use upstream::{
     DriveLinkProvider, LinkProvider, RawResponse, TransportError, UpstreamClient, UpstreamConfig,
@@ -173,6 +176,33 @@ impl StreamProxy {
     ) -> Result<StreamHandle> {
         let inner = self.ensure_started().await?;
         inner.open(provider, remote_path).await
+    }
+
+    /// 用**已取到的直链**打开代理流（不再重复请求 `direct_link`）。
+    ///
+    /// 供 [`resolve_playback`] / GUI 在「一次取链 → 判断是否 HLS → 非 HLS 建代理」链路里复用，
+    /// 避免同一路径取两次直链（很多网盘 `direct_link` 有额外耗时/配额）。
+    /// `provider` 仍用于后续链接过期热换（401/403/410/expire_at）。
+    pub async fn open_with_link(
+        &self,
+        drive: Arc<dyn Drive>,
+        remote_path: &str,
+        link: DirectLink,
+    ) -> Result<StreamHandle> {
+        let provider: Arc<dyn LinkProvider> = Arc::new(DriveLinkProvider::new(drive));
+        self.open_link_with_provider(provider, remote_path, link)
+            .await
+    }
+
+    /// 同 [`open_with_link`](Self::open_with_link)，但接受 [`LinkProvider`]（单测/自定义取链用）。
+    pub async fn open_link_with_provider(
+        &self,
+        provider: Arc<dyn LinkProvider>,
+        remote_path: &str,
+        link: DirectLink,
+    ) -> Result<StreamHandle> {
+        let inner = self.ensure_started().await?;
+        inner.open_with_link(provider, remote_path, link).await
     }
 
     /// 取流统计（未打开的 token 返回 None）。
