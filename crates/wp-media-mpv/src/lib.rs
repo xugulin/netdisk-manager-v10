@@ -6,14 +6,19 @@
 //! - `render` 模块（feature `render-gl`，默认开）提供 [`render::MpvRenderContext`]：
 //!   用 eframe/egui 当前的 GL 上下文把 mpv 画面渲染进 egui 的绘制回调（进程内、可覆盖 UI）。
 //!
-//! # 查找顺序（Linux）
+//! # 查找顺序（Linux，发布形态）
 //!
-//! 1. [`MpvConfig::lib_path`]（显式指定）
-//! 2. 环境变量 `WP_MPV_LIB`（开发/测试用）
-//! 3. `/usr/lib/libmpv.so.2`、`/usr/local/lib/libmpv.so.2`、多架构目录
-//! 4. 可执行文件同级的 `播放器运行时/`（随包发布的 LGPL 构建）
+//! 1. [`MpvConfig::lib_path`]（显式指定，最高优先级）
+//! 2. 环境变量 `WP_MPV_LIB`（开发/测试/发布验收用）
+//! 3. **可执行文件同级的 `播放器运行时/lib/libmpv.so.2`**（随包发布的 LGPL 构建；
+//!    相对 `current_exe()` 解析，dev（`target/debug/`）与发布目录都适用）
+//! 4. 可执行文件同级（某些打包方式直接放库）
+//! 5. 系统库 `/usr/lib/libmpv.so.2` 等（兜底）
 //!
-//! Windows 对应 `libmpv-2.dll`（优先 `播放器运行时\`）。
+//! 实际加载的路径与来源会记录到日志（`已加载 libmpv：<path>（来源：随包运行时/…）`），
+//! 并可用 [`probe_version_with_path`] 在启动自检/发布验收中读取。
+//!
+//! Windows 对应 `libmpv-2.dll`（同样「程序目录 `播放器运行时\` 优先 → 系统兜底」）。
 //!
 //! # GUI 集成（eframe 0.37 / egui 0.37）
 //!
@@ -187,6 +192,41 @@ const MIN_API_MAJOR: u32 = 2;
 /// 运行时目录名（随包发布的 libmpv 放这里）。
 pub const RUNTIME_DIR_NAME: &str = "播放器运行时";
 
+/// libmpv 候选来源（诊断/发布验收用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSource {
+    /// 显式指定（[`MpvConfig::lib_path`] / [`load_library`] 的 `path` 参数）
+    Explicit,
+    /// 环境变量 `WP_MPV_LIB`
+    Env,
+    /// 可执行文件同级的 `播放器运行时/`（随包 LGPL 构建，发布形态首选）
+    BundledRuntime,
+    /// 可执行文件同级（某些打包方式直接把库放 exe 旁）
+    ExeDir,
+    /// 系统库（发行版包管理安装，兜底）
+    System,
+}
+
+impl CandidateSource {
+    /// 人读标签（日志 / 发布验收输出用）。
+    pub fn label(self) -> &'static str {
+        match self {
+            CandidateSource::Explicit => "显式指定",
+            CandidateSource::Env => "WP_MPV_LIB",
+            CandidateSource::BundledRuntime => "随包运行时",
+            CandidateSource::ExeDir => "程序目录",
+            CandidateSource::System => "系统库",
+        }
+    }
+}
+
+/// 一个 libmpv 候选：路径 + 来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryCandidate {
+    pub path: PathBuf,
+    pub source: CandidateSource,
+}
+
 /// 可执行文件同级的 `播放器运行时/` 目录（不存在也返回路径）。
 pub fn bundled_runtime_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -194,81 +234,114 @@ pub fn bundled_runtime_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// 按优先级列出 libmpv 候选路径（不检查存在性，由加载流程逐个尝试）。
-pub fn library_candidates() -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
+/// 纯函数：按优先级生成候选列表（不读环境/当前进程，便于单测伪造路径）。
+///
+/// 顺序（发布形态）：`WP_MPV_LIB` → `exe_dir/播放器运行时/lib/libmpv.so.2` →
+/// `exe_dir/播放器运行时/libmpv.so.2` → `exe_dir/libmpv.so.2` → 系统库。
+fn candidates_from(wp_mpv_lib: Option<&str>, exe_dir: Option<&Path>) -> Vec<LibraryCandidate> {
+    let mut out: Vec<LibraryCandidate> = Vec::new();
+    let push = |out: &mut Vec<LibraryCandidate>, path: PathBuf, source: CandidateSource| {
+        out.push(LibraryCandidate { path, source });
+    };
 
-    // 1) 环境变量显式覆盖（开发调试/自定义构建用）
-    if let Ok(p) = std::env::var("WP_MPV_LIB") {
-        if !p.trim().is_empty() {
-            out.push(PathBuf::from(p));
+    // 1) 环境变量显式覆盖（开发调试 / 自定义构建 / 发布验收）
+    if let Some(p) = wp_mpv_lib.map(str::trim).filter(|s| !s.is_empty()) {
+        push(&mut out, PathBuf::from(p), CandidateSource::Env);
+    }
+
+    // 2) 随包运行时：相对「可执行文件所在目录」解析（dev=target/debug、发布=安装目录）
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = exe_dir {
+        let rt = dir.join(RUNTIME_DIR_NAME);
+        for path in [
+            rt.join("lib").join("libmpv.so.2"),
+            rt.join("lib").join("libmpv.so"),
+            rt.join("libmpv.so.2"),
+            rt.join("libmpv.so"),
+        ] {
+            push(&mut out, path, CandidateSource::BundledRuntime);
         }
     }
 
+    // 3) 可执行文件同级
     #[cfg(target_os = "linux")]
-    {
-        // 2) 系统库（发行版包管理安装）
-        for p in [
-            "/usr/lib/libmpv.so.2",
-            "/usr/lib/libmpv.so",
-            "/usr/local/lib/libmpv.so.2",
-            "/usr/local/lib/libmpv.so",
-            "/usr/lib/x86_64-linux-gnu/libmpv.so.2",
-            "/usr/lib/x86_64-linux-gnu/libmpv.so",
-            "/usr/lib/aarch64-linux-gnu/libmpv.so.2",
-        ] {
-            out.push(PathBuf::from(p));
+    if let Some(dir) = exe_dir {
+        for name in ["libmpv.so.2", "libmpv.so"] {
+            push(&mut out, dir.join(name), CandidateSource::ExeDir);
         }
-        // 3) 随包运行时
-        if let Some(dir) = bundled_runtime_dir() {
-            for name in ["libmpv.so.2", "libmpv.so"] {
-                out.push(dir.join(name));
-            }
-            out.push(dir.join("lib").join("libmpv.so.2"));
-        }
-        // 4) 可执行文件同级
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                out.push(parent.join("libmpv.so.2"));
-            }
-        }
+    }
+
+    // 4) 系统库兜底
+    #[cfg(target_os = "linux")]
+    for p in [
+        "/usr/lib/libmpv.so.2",
+        "/usr/lib/libmpv.so",
+        "/usr/local/lib/libmpv.so.2",
+        "/usr/local/lib/libmpv.so",
+        "/usr/lib/x86_64-linux-gnu/libmpv.so.2",
+        "/usr/lib/x86_64-linux-gnu/libmpv.so",
+        "/usr/lib/aarch64-linux-gnu/libmpv.so.2",
+    ] {
+        push(&mut out, PathBuf::from(p), CandidateSource::System);
     }
 
     #[cfg(target_os = "windows")]
-    {
-        let mut push_exe = |names: &[&str]| {
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(parent) = exe.parent() {
-                    for name in names {
-                        out.push(parent.join(name));
-                    }
-                    let rt = parent.join(RUNTIME_DIR_NAME);
-                    for name in names {
-                        out.push(rt.join(name));
-                        out.push(rt.join("lib").join(name));
-                    }
-                }
+    if let Some(dir) = exe_dir {
+        let rt = dir.join(RUNTIME_DIR_NAME);
+        for name in ["libmpv-2.dll", "libmpv.dll", "mpv-2.dll"] {
+            // 程序目录播放器运行时/lib 优先 → 播放器运行时 根目录 → exe 旁边 → 系统 PATH（由加载器兜底）
+            for path in [rt.join("lib").join(name), rt.join(name), dir.join(name)] {
+                let source = if path.starts_with(&rt) {
+                    CandidateSource::BundledRuntime
+                } else {
+                    CandidateSource::ExeDir
+                };
+                push(&mut out, path, source);
             }
-        };
-        push_exe(&["libmpv-2.dll", "libmpv.dll", "mpv-2.dll"]);
+        }
     }
 
     #[cfg(target_os = "macos")]
     {
+        if let Some(dir) = exe_dir {
+            let rt = dir.join(RUNTIME_DIR_NAME);
+            for name in ["libmpv.2.dylib", "libmpv.dylib"] {
+                for path in [rt.join("lib").join(name), rt.join(name), dir.join(name)] {
+                    let source = if path.starts_with(&rt) {
+                        CandidateSource::BundledRuntime
+                    } else {
+                        CandidateSource::ExeDir
+                    };
+                    push(&mut out, path, source);
+                }
+            }
+        }
         for p in [
             "/opt/homebrew/lib/libmpv.2.dylib",
             "/usr/local/lib/libmpv.2.dylib",
         ] {
-            out.push(PathBuf::from(p));
-        }
-        if let Some(dir) = bundled_runtime_dir() {
-            for name in ["libmpv.2.dylib", "libmpv.dylib"] {
-                out.push(dir.join(name));
-            }
+            push(&mut out, PathBuf::from(p), CandidateSource::System);
         }
     }
 
     out
+}
+
+/// 按优先级列出 libmpv 候选（含来源；读取当前环境与可执行文件路径）。
+pub fn library_candidates_annotated() -> Vec<LibraryCandidate> {
+    let env_val = std::env::var("WP_MPV_LIB").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf));
+    candidates_from(env_val.as_deref(), exe_dir.as_deref())
+}
+
+/// 按优先级列出 libmpv 候选路径（不检查存在性，由加载流程逐个尝试）。
+pub fn library_candidates() -> Vec<PathBuf> {
+    library_candidates_annotated()
+        .into_iter()
+        .map(|c| c.path)
+        .collect()
 }
 
 /// 加载 libmpv。
@@ -276,9 +349,12 @@ pub fn library_candidates() -> Vec<PathBuf> {
 /// `path = None` 时按 [`library_candidates`] 顺序尝试；失败信息包含**每个**尝试过的
 /// 路径与原因，便于用户排查「没装 mpv / 装的是不能渲染的精简版」。
 pub fn load_library(path: Option<&Path>) -> Result<Arc<MpvLibrary>> {
-    let candidates = match path {
-        Some(p) => vec![p.to_path_buf()],
-        None => library_candidates(),
+    let candidates: Vec<LibraryCandidate> = match path {
+        Some(p) => vec![LibraryCandidate {
+            path: p.to_path_buf(),
+            source: CandidateSource::Explicit,
+        }],
+        None => library_candidates_annotated(),
     };
     if candidates.is_empty() {
         return Err(Error::unsupported(
@@ -288,13 +364,24 @@ pub fn load_library(path: Option<&Path>) -> Result<Arc<MpvLibrary>> {
     }
     let mut failures = Vec::with_capacity(candidates.len());
     for cand in &candidates {
-        if !cand.exists() && path.is_none() {
+        if !cand.path.exists() && path.is_none() {
             // 自动探测时静默跳过不存在的候选，减少噪音
             continue;
         }
-        match unsafe { MpvLibrary::open(cand) } {
-            Ok(lib) => return Ok(Arc::new(lib)),
-            Err(e) => failures.push(format!("{}：{e}", cand.display())),
+        match unsafe { MpvLibrary::open(&cand.path) } {
+            Ok(lib) => {
+                // 诊断/发布验收关键证据：记录**实际加载**的库路径与来源，
+                // 便于确认「随包运行时」被使用、而非误用系统库。
+                wp_core::log_info!(
+                    "播放器",
+                    "已加载 libmpv：{}（来源：{}，{}）",
+                    lib.path().display(),
+                    cand.source.label(),
+                    lib.version().api_string()
+                );
+                return Ok(Arc::new(lib));
+            }
+            Err(e) => failures.push(format!("{}：{e}", cand.path.display())),
         }
     }
     let detail = if failures.is_empty() {
@@ -344,6 +431,14 @@ pub fn probe_version() -> Option<String> {
     Some(lib.describe())
 }
 
+/// 探测 libmpv 并返回（可读描述, **实际加载路径**）。
+///
+/// 发布验收/启动自检用：可断言加载的是 `播放器运行时/lib/libmpv.so.2` 而不是系统库。
+pub fn probe_version_with_path() -> Option<(String, PathBuf)> {
+    let lib = load_library(None).ok()?;
+    Some((lib.describe(), lib.path().to_path_buf()))
+}
+
 // ============================ 测试 ============================
 
 #[cfg(test)]
@@ -351,10 +446,134 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidates_contain_wp_mpv_lib_env_first() {
-        // 注意：测试进程内设置环境变量会影响同进程其它测试，这里只断言不 panic 且路径可枚举。
+    fn candidates_order_env_bundled_exedir_system() {
+        // 纯函数 + 伪造路径：不读真实环境、不需要真实库。
+        let exe = Path::new("/opt/fake-app");
+        let cands = candidates_from(Some("/custom/libmpv.so.2"), Some(exe));
+
+        // 1) env 永远第一
+        assert_eq!(cands[0].source, CandidateSource::Env);
+        assert_eq!(cands[0].path, PathBuf::from("/custom/libmpv.so.2"));
+
+        #[cfg(target_os = "linux")]
+        {
+            // 2) 随包运行时必须是「次优先」，且相对 exe 目录解析到 播放器运行时/lib/libmpv.so.2
+            let bundled: Vec<&LibraryCandidate> = cands
+                .iter()
+                .filter(|c| c.source == CandidateSource::BundledRuntime)
+                .collect();
+            assert!(!bundled.is_empty(), "Linux 候选应包含随包运行时");
+            assert_eq!(
+                bundled[0].path,
+                PathBuf::from("/opt/fake-app/播放器运行时/lib/libmpv.so.2")
+            );
+            // 3) 程序目录 → 系统库兜底，且顺序严格：随包全部在系统库之前
+            let first_system = cands
+                .iter()
+                .position(|c| c.source == CandidateSource::System)
+                .expect("Linux 候选应包含系统库兜底");
+            let last_bundled = cands
+                .iter()
+                .rposition(|c| c.source == CandidateSource::BundledRuntime)
+                .unwrap();
+            assert!(
+                last_bundled < first_system,
+                "随包运行时必须排在系统库之前（发布形态优先用随包库）"
+            );
+            assert!(cands.iter().any(|c| {
+                c.source == CandidateSource::System
+                    && c.path == PathBuf::from("/usr/lib/libmpv.so.2")
+            }));
+            assert!(cands.iter().any(|c| c.source == CandidateSource::ExeDir));
+        }
+    }
+
+    #[test]
+    fn candidates_without_env_prefers_bundled_over_system() {
+        let cands = candidates_from(None, Some(Path::new("/opt/published-app")));
+        assert!(!cands.is_empty());
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                cands[0].source,
+                CandidateSource::BundledRuntime,
+                "没有 WP_MPV_LIB 时，随包运行时应是第一候选"
+            );
+            assert!(cands[0].path.ends_with("播放器运行时/lib/libmpv.so.2"));
+            // 系统库仍保留在末尾兜底
+            assert_eq!(
+                cands.last().map(|c| c.source),
+                Some(CandidateSource::System)
+            );
+        }
+    }
+
+    #[test]
+    fn candidates_without_exe_keep_system_fallback() {
+        // current_exe 拿不到时（异常环境）仍要能兜底系统库
+        let cands = candidates_from(None, None);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(cands.iter().any(|c| c.source == CandidateSource::System));
+            assert!(cands.iter().all(|c| c.source == CandidateSource::System));
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn candidate_source_labels_are_readable() {
+        assert_eq!(CandidateSource::Env.label(), "WP_MPV_LIB");
+        assert_eq!(CandidateSource::BundledRuntime.label(), "随包运行时");
+        assert_eq!(CandidateSource::ExeDir.label(), "程序目录");
+        assert_eq!(CandidateSource::System.label(), "系统库");
+        assert_eq!(CandidateSource::Explicit.label(), "显式指定");
+    }
+
+    #[test]
+    fn library_candidates_do_not_panic_and_are_enumerable() {
         let cands = library_candidates();
         assert!(!cands.is_empty(), "默认候选列表不应为空");
+        // 带来源的版本与纯路径版本一一对应
+        let annotated = library_candidates_annotated();
+        assert_eq!(annotated.len(), cands.len());
+        assert!(annotated
+            .iter()
+            .zip(cands.iter())
+            .all(|(a, p)| &a.path == p));
+    }
+
+    #[test]
+    fn bundled_library_loads_and_reports_its_path_when_present() {
+        // 发布验收：真实加载随包 libmpv（若仓库里已生成 播放器运行时/），断言实际路径。
+        // 干净 checkout 下产物不存在 → 跳过（打包脚本生成后再跑即可覆盖）。
+        let bundled =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../播放器运行时/lib/libmpv.so.2");
+        if !bundled.exists() {
+            eprintln!(
+                "跳过：{} 不存在（先跑 scripts/package-player-runtime-linux.sh）",
+                bundled.display()
+            );
+            return;
+        }
+        let lib = load_library(Some(&bundled)).expect("随包 libmpv 应可加载");
+        assert_eq!(lib.path(), bundled.as_path(), "实际加载路径应是随包库");
+        assert!(lib.version().api_major >= 2);
+        assert!(lib.describe().contains("client API"));
+    }
+
+    #[test]
+    fn probe_version_with_path_reports_existing_path() {
+        // 环境里有 libmpv（系统或随包）时校验：返回的路径必须真实存在。
+        if let Some((desc, path)) = probe_version_with_path() {
+            assert!(
+                path.exists(),
+                "probe_version_with_path 返回路径应存在：{}",
+                path.display()
+            );
+            assert!(desc.contains("client API"), "描述应包含 client API：{desc}");
+            assert!(desc.contains(&path.display().to_string()));
+        }
     }
 
     #[test]

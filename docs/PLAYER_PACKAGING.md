@@ -19,6 +19,7 @@
 | 自包含模式 | 脚本已实现（拷依赖 .so + `patchelf --set-rpath '$ORIGIN'`）；当前 prebuilt 无语义依赖库 → **明确报错**，待 LGPL FFmpeg 等构建后启用 |
 | Windows 打包 | 结构级脚本 `scripts/package-player-runtime-windows.ps1`（DLL/ANGLE/许可证/加载顺序校验，不下载 DLL） |
 | 许可材料 | ✅ `assets/licenses/`（10 份许可证文本 + 来源说明），打包脚本自动随包 |
+| 发布验收 | ✅ `scripts/release-verify-linux.sh` 实测 **PASS=22 FAIL=0**：随包 libmpv 真实加载 + 发布布局模拟 + 短播放断言（见 §8） |
 | LGPL 合规 | 动态链接 + 可替换 + 源码获取说明 + 许可证随包；GPL 可选构建单独说明（§6） |
 
 **一键生成 Linux 运行时**：
@@ -151,17 +152,24 @@
 
 ### 2.5 libmpv 加载顺序（决定「随包运行时」何时生效）
 
-`wp-media-mpv::library_candidates()` 的候选顺序（Linux）：
+`wp-media-mpv::library_candidates_annotated()` 的候选顺序（Linux，**发布形态优先随包库**）：
 
-1. 环境变量 `WP_MPV_LIB`（调试/自定义构建优先）；
-2. **系统库** `/usr/lib/libmpv.so.2`、`/usr/local/lib/...`、多架构目录；
-3. 可执行文件同级 `播放器运行时/libmpv.so.2`、`播放器运行时/lib/libmpv.so.2`；
-4. 可执行文件同级 `libmpv.so.2`。
+| 优先级 | 来源 | 路径 | `CandidateSource` |
+|---|---|---|---|
+| 1 | 显式指定 | `MpvConfig.lib_path` / `load_library(Some(path))` | `Explicit` |
+| 2 | 环境变量 | `$WP_MPV_LIB` | `Env` |
+| 3 | **随包运行时** | `<exe目录>/播放器运行时/lib/libmpv.so.2`（及 `.so` / 根目录变体） | `BundledRuntime` |
+| 4 | 程序目录 | `<exe目录>/libmpv.so.2`（某些打包方式直接放 exe 旁） | `ExeDir` |
+| 5 | 系统库兜底 | `/usr/lib/libmpv.so.2`、`/usr/local/lib/...`、多架构目录 | `System` |
 
-⚠️ 注意：**系统库优先于随包运行时**。因此：
+要点：
 
-* 干净目标机器（无系统 libmpv）→ 使用随包 `播放器运行时/lib/libmpv.so.2` ✅
-* 开发机（已装系统 libmpv）→ 默认用系统库；要验证随包产物请显式指定：
+* **随包运行时排在系统库之前**：发布目录里只要存在 `播放器运行时/lib/libmpv.so.2`，就会优先用随包库
+  （不再出现「开发机装了 mpv 就永远用系统库」的问题）；
+* 候选路径**相对 `current_exe()` 解析**，因此 dev（`target/debug/`）与发布目录通用；
+* **实际加载路径会记录到日志**：`已加载 libmpv：<path>（来源：随包运行时，client API 2.5）`；
+  也可用 `wp_media_mpv::probe_version_with_path() -> Option<(描述, PathBuf)>` 在启动自检/验收中读取；
+* dev 环境（`target/debug/` 旁没有 `播放器运行时/`）自动回退系统库；要验证随包产物可显式指定：
   ```bash
   WP_MPV_LIB=./出/网盘管理-linux-x64/播放器运行时/lib/libmpv.so.2 ./出/网盘管理-linux-x64/网盘管理
   ```
@@ -352,7 +360,7 @@ mpv 支持 `-Dgpl=true`（引入 GPL-only 组件，例如部分蓝光/DVD 相关
 
 ### 7.1 Linux（脚本自动 + 人工复核）
 
-自动化（`package-player-runtime-linux.sh` 每次运行/`--verify-only` 都执行）：
+自动化一（`package-player-runtime-linux.sh` 每次运行/`--verify-only` 都执行）：
 
 - [x] `lib/libmpv.so.2.5.0` 存在且为 ELF 64-bit x86-64
 - [x] **sha256 与 `vendor/prebuilt/.../BUILDINFO.txt` 一致**
@@ -362,6 +370,16 @@ mpv 支持 `-Dgpl=true`（引入 GPL-only 组件，例如部分蓝光/DVD 相关
 - [x] `LICENSES/` 10 份必需文本齐全
 - [x] `源码获取说明.txt` 存在（LGPL 合规）
 - [x] `DEPENDENCIES.txt` 存在
+
+自动化二（`scripts/release-verify-linux.sh`，发布门禁/CI，见 §8）：
+
+- [x] 打包自校验（上表）通过
+- [x] 结构 / 许可证 / sha256 / SONAME 独立复核
+- [x] **随包 libmpv 真实加载**（`WP_MPV_LIB` 指向随包库，strace 证据确认打开的是随包路径）
+- [x] **未误用系统库**（加载日志无 `/usr/lib/libmpv`）
+- [x] **发布布局模拟**：把探针放到「应用目录 + 同级 `播放器运行时/`」，不设 `WP_MPV_LIB` 也能按 exe 相对路径加载随包库
+- [x] 系统库兜底可用（信息性）
+- [x] headless 短播放断言（版本 / Opened 事件 / 无 open_error）
 
 人工（发布前一次）：
 
@@ -385,7 +403,82 @@ mpv 支持 `-Dgpl=true`（引入 GPL-only 组件，例如部分蓝光/DVD 相关
 
 ---
 
-## 8. 脚本速查
+## 8. 发布验收（release-verify）与排查
+
+### 8.1 一键验收
+
+```bash
+./scripts/release-verify-linux.sh                 # 全量（需已生成 播放器运行时/）
+./scripts/release-verify-linux.sh --skip-play      # 只做静态校验（无 ffmpeg 的 CI 环境）
+./scripts/release-verify-linux.sh --runtime-dir 出/网盘管理-linux-x64/播放器运行时
+./scripts/release-verify-linux.sh --skip-package-verify   # 分阶段 CI
+```
+
+* 退出码 **0 = 全部 PASS**，非 0 = 有 FAIL（可直接作为发布门禁 / CI step）；
+* 证据目录 `出/验收日志/release-verify-<时间戳>/`（gitignore），含：
+  `summary.txt`、`package-verify.log`、`strace.log` + `strace-decoded.log`、
+  `load-evidence.txt`、`load-evidence-release-layout.txt`、`play.json`、
+  `play-release-layout.json`、`play-system-fallback.json`、`build-probe.log`；
+* 依赖：`bash python3 sha256sum readelf file cargo`；`ffmpeg`（生成测试视频，可 `--skip-play` 跳过）；
+  `strace`（推荐；缺省时自动退回 `LD_DEBUG=libs` 取证）。
+
+### 8.2 检查项与期望输出（2026-10-19 本机实测：PASS=22 FAIL=0）
+
+| 组 | 检查 | 期望 |
+|---|---|---|
+| 打包 | `package-player-runtime-linux.sh --verify-only` | 通过 |
+| 结构 | libmpv 实体/符号链接/sha256/SONAME | 全部一致（sha256 与 BUILDINFO） |
+| 许可 | `LICENSES/` 10 份 + `源码获取说明.txt` 等 | 齐全 |
+| 探针 | 强制重建 `mpv-probe` | 构建成功（防止用陈旧二进制假验收） |
+| 加载 | `WP_MPV_LIB=<运行时>/lib/libmpv.so.2` 真实加载 | strace 显示打开**随包路径**，无 `/usr/lib/libmpv` |
+| 播放 | headless 短播放（2s testsrc） | `mpv v0.41.0（client API 2.5）`、Opened/FirstFrame、`open_error=null` |
+| 兜底 | 不设 `WP_MPV_LIB`（dev 探针旁无运行时） | 回退系统 `libmpv`（信息性） |
+| **发布布局** | 探针拷到「应用目录」，`播放器运行时/` 与其同级，**不设** `WP_MPV_LIB` | 按 exe 相对路径加载随包库 ✅ |
+
+本次实测关键证据（证据目录 `出/验收日志/release-verify-20261019-032211/`）：
+
+```text
+# ① WP_MPV_LIB 显式指向随包库 → 打开的是随包路径（strace 解码后）
+openat(AT_FDCWD, ".../播放器运行时/lib/libmpv.so.2", O_RDONLY|O_CLOEXEC) = 3
+
+# ② 发布布局模拟（无 WP_MPV_LIB，exe 旁放 播放器运行时/ 软链）
+openat(AT_FDCWD, "/tmp/wp-release-verify.jzFC8y/app/播放器运行时/lib/libmpv.so.2", ...) = 3
+# play.json：mpv v0.41.0（client API 2.5），state=Ended，video=160x120，open→opened≈25ms
+
+# ③ 主验收 play.json（WP_MPV_LIB 方式）
+mpv_version = "mpv v0.41.0（client API 2.5）"
+state = Ended, video_size = [160,120], tracks = 1, dropped_frames = 0
+open_to_opened_ms ≈ 18.0ms, open_to_first_frame_ms ≈ 18.0ms
+```
+
+> 说明：短播放用 `mpv-probe --hwdec no`（`auto-safe` 的硬件解码设备初始化在高负载下会把
+> open 拖到秒级，导致 2s 窗口内只看到 `Opening` 的假失败；验收口径固定为软解快速 open）。
+
+### 8.3 排查：系统库被误用 / 缺依赖 / 版本不符
+
+| 症状 | 可能原因 | 排查与修复 |
+|---|---|---|
+| 日志/`probe_version` 显示 `来源：系统库`，或 strace 出现 `/usr/lib/libmpv` | ① `播放器运行时/` 放错位置（不在 exe 同级）；② `WP_MPV_LIB` 指到了系统库；③ 用了旧版二进制 | `ls <exe目录>/播放器运行时/lib/libmpv.so.2`；确认日志「已加载 libmpv」路径；重新 `cargo build -p wp-media-mpv`/用 release 构建；`release-verify` 会自动重建探针并给出 strace 证据 |
+| 启动报「无法加载 libmpv / cannot open shared object file」 | system-deps 模式缺系统依赖（FFmpeg/libass/libplacebo…） | 按 `播放器运行时/DEPENDENCIES.txt` 安装（Arch：`sudo pacman -S --needed <清单>`）；**不要**用 `LD_LIBRARY_PATH` 指向运行时 lib 掩盖缺依赖（那里只有 libmpv） |
+| `libmpv client API 版本过低（… < 2.0）` | 系统 libmpv 太旧且被优先选中 | 把随包运行时放到 exe 同级（候选 3 会先于系统库），或用 `WP_MPV_LIB` 指向随包库 |
+| 播放失败但库加载正常 | 与加载无关（编解码/网络/文件） | 看 `play.json` 的 `open_error` / mpv 日志；回到 M0/流媒体排查 |
+| 手工 strace 找不到中文路径 | strace 把非 ASCII 文件名写成 `\ooo` 八进制转义 | `release-verify` 已自动解码；手工排查可 `python3` 将 `\([0-7]{3})` 逐字节解码后再 grep（见脚本 `decode_escaped_paths`） |
+| 验收结果与预期相反但「看起来通过」 | 复用了**陈旧**的 mpv-probe/二进制（源码改了但没重编） | 验收脚本已**每次强制** `cargo build -q -p wp-media-mpv --bin mpv-probe`；CI 注意 cargo 缓存与源码 hash |
+
+### 8.4 CI 集成建议
+
+```yaml
+# 伪代码：发布 job
+- run: ./scripts/package-player-runtime-linux.sh
+- run: ./scripts/release-verify-linux.sh          # 退出码 0 才继续
+- uses: actions/upload-artifact@v4
+  with: { name: release-verify-evidence, path: 出/验收日志/ }
+- run: ./scripts/build-linux.sh --portable
+```
+
+验收证据（PASS/FAIL 明细 + strace + play.json）建议随发布产物归档，便于事后复核「当时确实加载了随包库」。
+
+## 9. 脚本速查
 
 | 脚本 | 作用 | 备注 |
 |---|---|---|
@@ -393,6 +486,7 @@ mpv 支持 `-Dgpl=true`（引入 GPL-only 组件，例如部分蓝光/DVD 相关
 | `scripts/build-media-stack-windows.ps1` | Windows 构建骨架（MSYS2 UCRT64） | 文档级，未实测 |
 | `scripts/package-player-runtime-linux.sh` | **运行时打包/校验**（系统依赖/自包含） | 默认 `--system-deps`；`--verify-only` |
 | `scripts/package-player-runtime-windows.ps1` | Windows 运行时结构级生成/校验 | 不下载 DLL；PE 校验需 Windows |
+| `scripts/release-verify-linux.sh` | **发布验收**：静态校验 + 随包库真实加载 + 发布布局模拟 + 短播放 | 退出码可进 CI；见 §8 |
 | `scripts/build-linux.sh --portable` | 构建便携目录并自动拷入 `播放器运行时/` | 已对接 |
 | `scripts/build-windows.ps1 -Portable` | 构建 Windows 便携目录 | 需手工/GUI 拷运行时（后续可对接） |
 
@@ -412,7 +506,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-window
 
 ---
 
-## 9. 已知限制与后续
+## 10. 已知限制与后续
 
 | # | 项 | 说明 / 后续 |
 |---|---|---|
