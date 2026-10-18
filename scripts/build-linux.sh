@@ -65,6 +65,13 @@ if [ "$PORTABLE" = "1" ]; then
     cp assets/netdisk-manager.desktop "$OUT/图标/" 2>/dev/null || true
   fi
   cp scripts/install-desktop.sh "$OUT/安装桌面图标.sh" 2>/dev/null && chmod +x "$OUT/安装桌面图标.sh" || true
+  # 播放器运行时（libmpv 及其依赖；由 scripts/build-media-stack-linux.sh 生成）
+  if [ -d "播放器运行时" ]; then
+    cp -r "播放器运行时" "$OUT/播放器运行时"
+    echo "==> 已打包播放器运行时（$(du -sh 播放器运行时 | cut -f1)）"
+  else
+    echo "==> 提示：未找到 播放器运行时/（播放器功能将在启动时提示缺少 libmpv）"
+  fi
   # 绿色版标记：数据写在可执行文件旁（U 盘/解压即用）
   : > "$OUT/portable"
   echo "==> 绿色版目录：$OUT"

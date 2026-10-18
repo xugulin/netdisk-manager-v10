@@ -6,3 +6,8 @@
 .DS_Store
 *.log
 /出
+
+# 播放器运行时（vendored libmpv 构建产物，脚本生成）
+/vendor/prebuilt/
+/播放器运行时/
+/出/播放器运行时/
