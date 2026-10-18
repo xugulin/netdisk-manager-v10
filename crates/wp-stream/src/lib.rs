@@ -72,10 +72,13 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             cache_dir: PathBuf::new(),
-            readahead_bytes: 64 * 1024 * 1024,
+            // 4K（40–100Mbps）预读 ≈8.5–25s 缓冲；弱网/移动端建议手动降到 32–64MB
+            // （见 docs/PLAYER_PERF.md §4，预读过大会与 seek 抢带宽，自适应优化见 task-18）。
+            readahead_bytes: 128 * 1024 * 1024,
             max_cache_bytes: 20 * 1024 * 1024 * 1024,
             chunk_bytes: 4 * 1024 * 1024,
-            parallel_fetches: 2,
+            // 多连接预取聚合 2–5×（PLAYER_PERF 实测 parallel=2 聚合 ≈21.8Mbps）
+            parallel_fetches: 4,
             max_link_restarts: 3,
             request_timeout_secs: 30,
             connect_timeout_secs: 10,

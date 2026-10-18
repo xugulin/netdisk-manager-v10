@@ -1002,7 +1002,7 @@ async fn bench_hls(
             "first_segment_ttfb_ms": round1(first_ttfb),
             "first_segment_ms": round1(first_ms),
             "estimated_startup_ms": round1(m3u8_total + first_ms),
-            "first_segment_mbps": round2(first_body.len() as f64 * 8.0 / first_ms.max(0.001)),
+            "first_segment_mbps": round2(first_body.len() as f64 * 8.0 * 1000.0 / first_ms.max(0.001) / 1_000_000.0),
         },
         "steady": {
             "segments_fetched": steady_fetch,
@@ -1047,67 +1047,80 @@ async fn run_matrix(
     let total = link.size;
     let mut rows = Vec::new();
     for (idx, (chunk, readahead, parallel)) in matrix_configs().into_iter().enumerate() {
-        let dir = base_dir.join(format!("m{idx}"));
-        let cfg = StreamConfig {
-            cache_dir: dir.clone(),
+        let mk = |sub: &str, chunk: u64, readahead: u64, parallel: usize| StreamConfig {
+            cache_dir: base_dir.join(format!("m{idx}")).join(sub),
             chunk_bytes: chunk,
             readahead_bytes: readahead,
             max_cache_bytes: opts.lru,
             parallel_fetches: parallel.max(1),
             ..StreamConfig::default()
         };
-        let bench = Bench::new(cfg)?;
-        let open_t0 = Instant::now();
+
+        // 会话 A：顺序读（全新会话，先 seq 再预读，避免把缓存命中误当网络吞吐）
+        let bench = Bench::new(mk("seq", chunk, readahead, parallel))?;
+        let t = Instant::now();
         let handle = bench.open(link.clone(), &opts.remote_path).await?;
-        let open_ms = open_t0.elapsed().as_secs_f64() * 1000.0;
-        let (_, ttfb, _) = read_range(&bench.client, &handle.url, 0, 65535.min(total - 1)).await?;
+        let open_ms = t.elapsed().as_secs_f64() * 1000.0;
         let seq = seq_read(&bench, &handle.url, total, opts.read_bytes).await?;
         let fill = prefetch_fill(&bench, &handle.token, total, readahead).await?;
-        // 中段 seek：冷（未预读窗口）→ 热（重复）
+        bench.finish().await;
+
+        // 会话 B：起播（全新会话，Range 0-64KB；代理需先备好首块）
+        let bench_b = Bench::new(mk("startup", chunk, readahead, parallel))?;
+        let handle_b = bench_b.open(link.clone(), &opts.remote_path).await?;
+        let (_, ttfb, _) =
+            read_range(&bench_b.client, &handle_b.url, 0, 65535.min(total - 1)).await?;
+        bench_b.finish().await;
+
+        // 会话 C：冷 seek（全新会话；中段不在预读窗口内）→ 重复 warm
+        let bench_c = Bench::new(mk("seek", chunk, readahead, parallel))?;
+        let handle_c = bench_c.open(link.clone(), &opts.remote_path).await?;
         let mid = total / 2;
-        let w = opts.seek_bytes.min(total);
-        let before = bench
+        let w = opts.seek_bytes.max(1).min(total.max(1));
+        let before = bench_c
             .proxy
-            .stats(&handle.token)
+            .stats(&handle_c.token)
             .map(|s| s.downloaded_bytes)
             .unwrap_or(0);
         let (_, cold_ttfb, _) = read_range(
-            &bench.client,
-            &handle.url,
+            &bench_c.client,
+            &handle_c.url,
             mid,
             (mid + w - 1).min(total - 1),
         )
         .await?;
-        let mid_delta = bench
+        let mid_delta = bench_c
             .proxy
-            .stats(&handle.token)
+            .stats(&handle_c.token)
             .map(|s| s.downloaded_bytes)
             .unwrap_or(0)
             .saturating_sub(before);
-        let before2 = bench
+        let before2 = bench_c
             .proxy
-            .stats(&handle.token)
+            .stats(&handle_c.token)
             .map(|s| s.downloaded_bytes)
             .unwrap_or(0);
         let (_, warm_ttfb, _) = read_range(
-            &bench.client,
-            &handle.url,
+            &bench_c.client,
+            &handle_c.url,
             mid,
             (mid + w - 1).min(total - 1),
         )
         .await?;
-        let warm_delta = bench
+        let warm_delta = bench_c
             .proxy
-            .stats(&handle.token)
+            .stats(&handle_c.token)
             .map(|s| s.downloaded_bytes)
             .unwrap_or(0)
             .saturating_sub(before2);
+        bench_c.finish().await;
+
         rows.push(serde_json::json!({
             "chunk_bytes": chunk,
             "readahead_bytes": readahead,
             "parallel": parallel,
             "open_ms": round1(open_ms),
-            "first_range_ttfb_ms": round1(ttfb),
+            "startup_first_range_ttfb_ms": round1(ttfb),
             "seq": seq,
             "prefetch": fill,
             "seek_mid_cold_ttfb_ms": round1(cold_ttfb),
@@ -1115,7 +1128,6 @@ async fn run_matrix(
             "seek_mid_warm_ttfb_ms": round1(warm_ttfb),
             "seek_mid_warm_hit": warm_delta == 0,
         }));
-        bench.finish().await;
     }
     Ok(serde_json::json!({ "rows": rows }))
 }
