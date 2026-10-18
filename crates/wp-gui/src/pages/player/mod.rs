@@ -88,6 +88,11 @@ pub struct PlayerNetwork {
 }
 
 impl PlayerNetwork {
+    /// 是否 HLS 直连链路（带宽不足启发式只对它启用；代理流有 StreamStats）。
+    pub fn is_hls(&self) -> bool {
+        self.mode.contains("HLS")
+    }
+
     pub fn label(&self) -> String {
         if self.size > 0 {
             format!("{} · {}", self.mode, human_size(self.size))
@@ -95,6 +100,23 @@ impl PlayerNetwork {
             self.mode.clone()
         }
     }
+}
+
+/// HLS 带宽不足启发式判定（纯函数，可单测）。
+///
+/// 规则：HLS 直连 + 连续部分缓冲（`Buffering(0<pct<100)`）≥8s + 距最近 seek ≥3s（去抖）。
+/// 依据 `docs/PLAYER_PERF.md §8.1`：稳定播放约需 ≥1.5× 内容码率。
+pub fn hls_bandwidth_hint_due(
+    is_hls: bool,
+    buffering_since: Option<Instant>,
+    last_seek_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    const HOLD: Duration = Duration::from_secs(8);
+    const SEEK_DEBOUNCE: Duration = Duration::from_secs(3);
+    is_hls
+        && buffering_since.is_some_and(|t| now.saturating_duration_since(t) >= HOLD)
+        && last_seek_at.map_or(true, |t| now.saturating_duration_since(t) >= SEEK_DEBOUNCE)
 }
 
 /// 当前网盘播放目标（链接过期时重新取链 + 续播用）。
@@ -318,6 +340,12 @@ pub struct PlayerUi {
     pub proxy_diag: Option<ProxyDiag>,
     /// 最近一次「上游熔断」可读提示（粘性：换链重解析新会话后仍展示，直到切换媒体）
     pub fatal_hint: Option<(String, u64)>,
+    /// HLS 带宽不足提示（启发式：连续 `Buffering(0<pct<100)` >8s；仅 HLS 直连）
+    pub hls_bandwidth_hint: bool,
+    /// 连续「部分缓冲」事件起点（`PlayerEvent::Buffering` 的 0<pct<100 期间）
+    buffering_event_since: Option<Instant>,
+    /// 最近一次 seek 时间（去抖：seek 后 3s 内不判带宽不足）
+    pub last_seek_at: Option<Instant>,
     last_tick: Instant,
     pub subtitle: SubtitleUi,
     pub danmaku: DanmakuUi,
@@ -359,6 +387,9 @@ impl PlayerUi {
             network: None,
             proxy_diag: None,
             fatal_hint: None,
+            hls_bandwidth_hint: false,
+            buffering_event_since: None,
+            last_seek_at: None,
             last_tick: Instant::now(),
             subtitle: SubtitleUi::default(),
             danmaku: DanmakuUi::default(),
@@ -580,6 +611,9 @@ impl PlayerUi {
         self.network = None;
         self.proxy_diag = None;
         self.fatal_hint = None;
+        self.hls_bandwidth_hint = false;
+        self.buffering_event_since = None;
+        self.last_seek_at = None;
         self.subtitle.reset();
     }
 
@@ -649,7 +683,51 @@ impl PlayerUi {
         };
         let target = target.clamp(0.0, max);
         self.position = target;
+        // seek 去抖：正常 HLS seek 2.2–2.3s，不应当作「带宽不足」
+        self.last_seek_at = Some(Instant::now());
+        self.buffering_event_since = None;
+        self.hls_bandwidth_hint = false;
         self.send(PlayerCommand::SeekAbsolute(target));
+    }
+
+    /// 记录缓冲事件：连续部分缓冲起点；满缓冲/清空时清除提示。
+    fn note_buffering_event(&mut self, pct: u8) {
+        if pct > 0 && pct < 100 {
+            if self.buffering_event_since.is_none() {
+                self.buffering_event_since = Some(Instant::now());
+            }
+        } else {
+            self.buffering_event_since = None;
+            self.hls_bandwidth_hint = false;
+        }
+    }
+
+    /// 验收用：把当前播放页标记为「HLS 直连 + 连续缓冲 9s」，用于无头截图验证带宽不足提示。
+    ///
+    /// 仅由 `WP_DEMO_HLS_HINT` 验收钩子调用；不影响正常播放逻辑。
+    #[doc(hidden)]
+    pub fn force_hls_bandwidth_hint_for_demo(&mut self) {
+        self.network = Some(PlayerNetwork {
+            mode: "HLS 直连".into(),
+            size: 173_709_677,
+        });
+        self.buffering_event_since = Some(Instant::now() - Duration::from_secs(9));
+        self.last_seek_at = None;
+    }
+
+    /// 每帧评估 HLS 带宽不足提示（启发式；仅 HLS 直连；恢复满缓冲/切换媒体自动消失）。
+    pub fn update_hls_bandwidth_hint(&mut self) {
+        let is_hls = self.network.as_ref().is_some_and(|n| n.is_hls());
+        let due = hls_bandwidth_hint_due(
+            is_hls,
+            self.buffering_event_since,
+            self.last_seek_at,
+            Instant::now(),
+        );
+        if due && !self.hls_bandwidth_hint {
+            wp_core::log_info!("播放器", "HLS 带宽不足提示出现（连续缓冲 >8s，启发式）");
+        }
+        self.hls_bandwidth_hint = due;
     }
 
     pub fn set_volume(&mut self, volume: f64) {
@@ -723,6 +801,7 @@ impl PlayerUi {
             PlayerState::Playing | PlayerState::Buffering | PlayerState::Opening
         );
         self.refresh_danmaku_layout();
+        self.update_hls_bandwidth_hint();
         if self.playing {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -817,7 +896,10 @@ impl PlayerUi {
                     self.subtitle.current_cue = Some(text);
                 }
             }
-            PlayerEvent::Buffering(pct) => self.buffering_pct = pct.min(100),
+            PlayerEvent::Buffering(pct) => {
+                self.buffering_pct = pct.min(100);
+                self.note_buffering_event(pct);
+            }
             PlayerEvent::FirstFrame => self.first_frame = true,
             PlayerEvent::EndOfFile => {
                 self.playing = false;
@@ -1726,6 +1808,19 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme, actions: &mut Vec
     ui.horizontal(|ui| {
         let (label, color) = overlay::state_style(player.snapshot.state, t);
         ui.label(RichText::new(format!("● {label}")).size(11.0).color(color));
+        if player.hls_bandwidth_hint {
+            ui.label(
+                RichText::new("⚠ 带宽可能不足（HLS 约需 ≥1.5× 内容码率，正在缓冲…）")
+                    .size(10.5)
+                    .color(t.warning),
+            )
+            .on_hover_text(
+                "HLS 直连已连续缓冲 >8s：稳定播放约需内容码率 1.5× 带宽\n\
+                 （参考：1080p HLS 8–16Mbps → 需 12–24Mbps；4K 40–100Mbps → 需 60–150Mbps）。\n\
+                 夸克 HLS 真机样例内容码率 14.07Mbps（docs/PLAYER_PERF.md §8.1）。\n\
+                 恢复播放后提示自动消失；若持续出现请检查网络或换源。",
+            );
+        }
         ui.separator();
         let hwdec = player.snapshot.hwdec.clone().unwrap_or_else(|| {
             if player.backend == EngineBackend::Mock {
@@ -1958,6 +2053,70 @@ mod tests {
     fn fresh_ui() -> PlayerUi {
         let (tx, _rx) = std::sync::mpsc::channel();
         PlayerUi::new(tx)
+    }
+
+    #[test]
+    fn hls_bandwidth_hint_due_rules() {
+        let now = Instant::now();
+        // 非 HLS：永不提示
+        assert!(!hls_bandwidth_hint_due(
+            false,
+            Some(now - Duration::from_secs(30)),
+            None,
+            now
+        ));
+        // 连续部分缓冲 9s → 提示；5s → 不提示
+        assert!(hls_bandwidth_hint_due(
+            true,
+            Some(now - Duration::from_secs(9)),
+            None,
+            now
+        ));
+        assert!(!hls_bandwidth_hint_due(
+            true,
+            Some(now - Duration::from_secs(5)),
+            None,
+            now
+        ));
+        // seek 去抖：1s 前 seek（正常 2.2–2.3s 缓冲）不提示；4s 前可提示
+        assert!(!hls_bandwidth_hint_due(
+            true,
+            Some(now - Duration::from_secs(9)),
+            Some(now - Duration::from_secs(1)),
+            now
+        ));
+        assert!(hls_bandwidth_hint_due(
+            true,
+            Some(now - Duration::from_secs(9)),
+            Some(now - Duration::from_secs(4)),
+            now
+        ));
+    }
+
+    #[test]
+    fn hls_bandwidth_hint_lifecycle() {
+        // HLS 直连 + 持续部分缓冲 → 提示出现；Buffering(100) 恢复 → 消失
+        let mut ui = fresh_ui();
+        ui.network = Some(PlayerNetwork {
+            mode: "HLS 直连".into(),
+            size: 1024,
+        });
+        ui.note_buffering_event(20);
+        ui.buffering_event_since = Some(Instant::now() - Duration::from_secs(9));
+        ui.update_hls_bandwidth_hint();
+        assert!(ui.hls_bandwidth_hint);
+        ui.note_buffering_event(100);
+        ui.update_hls_bandwidth_hint();
+        assert!(!ui.hls_bandwidth_hint);
+        // 代理流（有 StreamStats）不启用该启发式
+        let mut proxy = fresh_ui();
+        proxy.network = Some(PlayerNetwork {
+            mode: "代理流".into(),
+            size: 1024,
+        });
+        proxy.buffering_event_since = Some(Instant::now() - Duration::from_secs(9));
+        proxy.update_hls_bandwidth_hint();
+        assert!(!proxy.hls_bandwidth_hint);
     }
 
     #[test]

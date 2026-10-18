@@ -782,6 +782,11 @@ impl App {
             app.open_player_demo();
             app.toasts.clear();
         }
+        // 验收钩子：WP_DEMO_HLS_HINT=1 → 注入「HLS 直连 + 连续缓冲 9s」状态，截图验证带宽不足提示
+        if std::env::var("WP_DEMO_HLS_HINT").is_ok() && app.page == Page::Player {
+            app.player.force_hls_bandwidth_hint_for_demo();
+            wp_core::log_info!("播放器", "验收：注入 HLS 带宽不足提示（WP_DEMO_HLS_HINT）");
+        }
         app
     }
 
