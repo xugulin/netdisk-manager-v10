@@ -188,9 +188,14 @@ pub fn readable_playback_error(raw: &str) -> String {
 /// 网盘流代理诊断（状态行展示；上游反复失败时给可读提示）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProxyDiag {
+    /// 本会话从上游真实下载字节。
     pub downloaded: u64,
+    /// 代理已可服务字节（**含跨会话磁盘缓存命中**，可能远大于 downloaded）。
+    pub buffered: u64,
     pub errors: u32,
     pub restarts: u32,
+    /// 弱网自适应已触发（预读窗口自动下调）。
+    pub weak_network: bool,
 }
 
 impl ProxyDiag {
@@ -1197,7 +1202,17 @@ impl App {
             PlayerEvent::Opened { duration_secs, .. } => {
                 wp_core::log_info!("播放器", "媒体已打开：时长={duration_secs:?}s");
             }
-            PlayerEvent::FirstFrame => wp_core::log_info!("播放器", "首帧已渲染"),
+            PlayerEvent::FirstFrame => {
+                wp_core::log_info!("播放器", "首帧已渲染");
+                // 冷起播 bootstrap 验证：首帧时打印代理 stats（仅 WP_PLAYER_DIAG=1）
+                if std::env::var("WP_PLAYER_DIAG").is_ok() {
+                    if let Some(token) = self.stream_token.as_ref() {
+                        if let Some(stats) = self.stream_proxy.stats(token) {
+                            println!("PLAYER_FIRST_FRAME_STATS {stats:?}");
+                        }
+                    }
+                }
+            }
             PlayerEvent::Buffering(pct) => wp_core::log_info!("播放器", "缓冲 {pct}%"),
             _ => {}
         }
@@ -1644,6 +1659,20 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme) {
             status_kv(ui, t, "链路", &network.mode);
         }
         if let Some(diag) = &player.proxy_diag {
+            // 区分「磁盘缓存命中」与「本会话真实下载」：buffered 含旧缓存，downloaded 只算本次
+            status_kv(
+                ui,
+                t,
+                "缓存",
+                &format!(
+                    "{}（本会话下载 {}）",
+                    human_size(diag.buffered),
+                    human_size(diag.downloaded)
+                ),
+            );
+            if diag.weak_network {
+                status_kv(ui, t, "弱网", "自适应预读已降窗");
+            }
             if diag.errors > 0 || diag.restarts > 0 {
                 let text = format!(
                     "上游错误 {} / 换链 {} / 已下载 {}",

@@ -1733,8 +1733,10 @@ impl eframe::App for App {
             if let Some(stats) = self.stream_proxy.stats(token) {
                 let diag = crate::pages::player::ProxyDiag {
                     downloaded: stats.downloaded_bytes,
+                    buffered: stats.buffered_bytes,
                     errors: stats.errors as u32,
                     restarts: stats.upstream_restarts as u32,
+                    weak_network: stats.weak_network,
                 };
                 self.player.proxy_diag = Some(diag);
                 if diag.is_stalled() && !self.proxy_hint_shown {

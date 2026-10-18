@@ -235,6 +235,12 @@ cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
 | **seek 优先/可取消预读** | 客户端跳转（偏移差 > chunk）时：`seek_gen += 1` 取消旧预读任务（协作式取消，开始前校验代次）、暂停后台预读 `seek_pause_ms`（400ms，弱网 ×2）、播放器等待的块优先；目标块就绪后自动恢复预读。回看命中仍是毫秒级 |
 | **诊断字段**（`StreamStats` 新增） | `weak_network` / `effective_readahead_bytes` / `seek_pauses` / `bootstrap_bytes` / `bootstrap_mbps` |
 
+> 统计口径（GUI 诊断注意）：
+> * `bootstrap_bytes/bootstrap_mbps` 是**会话级累计值，只在「GET 请求命中未缓存块」时**才触发/增长；
+>   若磁盘缓存已预热（`buffered_bytes > downloaded_bytes` 即多为旧缓存命中），冷起播路径不会走，二者保持 0——属正常。
+> * `weak_network` 也只在首字节引导实测后才有意义（无引导则为 false）；`effective_readahead_bytes` 初始=配置值，弱网降级后才变小。
+> * `buffered_bytes` 是磁盘缓存中已就绪字节（可含上次会话持久化缓存），`downloaded_bytes` 是本会话从上游下载字节，两者不必相等。
+
 测试：`cargo test -p wp-stream` **59 全绿**（29 单元 + 28 端到端 + 2 doc；新增 7 个 task-18 测试：首字节先于整块、关闭自适应回旧语义、小 Range 不拉整块、跨引导/分块正文正确、弱网降窗、seek 暂停且不误计错误、默认值）。
 
 ### 7.2 真机前后对比（光鸭 727MB mkv；⚠ 测试窗口网络进一步劣化：直连 2–7.5Mbps 且波动）
