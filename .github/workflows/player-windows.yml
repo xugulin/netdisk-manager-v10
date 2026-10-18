@@ -77,7 +77,6 @@ jobs:
             mingw-w64-ucrt-x86_64-libass
             mingw-w64-ucrt-x86_64-libplacebo
             mingw-w64-ucrt-x86_64-libbluray
-            mingw-w64-ucrt-x86_64-luajit
 
       - name: 缓存 media-stack 构建目录（FFmpeg/mpv 源码与中间产物）
         uses: actions/cache@v4

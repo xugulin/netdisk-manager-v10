@@ -111,8 +111,7 @@ pacman -S --needed --noconfirm base-devel git curl tar xz p7zip meson ninja pkgc
   mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-libass \
   mingw-w64-ucrt-x86_64-libplacebo \
-  mingw-w64-ucrt-x86_64-libbluray \
-  mingw-w64-ucrt-x86_64-luajit
+  mingw-w64-ucrt-x86_64-libbluray
 '@
   },
   [ordered]@{
@@ -133,7 +132,7 @@ cd 'ffmpeg-src'
   --disable-gpl --disable-nonfree --disable-version3 \
   --disable-doc --disable-debug --disable-programs \
   --enable-shared --disable-static \
-  --enable-w32threads
+  --disable-autodetect
 make -j__JOBS__
 make install
 '@
@@ -156,6 +155,7 @@ rm -rf mpv-build
 meson setup mpv-build mpv-src \
   --buildtype=release --prefix='__PREFIX__/mpv' \
   -Dgpl=false -Dlibmpv=true -Dcplayer=false -Dbuild-date=false \
+  -Dlua=disabled -Djavascript=disabled -Drubberband=disabled \
   -Dtests=false -Dmanpage-build=disabled
 ninja -C mpv-build
 ninja -C mpv-build install
@@ -220,8 +220,12 @@ function Invoke-Msys2Bash([string]$script, [string]$label) {
     $env:MSYSTEM = "UCRT64"
     $env:CHERE_INVOKING = "1"
     $cmd = "source /etc/profile && bash '$shPath'"
-    & $Bash "-lc" $cmd
-    return $LASTEXITCODE
+    # 注意：不能直接 `& $Bash ...` + `return $LASTEXITCODE`。
+    # bash 的 stdout 会进入函数输出流，导致调用方拿到「输出行 + 退出码」数组，
+    # 进而被误判为失败（首次 CI 实测踩坑）。这里显式把输出写到 Host，只返回退出码。
+    & $Bash "-lc" $cmd | Out-Host
+    $rc = $LASTEXITCODE
+    return $rc
   } finally {
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
   }
