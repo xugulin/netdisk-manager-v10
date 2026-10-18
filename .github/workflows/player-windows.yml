@@ -1,0 +1,212 @@
+name: player-windows
+
+# Windows 播放器运行时构建（M6-Win）
+#
+# 流程：
+#   job1 media-stack : MSYS2 UCRT64 中从源码构建 **LGPL FFmpeg** + **mpv v0.41.0 LGPL libmpv-2.dll**
+#   job2 player-package : 下载 media-stack 产物 → fetch ANGLE → cargo 构建 → 组装 播放器运行时\
+#                        → package-player-runtime-windows.ps1 -Generate -Check -Strict
+#                        → windows-verify.ps1（W1–W7，CI 中 GL 项 SKIP）→ 上传 zip + 验收报告
+#
+# 触发：
+#   * push tag `v*`
+#   * 手动：仓库 Actions 页 → player-windows → Run workflow（可改 mpv/FFmpeg 版本、是否尝试 GL 验收）
+#   * 本仓库当前无 GitHub 远端时：推送代码到 GitHub 后此文件即可直接使用（无需改路径）。
+#
+# 产物（Artifacts）：
+#   media-stack-windows      vendor/prebuilt/windows-x86_64（libmpv-2.dll + 依赖 DLL + BUILDINFO）
+#   windows-player-runtime   出/网盘管理-win64.zip（含 LICENSES/源码获取说明/LOAD-ORDER）
+#                            + 出/验收日志/windows-verify-report.json
+#
+# 说明：Windows 真机/显卡相关项（W1 GL_RENDERER、W3 硬解、W4 4K 性能、W5 HDR）无法在 CI 完全判定，
+#       CI 只自动完成 W2/W7 + 结构校验；其余需按 docs/PLAYER_WINDOWS_ANGLE.md 在目标 Windows 机器跑
+#       scripts/windows-verify.ps1（可用 -Sample1080/-Sample4K 补齐）。
+on:
+  workflow_dispatch:
+    inputs:
+      mpv_version:
+        description: "mpv 版本（tag，不含 v）"
+        required: false
+        default: "0.41.0"
+      ffmpeg_version:
+        description: "FFmpeg 源码 tag（LGPL 构建）"
+        required: false
+        default: "n9.0.2"
+      run_gl_verify:
+        description: "尝试在 CI 里跑 GL 相关验收（无 GPU 会话时可能失败；默认跳过）"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  MPV_VERSION: ${{ github.event.inputs.mpv_version || '0.41.0' }}
+  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n9.0.2' }}
+
+jobs:
+  media-stack:
+    name: 构建 LGPL libmpv（MSYS2 UCRT64）
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 MSYS2（UCRT64）
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            git
+            curl
+            tar
+            xz
+            p7zip
+            meson
+            ninja
+            pkgconf
+            nasm
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libass
+            mingw-w64-ucrt-x86_64-libplacebo
+            mingw-w64-ucrt-x86_64-libbluray
+            mingw-w64-ucrt-x86_64-luajit
+
+      - name: 缓存 media-stack 构建目录（FFmpeg/mpv 源码与中间产物）
+        uses: actions/cache@v4
+        with:
+          path: 出/构建缓存/windows-media-stack
+          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-${{ hashFiles('scripts/build-media-stack-windows.ps1') }}
+          restore-keys: |
+            media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-
+
+      - name: 构建 LGPL FFmpeg + mpv libmpv-2.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./scripts/build-media-stack-windows.ps1 -Run -Msys2Root C:\msys64 `
+            -WorkDir "${{ github.workspace }}\出\构建缓存\windows-media-stack" `
+            -MpvVersion "$env:MPV_VERSION" -FfmpegVersion "$env:FFMPEG_VERSION" -Jobs 4
+
+      - name: 校验构建产物（sha256 / 许可证 / BUILDINFO）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dll = "vendor\prebuilt\windows-x86_64\lib\libmpv-2.dll"
+          if (-not (Test-Path $dll)) { throw "缺少 $dll" }
+          $h = (Get-FileHash -Algorithm SHA256 $dll).Hash.ToLowerInvariant()
+          Write-Host "libmpv-2.dll sha256=$h size=$((Get-Item $dll).Length)"
+          "libmpv_sha256=$h" | Out-File -Encoding ascii "vendor\prebuilt\windows-x86_64\BUILDINFO.sha256.txt"
+          foreach ($f in @("LICENSE.LGPL", "COPYING.FFmpeg-LGPLv2.1", "mpv-Copyright")) {
+            if (-not (Test-Path (Join-Path "vendor\prebuilt\windows-x86_64\licenses" $f))) { throw "缺少许可证 $f" }
+          }
+          Get-ChildItem "vendor\prebuilt\windows-x86_64\lib" -Filter *.dll | Measure-Object | ForEach-Object {
+            Write-Host "依赖 DLL 数量：$($_.Count)"
+          }
+
+      - name: 上传 media-stack 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-stack-windows
+          path: vendor/prebuilt/windows-x86_64
+          if-no-files-found: error
+          retention-days: 14
+
+  player-package:
+    name: 组装播放器运行时 + 验收
+    needs: media-stack
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 下载 media-stack 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: media-stack-windows
+          path: vendor/prebuilt/windows-x86_64
+
+      - name: 获取并校验 ANGLE（libEGL/libGLESv2，BSD-3）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./scripts/fetch-angle.ps1 -OutDir "vendor\prebuilt\windows-x86_64\angle" -Force
+
+      - name: 编译播放器（release）
+        run: cargo build --release -p wp-gui -p wp-cli
+
+      - name: 组装 出\网盘管理-win64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "出\网盘管理-win64"
+          Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          Copy-Item (Join-Path $meta.target_directory "release\网盘管理.exe") $out
+          Copy-Item (Join-Path $meta.target_directory "release\wp-cli.exe") $out -ErrorAction SilentlyContinue
+          Copy-Item docs (Join-Path $out "docs") -Recurse -ErrorAction SilentlyContinue
+          Copy-Item README.md $out -ErrorAction SilentlyContinue
+          New-Item -ItemType File -Path (Join-Path $out "portable") | Out-Null
+          if (Test-Path "assets\icons") {
+            New-Item -ItemType Directory -Force -Path (Join-Path $out "图标") | Out-Null
+            Copy-Item "assets\icons\*" (Join-Path $out "图标") -ErrorAction SilentlyContinue
+          }
+          Write-Host "exe 就位：$(Test-Path (Join-Path $out '网盘管理.exe'))"
+
+      - name: 生成播放器运行时（含 LICENSES/源码获取说明）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./scripts/package-player-runtime-windows.ps1 -Generate `
+            -RuntimeDir "出\网盘管理-win64\播放器运行时" `
+            -PrebuiltDir "vendor\prebuilt\windows-x86_64" -Check -Strict
+          if ($LASTEXITCODE -ne 0) { throw "package-player-runtime-windows.ps1 校验失败" }
+
+      - name: Windows 验收（W1–W7；CI 中 GL 项 SKIP）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $verifyArgs = @(
+            "-RuntimeDir", "出\网盘管理-win64\播放器运行时",
+            "-AppExe", "出\网盘管理-win64\网盘管理.exe",
+            "-OutJson", "出\验收日志\windows-verify-report.json",
+            "-SkipBuild"
+          )
+          $gl = "${{ github.event.inputs.run_gl_verify }}" -eq "true"
+          if (-not $gl) { $verifyArgs += "-SkipGl" }
+          ./scripts/windows-verify.ps1 @verifyArgs
+          # 注：CI 无 GPU/样本时 W1/W3/W4/W5/W6 为 SKIP/WARN，W2/W7 应 PASS；FAIL 时 job 失败
+
+      - name: 打包 zip（含 LICENSES/源码获取说明/验收报告）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Compress-Archive -Path "出\网盘管理-win64\*" -DestinationPath "出\网盘管理-win64.zip" -Force
+          Get-Item "出\网盘管理-win64.zip" | ForEach-Object { Write-Host "zip: $($_.FullName) $($_.Length) B" }
+
+      - name: 上传发行包 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-player-runtime
+          path: |
+            出/网盘管理-win64.zip
+            出/验收日志/windows-verify-report.json
+            出/网盘管理-win64/播放器运行时/LICENSES
+            出/网盘管理-win64/播放器运行时/源码获取说明.txt
+          if-no-files-found: error
+          retention-days: 30

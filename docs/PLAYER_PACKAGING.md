@@ -204,8 +204,9 @@ DLL 来源：
 1. `libmpv-2.dll` 与 FFmpeg/libass/libplacebo 等：MSYS2 UCRT64 下按
    [build-media-stack-windows.ps1](../scripts/build-media-stack-windows.ps1) 构建/收集，放入
    `vendor/prebuilt/windows-x86_64/lib/`；
-2. ANGLE `libEGL.dll`/`libGLESv2.dll`：优先取 **mpv 官方 Windows 发行包**自带的 ANGLE（与 libmpv
-   同源、版本匹配），或自行从 Google ANGLE 源码构建；不建议从 Chromium/Edge 抠（版本不确定）。
+2. ANGLE `libEGL.dll`/`libGLESv2.dll`：**用 `scripts/fetch-angle.ps1` 从固定来源（ANGLE prebuilt，
+   Chrome stable 同源，已 pin 版本 + 归档/DLL sha256）下载并校验**；⚠️ 2026-10 实测 **mpv 官方
+   Windows 发行包已不再自带 ANGLE**（旧方案失效），不建议从 Chromium/Edge 安装目录抠（版本不确定）。
    放 `vendor/prebuilt/windows-x86_64/angle/`，打包脚本会一并复制。
 
 ### 3.2 DLL 加载顺序（关键）
