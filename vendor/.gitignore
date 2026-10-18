@@ -1,0 +1,13 @@
+# 媒体栈二进制不进 git（由 scripts/build-media-stack-*.sh/.ps1 生成）
+# 头文件/许可证/BUILDINFO 进 git（体积小、审计与 LGPL 声明需要）
+prebuilt/**/*.so
+prebuilt/**/*.so.*
+prebuilt/**/*.dylib
+prebuilt/**/*.dll
+prebuilt/**/*.dll.a
+prebuilt/**/*.a
+prebuilt/**/bin/
+.build/
+patches/*.patch.bak
+*.tar.gz
+*.tar.xz

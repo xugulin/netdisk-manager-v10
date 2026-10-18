@@ -25,7 +25,9 @@ wp-stream.workspace = true
 wp-subtitle.workspace = true
 wp-danmaku.workspace = true
 wp-ai.workspace = true
-eframe.workspace = true
+# Mode A 渲染桥（libmpv render API）需要 glow/GL 上下文：启用 eframe glow 后端
+# （NativeOptions.renderer 在 main.rs 里显式选择 Glow）
+eframe = { workspace = true, features = ["glow"] }
 egui.workspace = true
 image.workspace = true
 serde.workspace = true

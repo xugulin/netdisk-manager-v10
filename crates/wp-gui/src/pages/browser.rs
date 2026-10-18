@@ -600,6 +600,11 @@ fn context_menu(ui: &mut Ui, e: &RemoteEntry) -> Option<Action> {
             ui.close();
         }
     } else {
+        // 播放器入口：视频/音频文件右键可直接播放（T5/T15）
+        if crate::pages::player::is_media_file(&e.name) && ui.button("▶ 播放").clicked() {
+            action = Some(Action::Play(e.clone()));
+            ui.close();
+        }
         if ui.button("⬇ 下载").clicked() {
             action = Some(Action::Download(vec![e.path.clone()]));
             ui.close();
@@ -664,6 +669,8 @@ pub enum Action {
     SelectEntry(String, bool),
     ToggleSelect(String),
     Open(RemoteEntry),
+    /// 用播放器打开该媒体文件（右键「▶ 播放」）
+    Play(RemoteEntry),
     OpenTools(ToolsTab),
     LoadThumb(RemoteEntry),
 }
@@ -829,6 +836,7 @@ fn apply(app: &mut App, action: Action) {
             }
         }
         Action::Open(e) => app.open_entry(&e),
+        Action::Play(e) => app.open_player_remote_entry(&e),
         Action::LoadThumb(e) => app.request_thumbnail(&e),
         Action::OpenTools(tab) => {
             app.page = crate::app::Page::Tools;

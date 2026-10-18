@@ -107,6 +107,12 @@ fn main() -> eframe::Result<()> {
                     i += 1;
                 }
             }
+            "--media" => {
+                if let Some(p) = next(i) {
+                    dev.media = Some(std::path::PathBuf::from(p));
+                    i += 1;
+                }
+            }
             other if other.starts_with("--drive=") => {
                 dev.initial_drive = Some(other["--drive=".len()..].to_string());
             }
@@ -169,7 +175,6 @@ fn main() -> eframe::Result<()> {
         .expect("无法创建 tokio runtime");
     let handle = rt.handle().clone();
 
-    let mut initial_app = Some(App::new(paths, cfg, handle, dev));
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title(format!("{} v{}", wp_core::APP_NAME, wp_core::APP_VERSION))
         .with_inner_size([window_size[0].max(960.0), window_size[1].max(600.0)])
@@ -178,6 +183,8 @@ fn main() -> eframe::Result<()> {
         .with_icon(app_icon());
     let options = eframe::NativeOptions {
         viewport,
+        // Mode A：进程内 GL render API 需要 glow 后端（mpv 画面贴进 egui）
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
@@ -191,9 +198,8 @@ fn main() -> eframe::Result<()> {
                 Some(font_custom.as_str())
             };
             fonts::install(&cc.egui_ctx, font_custom);
-            let Some(app) = initial_app.take() else {
-                return Err("应用状态已初始化".into());
-            };
+            // App 在 CreationContext 里创建：播放器需要 GL get_proc_address 建 Mode A 渲染桥。
+            let app = App::new(paths, cfg, handle, dev, cc);
             theme::apply(&cc.egui_ctx, app.theme);
             Ok(Box::new(app))
         }),

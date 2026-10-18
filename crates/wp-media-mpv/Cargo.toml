@@ -11,3 +11,23 @@ wp-media.workspace = true
 libloading.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# RenderBridge（Mode A：进程内 GL render API）所需的 GUI 类型。
+# 默认开；headless/CLI 场景可用 `--no-default-features` 去掉 egui/glow 依赖。
+egui = { workspace = true, optional = true }
+glow = { version = "0.17", optional = true }
+egui_glow = { version = "0.37", optional = true }
+
+[features]
+default = ["render-gl"]
+render-gl = ["dep:egui", "dep:glow", "dep:egui_glow"]
+
+# 仅 examples/render_probe.rs（Mode A 真渲染实验）需要。
+# 关掉默认的 wgpu 后端，避免无关重依赖；xfvb/Windows 均走 glow。
+[dev-dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }

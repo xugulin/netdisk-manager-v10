@@ -240,6 +240,9 @@ pub enum Event {
         key: String,
         result: Result<Vec<u8>, wp_core::Error>,
     },
+    // ── 播放器 ──
+    /// 播放引擎事件（wp_media::PlayerEvent 经 mpsc 回到 UI 线程）
+    Player(wp_media::PlayerEvent),
 }
 
 /// 共享守卫钩子（传输引擎上传前调用）。
@@ -333,6 +336,14 @@ pub enum ConfirmAction {
     CancelTasks { ids: Vec<String> },
 }
 
+/// 本地文件选择器用途：上传 / 播放器选片 / 选择外挂字幕。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerPurpose {
+    Upload,
+    PlayMedia,
+    SubtitleFile,
+}
+
 /// 本地文件选择器。
 pub struct FilePicker {
     pub path: PathBuf,
@@ -341,6 +352,8 @@ pub struct FilePicker {
     pub manual: String,
     pub error: String,
     pub dir_mode: bool,
+    /// 选择器用途（决定确认按钮文案与选中后的动作）
+    pub purpose: FilePickerPurpose,
 }
 
 #[derive(Debug, Clone)]
@@ -488,6 +501,8 @@ pub struct App {
     pub tools: ToolsState,
     /// 文件列表缩略图缓存（图片/视频预览）
     pub thumbs: crate::thumbs::ThumbCache,
+    /// 播放器页状态：引擎句柄 + 快照 + 字幕/弹幕/AI 面板（pages/player）
+    pub player: crate::pages::player::PlayerUi,
     /// 应用 logo 纹理（顶栏 / 关于页；懒加载一次）
     pub logo: Option<egui::TextureHandle>,
     pub guard_new_word: String,
@@ -538,10 +553,18 @@ pub struct DevOptions {
     pub tools_tab: Option<String>,
     /// 验收用：第 4 帧时阻塞等待毫秒数（真实账号截图等待网络数据用）
     pub wait_ms: Option<u64>,
+    /// 验收用：启动即用播放器打开该本地媒体文件（真实 libmpv 播放截图）
+    pub media: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(paths: Paths, cfg: AppConfig, rt: tokio::runtime::Handle, dev: DevOptions) -> Self {
+    pub fn new(
+        paths: Paths,
+        cfg: AppConfig,
+        rt: tokio::runtime::Handle,
+        dev: DevOptions,
+        cc: &eframe::CreationContext<'_>,
+    ) -> Self {
         paths.ensure();
         let cfg_path = paths.config_file();
         // 日志
@@ -614,6 +637,7 @@ impl App {
             })
             .unwrap_or(0);
         let page = match dev.initial_page.as_deref() {
+            Some("player") => Page::Player,
             Some("transfers") => Page::Transfers,
             Some("tools") => Page::Tools,
             Some("settings") => Page::Settings,
@@ -623,6 +647,10 @@ impl App {
             _ => Page::Browser,
         };
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut player = crate::pages::player::PlayerUi::new(event_tx.clone());
+        // 真实 libmpv 引擎 + Mode A 渲染桥：启动时尝试一次；失败回退演示引擎并在状态行提示。
+        // WP_PLAYER_ENGINE=mock 可强制 Mock（无 libmpv 环境/CI 截图）。
+        player.init_real_engine(cc.get_proc_address.clone(), cc.egui_ctx.clone());
         let settings_draft = settings_from_config(&cfg);
         let mut app = Self {
             paths,
@@ -651,6 +679,7 @@ impl App {
                 ..Default::default()
             },
             thumbs: crate::thumbs::ThumbCache::default(),
+            player,
             logo: None,
             guard_new_word: String::new(),
             guard_new_instance_word: String::new(),
@@ -686,6 +715,16 @@ impl App {
         }
         if let Some(name) = app.dev.dialog.clone() {
             app.open_dev_dialog(&name);
+        }
+        // 启动即打开指定本地媒体（验收/截图真实播放用）
+        if let Some(media) = app.dev.media.clone() {
+            app.open_player_local_file(media);
+            // 启动自动打开不弹提示条：截图回归画面要干净
+            app.toasts.clear();
+        } else if app.page == Page::Player {
+            // 播放器页：`--page player` 时自动用演示引擎打开演示媒体（截图回归/验收用）
+            app.open_player_demo();
+            app.toasts.clear();
         }
         app
     }
@@ -1036,6 +1075,9 @@ impl App {
             if let Some(id) = drive_id {
                 self.navigate_drive(&id, &entry.path, true);
             }
+        } else if crate::pages::player::is_media_file(&entry.name) {
+            // 播放器入口：双击/Enter 视频/音频文件直接进播放器页
+            self.open_player_remote_entry(entry);
         } else {
             self.dialog = Some(Dialog::Details(DetailsDialog {
                 entry: entry.clone(),
@@ -1553,6 +1595,7 @@ impl App {
                 Ok(bytes) => self.thumbs.put_raw(&key, bytes),
                 Err(_) => self.thumbs.put_failed(&key),
             },
+            Event::Player(ev) => self.on_player_event(ev),
             Event::PickerListed { path, result } => {
                 if let Some(Dialog::DirPicker(d)) = self.dialog.as_mut() {
                     d.loading = false;
@@ -1600,6 +1643,7 @@ impl eframe::App for App {
         }
         self.frames += 1;
         self.poll_events();
+        self.player.tick(&ctx);
         self.tick_transfers(false);
         self.poll_logs();
         self.thumbs.pump(&ctx);
@@ -1630,43 +1674,49 @@ impl eframe::App for App {
 
         self.handle_shortcuts(&ctx);
 
-        // ── 顶栏：网盘导航 + 账号区
-        egui::Panel::top("topbar")
-            .exact_size(theme::size::TOPBAR_H)
-            .frame(
-                egui::Frame::NONE
-                    .fill(self.theme.nav_bg)
-                    .inner_margin(egui::Margin::symmetric(10, 6)),
-            )
-            .show(ui, |ui| self.topbar(ui));
+        // 播放器伪全屏：隐藏顶栏/底栏/侧栏（页内 chrome 由 player 页自行隐藏）
+        let player_fullscreen = self.page == Page::Player && self.player.fullscreen;
 
-        // ── 底栏：状态
-        egui::Panel::bottom("statusbar")
-            .exact_size(theme::size::STATUSBAR_H)
-            .frame(
-                egui::Frame::NONE
-                    .fill(self.theme.card)
-                    .inner_margin(egui::Margin::symmetric(10, 2)),
-            )
-            .show(ui, |ui| self.statusbar(ui));
+        if !player_fullscreen {
+            // ── 顶栏：网盘导航 + 账号区
+            egui::Panel::top("topbar")
+                .exact_size(theme::size::TOPBAR_H)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(self.theme.nav_bg)
+                        .inner_margin(egui::Margin::symmetric(10, 6)),
+                )
+                .show(ui, |ui| self.topbar(ui));
 
-        // ── 左栏：功能导航
-        egui::Panel::left("sidebar")
-            .exact_size(theme::size::SIDEBAR_W)
-            .resizable(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(self.theme.card)
-                    .inner_margin(egui::Margin::symmetric(8, 10)),
-            )
-            .show(ui, |ui| self.sidebar(ui));
+            // ── 底栏：状态
+            egui::Panel::bottom("statusbar")
+                .exact_size(theme::size::STATUSBAR_H)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(self.theme.card)
+                        .inner_margin(egui::Margin::symmetric(10, 2)),
+                )
+                .show(ui, |ui| self.statusbar(ui));
+
+            // ── 左栏：功能导航
+            egui::Panel::left("sidebar")
+                .exact_size(theme::size::SIDEBAR_W)
+                .resizable(false)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(self.theme.card)
+                        .inner_margin(egui::Margin::symmetric(8, 10)),
+                )
+                .show(ui, |ui| self.sidebar(ui));
+        }
 
         // ── 中央内容
+        let content_margin: i8 = if player_fullscreen { 0 } else { 10 };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(self.theme.bg)
-                    .inner_margin(egui::Margin::same(10)),
+                    .inner_margin(egui::Margin::same(content_margin)),
             )
             .show(ui, |ui| match self.page {
                 Page::Browser => pages::browser::show(self, ui),
@@ -1702,6 +1752,12 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(600));
         }
     }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        // 顺序：先销毁渲染桥（释放 mpv render ctx/FBO/纹理）→ 再停引擎；
+        // 反序会让 mpv 访问已释放的 GL 资源（media-core 明确要求）。
+        self.player.shutdown_all(gl);
+    }
 }
 
 impl App {
@@ -1726,6 +1782,11 @@ impl App {
                 self.file_picker = None;
             }
             return;
+        }
+        // 播放器页快捷键（空格暂停/←→ seek/F 全屏/S 字幕/D 弹幕/Esc 退出全屏）
+        // 仅当没有输入框聚焦时消费，避免与文本框/面板输入冲突。
+        if self.page == Page::Player && !ctx.egui_wants_keyboard_input() {
+            self.player_shortcuts(ctx);
         }
         let (f5, del, enter, backspace, ctrl_f, ctrl_u, ctrl_1_6) = ctx.input(|i| {
             (
@@ -2209,7 +2270,36 @@ impl App {
         let Some(path) = self.dev.screenshot.clone() else {
             return;
         };
-        if self.frames == 8 {
+        // 截图帧可用 WP_SCREENSHOT_FRAME 覆盖（默认 8；真实播放首帧慢时用更大的帧号）
+        let shot_frame: u64 = std::env::var("WP_SCREENSHOT_FRAME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        if self.frames == shot_frame {
+            // 真实播放验收诊断（--media/--page player 截图时输出到 stdout，便于无头排查）
+            if self.page == Page::Player {
+                let snap = self.player.snapshot.clone();
+                let stats = self.player.render.as_ref().map(|render| render.stats());
+                println!(
+                    "PLAYER_DIAG position={:.3} state={:?} hwdec={:?} dropped={} real={} render_stats={:?} render_err={:?}",
+                    snap.position_secs,
+                    snap.state,
+                    snap.hwdec,
+                    snap.dropped_frames,
+                    self.player.is_real_playback(),
+                    stats.map(|s| (
+                        s.paint_calls,
+                        s.frames_rendered,
+                        s.frames_reused,
+                        s.last_update_flags,
+                        s.first_frame
+                    )),
+                    self.player
+                        .render
+                        .as_ref()
+                        .and_then(|render| render.last_error()),
+                );
+            }
             let p = path.clone();
             ctx.request_screenshot(move |img| {
                 let (w, h) = (img.size[0], img.size[1]);
@@ -2245,7 +2335,11 @@ impl App {
                     egui::RichText::new(if picker.dir_mode {
                         "选择目录"
                     } else {
-                        "选择上传文件"
+                        match picker.purpose {
+                            FilePickerPurpose::Upload => "选择上传文件",
+                            FilePickerPurpose::PlayMedia => "选择要播放的本地媒体",
+                            FilePickerPurpose::SubtitleFile => "选择外挂字幕文件",
+                        }
                     })
                     .size(16.0)
                     .strong()
@@ -2299,7 +2393,25 @@ impl App {
             egui::ScrollArea::vertical()
                 .max_height(340.0)
                 .show(ui, |ui| {
-                    for e in &picker.entries {
+                    // 按用途过滤：上传=全部；播放器=仅音视频；字幕=仅字幕文件（目录始终显示）
+                    let entries: Vec<LocalEntry> = picker
+                        .entries
+                        .iter()
+                        .filter(|e| {
+                            e.is_dir
+                                || match picker.purpose {
+                                    FilePickerPurpose::Upload => true,
+                                    FilePickerPurpose::PlayMedia => {
+                                        crate::pages::player::is_media_file(&e.name)
+                                    }
+                                    FilePickerPurpose::SubtitleFile => {
+                                        crate::pages::player::is_subtitle_file(&e.name)
+                                    }
+                                }
+                        })
+                        .cloned()
+                        .collect();
+                    for e in &entries {
                         ui.horizontal(|ui| {
                             if e.is_dir {
                                 if ui
@@ -2349,9 +2461,9 @@ impl App {
                             }
                         });
                     }
-                    if picker.entries.is_empty() {
+                    if entries.is_empty() {
                         ui.label(
-                            egui::RichText::new("（空目录）")
+                            egui::RichText::new("（空目录 / 无匹配文件）")
                                 .size(12.0)
                                 .color(t.text_weak),
                         );
@@ -2367,10 +2479,18 @@ impl App {
                         action = Some(FilePickerAction::PickDir(picker.path.clone()));
                     }
                 } else {
-                    if ui
-                        .button("✓ 上传所选（0）".replace("0", &picker.selected.len().to_string()))
-                        .clicked()
-                    {
+                    let button_label = match picker.purpose {
+                        FilePickerPurpose::Upload => {
+                            format!("✓ 上传所选（{}）", picker.selected.len())
+                        }
+                        FilePickerPurpose::PlayMedia => {
+                            format!("▶ 播放所选（{}）", picker.selected.len())
+                        }
+                        FilePickerPurpose::SubtitleFile => {
+                            format!("✓ 选择字幕（{}）", picker.selected.len())
+                        }
+                    };
+                    if ui.button(button_label).clicked() {
                         action = Some(FilePickerAction::PickFiles(
                             picker.selected.iter().cloned().collect(),
                         ));
@@ -2395,7 +2515,22 @@ impl App {
             }
             Some(FilePickerAction::PickFiles(files)) => {
                 self.file_picker = None;
-                self.enqueue_upload_files(&files);
+                match picker.purpose {
+                    FilePickerPurpose::Upload => self.enqueue_upload_files(&files),
+                    FilePickerPurpose::PlayMedia => match files.first() {
+                        Some(file) => self.open_player_local_file(file.clone()),
+                        None => self.toast(ToastKind::Warn, "未选择要播放的文件"),
+                    },
+                    FilePickerPurpose::SubtitleFile => match files.first() {
+                        Some(file) => {
+                            self.page = Page::Player;
+                            self.player.panel = crate::pages::player::PlayerPanel::Subtitles;
+                            self.player.subtitle.import_path = file.to_string_lossy().to_string();
+                            self.player.subtitle.status = format!("已选择字幕：{}", file.display());
+                        }
+                        None => self.toast(ToastKind::Warn, "未选择字幕文件"),
+                    },
+                }
             }
             None => self.file_picker = Some(picker),
         }
@@ -2423,6 +2558,7 @@ impl App {
             manual: start.to_string_lossy().to_string(),
             error: String::new(),
             dir_mode,
+            purpose: FilePickerPurpose::Upload,
         };
         load_local_dir(&mut picker, &start);
         self.file_picker = Some(picker);
