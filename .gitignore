@@ -11,3 +11,5 @@
 /vendor/prebuilt/
 /播放器运行时/
 /出/播放器运行时/
+# vendored 构建中间产物（FFmpeg/libmpv 源码构建目录）
+/vendor/build/
