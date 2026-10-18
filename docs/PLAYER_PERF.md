@@ -293,6 +293,20 @@ mpv --no-config     --http-header-fields="Cookie: …" --user-agent "…" --refe
 * `--http-header-fields` 注入 Cookie/Referer，`--user-agent` 单独指定（与直链 headers 一致）；
 * 4K HLS 需要 ≥1.5× 码率稳定带宽（60Mbps 4K 码率 → ≥90Mbps 带宽），否则 seek/起播会明显变慢（实测 40% seek 2.2–2.5s/2.2MB 分片）。
 
+### 8.1 HLS 内容码率参考（供 GUI「带宽不足」提示用）
+
+| 源 / 场景 | 文件大小 | 内容时长 | 内容码率 | 分片 |
+|---|---|---|---|---|
+| 夸克 HLS 真机样例（`/video_20260903_171534.mp4`） | 173.7 MB | 98.76 s | **14.07 Mbps** | 22 片，均值 ≈2.16MB / 4.49s |
+| 1080p HLS 常见 | — | — | 8–16 Mbps | — |
+| 4K HLS 常见 | — | — | 40–100 Mbps | — |
+
+判定规则：
+* 稳定播放需 **≥1.5× 内容码率** 的持续带宽；
+* 观测平均拉流带宽 **< 1.2× 内容码率** → 基本可判定「带宽不足」（本机实测：劣化网络 5 分钟 114 分片，平均 **6.12 Mbps** vs 内容 **14.07 Mbps** → 93 次 >1.5s 卡顿，纯带宽不足，非代理/HLS 服务问题）。
+* GUI 启发式（方案 A，无需新字段）：HLS 直连且连续 `Buffering(0<pct<100)` >8s → 状态行提示「网络带宽可能不足：HLS 约需内容码率 1.5× 带宽（1080p≈12–24Mbps / 4K≈60–150Mbps），正在缓冲…」，恢复 Playing 自动清除。
+* 精确版（方案 B）需要 mpv `cache-speed`（bytes/s）→ 由 wp-media-mpv 发 `CacheState/avg_mbps` 事件，wp-stream 不参与 HLS 直连、不在本 crate 范围。
+
 ---
 
 ## 9. 上游权限类 4xx 连续失败熔断（task-21）
