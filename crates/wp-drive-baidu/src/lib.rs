@@ -13,8 +13,10 @@
 //! * 回收站走 `/api/recycle/list/` 与 `/api/recycle/restore`；彻底删除/清空
 //!   会触发 132 短信风控，Python 源码刻意不自动化，这里同样不实现。
 //! * 分类浏览走 `/api/categorylist`；分享校验/转存走 verify → list → transfer。
-//! * 云添加只实现只读 `cloud_dl?method=list_task`（HAR 有完整请求/响应样本）；
-//!   新建离线任务的参数未抓到，`cloud_add` 保持 Unsupported。
+//! * 云添加：创建走 `cloud_dl?method=add_task`（真机反推，错误字段是
+//!   `error_code`），列表走 `method=list_task`；详见 `cloud.rs` 顶部注释。
+//! * 缩略图：条目从响应 `thumbs` 提取 URL，`fetch_thumbnail` 用会话 Cookie
+//!   拉取 CDN 原始字节（详见 `files.rs`）。
 //!
 //! 对外唯一入口是 [`create`]。
 
@@ -276,8 +278,8 @@ impl Drive for BaiduDrive {
             recycle_restore: true,
             recycle_delete: false,
             recycle_clear: false,
-            // 云添加：HAR 只抓到 list_task/query_task 只读参数，创建参数缺失。
-            cloud_add: false,
+            // 云添加：创建参数已真机反推通过服务端校验（见 cloud.rs）。
+            cloud_add: true,
             // 只读任务列表可安全实现（请求参数见 cloud.rs）。
             cloud_tasks: true,
             // Python 源码里上传记录是 NotImplemented 占位。
@@ -409,8 +411,16 @@ impl Drive for BaiduDrive {
         recycle::restore(self, ids).await
     }
 
+    async fn cloud_add(&self, url: &str, dest_dir: &str) -> Result<String> {
+        cloud::add_task(self, url, dest_dir).await
+    }
+
     async fn cloud_tasks(&self) -> Result<Vec<CloudTask>> {
         cloud::list_tasks(self).await
+    }
+
+    async fn fetch_thumbnail(&self, entry: &RemoteEntry) -> Result<Vec<u8>> {
+        files::fetch_thumbnail(self, entry).await
     }
 
     async fn category_list(&self, category: &str) -> Result<Vec<RemoteEntry>> {
@@ -420,7 +430,6 @@ impl Drive for BaiduDrive {
     // 刻意不覆写（保持 trait 默认的 Unsupported）：
     // * recycle_delete / recycle_clear：百度首次调用必触发 errno:132 短信验证，
     //   客户端无法绕过（`回收站接口.py` 明确不提供自动化方法）；
-    // * cloud_add：创建离线任务的参数未抓到，不臆造；
     // * upload_records：Python 源码为 NotImplemented 占位。
 
     async fn write_probe(&self) -> Result<String> {

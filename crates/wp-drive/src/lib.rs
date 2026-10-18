@@ -375,6 +375,15 @@ pub trait Drive: Send + Sync {
         Err(Error::unsupported("该网盘不支持转存分享"))
     }
 
+    // ───────────── 缩略图 ─────────────
+    /// 拉取条目的缩略图原始字节（PNG/JPEG）。
+    ///
+    /// 默认不支持；适配器用自己会话的 Cookie 去服务端 CDN 取（兼容签名/鉴权）。
+    /// 条目通常带 `RemoteEntry.thumbnail`，没有该字段说明不可预览。
+    async fn fetch_thumbnail(&self, _entry: &RemoteEntry) -> Result<Vec<u8>> {
+        Err(Error::unsupported("该网盘不支持缩略图"))
+    }
+
     // ───────────── 分类浏览 ─────────────
     /// 按分类列出全盘文件。`category` 取值：video/audio/image/doc/app/other/all。
     async fn category_list(&self, _category: &str) -> Result<Vec<RemoteEntry>> {

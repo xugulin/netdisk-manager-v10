@@ -232,6 +232,11 @@ pub enum Event {
         drive: String,
         result: Result<Vec<RemoteEntry>, wp_core::Error>,
     },
+    // ── 缩略图 ──
+    ThumbLoaded {
+        key: String,
+        result: Result<Vec<u8>, wp_core::Error>,
+    },
 }
 
 /// 共享守卫钩子（传输引擎上传前调用）。
@@ -478,6 +483,8 @@ pub struct App {
     pub settings_draft: SettingsDraft,
     pub settings_draft_kind: DriveKind,
     pub tools: ToolsState,
+    /// 文件列表缩略图缓存（图片/视频预览）
+    pub thumbs: crate::thumbs::ThumbCache,
     pub guard_new_word: String,
     pub guard_new_instance_word: String,
     pub loading_accounts: bool,
@@ -524,6 +531,8 @@ pub struct DevOptions {
     pub initial_path: Option<String>,
     /// 验收用：工具页默认标签（recycle/cloud/records/shares/categories）
     pub tools_tab: Option<String>,
+    /// 验收用：第 4 帧时阻塞等待毫秒数（真实账号截图等待网络数据用）
+    pub wait_ms: Option<u64>,
 }
 
 impl App {
@@ -636,6 +645,7 @@ impl App {
                 tab: Some(ToolsTab::Recycle),
                 ..Default::default()
             },
+            thumbs: crate::thumbs::ThumbCache::default(),
             guard_new_word: String::new(),
             guard_new_instance_word: String::new(),
             loading_accounts: false,
@@ -679,7 +689,9 @@ impl App {
         let drive = self.active_drive_id();
         let sample = RemoteEntry::file("示例影片-4K.mp4", "/影视/示例影片-4K.mp4", 4_500_000_000)
             .with_id("fake-0000")
-            .with_modified(wp_core::util::now_ts() - 86400);
+            .with_modified(wp_core::util::now_ts() - 86400)
+            // 验收截图：详情弹窗里展示缩略图预览（演示盘支持）
+            .with_thumbnail(Some("demo-thumb://影视/示例影片-4K.mp4".into()));
         match name {
             "login" => self.open_login_dialog(),
             "newfolder" => {
@@ -1531,6 +1543,10 @@ impl App {
                     Err(e) => self.tools.categories.error = e.to_string(),
                 }
             }
+            Event::ThumbLoaded { key, result } => match result {
+                Ok(bytes) => self.thumbs.put_raw(&key, bytes),
+                Err(_) => self.thumbs.put_failed(&key),
+            },
             Event::PickerListed { path, result } => {
                 if let Some(Dialog::DirPicker(d)) = self.dialog.as_mut() {
                     d.loading = false;
@@ -1580,6 +1596,13 @@ impl eframe::App for App {
         self.poll_events();
         self.tick_transfers(false);
         self.poll_logs();
+        self.thumbs.pump(&ctx);
+        // 验收模式：第 4 帧阻塞等待网络数据（真实账号截图时让列表/缩略图先加载完）
+        if self.frames == 4 {
+            if let Some(ms) = self.dev.wait_ms {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
 
         // 主题切换
         if self.applied_theme != self.theme.name {
@@ -2563,6 +2586,35 @@ impl App {
             Event::CategoriesListed {
                 drive: id,
                 result: drive.category_list(&category).await,
+            }
+        });
+    }
+
+    /// 请求条目缩略图（异步；已缓存/加载中/不支持则忽略）。
+    pub fn request_thumbnail(&mut self, entry: &RemoteEntry) {
+        if !crate::thumbs::ThumbCache::is_candidate(entry) {
+            return;
+        }
+        let drive_id = self.active_drive_id();
+        if drive_id.is_empty() {
+            return;
+        }
+        let key = crate::thumbs::ThumbCache::key(&drive_id, entry);
+        if !self.thumbs.need(&key) {
+            return;
+        }
+        let Some(slot) = self.slot_by_id(&drive_id) else {
+            return;
+        };
+        let Some(drive) = slot.drive.clone() else {
+            return;
+        };
+        self.thumbs.mark_loading(&key);
+        let entry = entry.clone();
+        self.spawn(async move {
+            Event::ThumbLoaded {
+                key,
+                result: drive.fetch_thumbnail(&entry).await,
             }
         });
     }

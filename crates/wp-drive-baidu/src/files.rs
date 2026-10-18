@@ -9,12 +9,14 @@
 //! * 删除/移动/复制返回 `taskid`，用 `/share/taskquery` 轮询。
 
 use crate::http::ReqOpts;
-use crate::{err_text, BaiduDrive};
+use crate::{err_text, BaiduDrive, UA};
+use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, COOKIE, REFERER, USER_AGENT};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use wp_core::model::{OpReport, RemoteEntry};
 use wp_core::util::{base_name, join_path, norm_path, parent_path};
 use wp_core::{Error, Result};
+use wp_net::client::net_err;
 
 fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
@@ -22,6 +24,119 @@ fn p(key: &str, value: impl Into<String>) -> (String, String) {
 
 fn json_text(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+}
+
+/// 缩略图请求超时（秒）。
+const THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(20);
+/// 缩略图响应上限：5 MiB（超过按错误处理，避免异常 URL 拖垮进程）。
+const THUMBNAIL_MAX_BYTES: usize = 5 * 1024 * 1024;
+/// `thumbs` 键优先级，与 Python 源 `取缩略图URL` 一致。
+const THUMBNAIL_KEYS: [&str; 6] = ["icon", "url3", "url2", "url1", "small", "middle"];
+
+/// 从文件对象的 `thumbs` 字典提取缩略图 URL。
+///
+/// 实测（2026-10-18，`/api/list` / `/api/categorylist` / `/api/filemetas`）：
+/// 结构形如 `thumbs = {"icon": "https://thumbnail0.baidupcs.com/thumbnail/..."}`，
+/// 仅图片/视频等部分文件带该字段；键优先级同 Python 源。
+///
+/// 部分响应里的 URL 是“二次转义”的：JSON 解码后仍残留字面量 `\u0026`
+/// （反斜杠 + u0026，而不是 `&`），这里统一还原，否则拼出的签名 URL 打不开。
+pub(crate) fn thumbnail_from_value(v: &Value) -> Option<String> {
+    let thumbs = v.get("thumbs")?.as_object()?;
+    let url = THUMBNAIL_KEYS
+        .iter()
+        .find_map(|key| thumbs.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            // 兜底：优先键都没有时取第一个非空字符串值（对应 Python 的 values()）。
+            thumbs
+                .values()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .map(str::to_string)
+        })?;
+    Some(url.replace("\\u0026", "&"))
+}
+
+/// 拉取条目缩略图的原始字节（PNG/JPEG）。
+///
+/// 百度返回的是带签名/鉴权的绝对 CDN URL；这里用适配器自己的 HTTP 客户端，
+/// 带上当前会话 Cookie + 通用 UA/Referer 请求，避免签名 URL 对来源的校验。
+pub(crate) async fn fetch_thumbnail(d: &BaiduDrive, entry: &RemoteEntry) -> Result<Vec<u8>> {
+    let url = entry
+        .thumbnail
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::unsupported("该文件无缩略图"))?;
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(Error::other(format!(
+            "缩略图地址不是绝对 HTTP URL：{}",
+            url.chars().take(200).collect::<String>()
+        )));
+    }
+
+    let mut req = d
+        .http
+        .api
+        .get(url)
+        .header(ACCEPT, "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+        .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+        .header(USER_AGENT, UA)
+        .header(REFERER, "https://pan.baidu.com/disk/main")
+        .timeout(THUMBNAIL_TIMEOUT);
+    let cookie = d.cookie_header();
+    if !cookie.is_empty() {
+        req = req.header(COOKIE, cookie);
+    }
+
+    let resp = req.send().await.map_err(net_err)?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(240).collect();
+        return Err(Error::server(
+            status as i64,
+            if snippet.trim().is_empty() {
+                format!("缩略图请求失败：HTTP {status}")
+            } else {
+                format!("缩略图请求失败：HTTP {status}：{snippet}")
+            },
+        ));
+    }
+    if let Some(len) = resp.content_length() {
+        if len as usize > THUMBNAIL_MAX_BYTES {
+            return Err(Error::server(
+                -1,
+                format!("缩略图过大（{len} 字节，上限 5 MiB）"),
+            ));
+        }
+    }
+
+    // 分块读取并累计校验，防止无 Content-Length 的响应无限增长。
+    let mut resp = resp;
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(net_err)? {
+        if out.len() + chunk.len() > THUMBNAIL_MAX_BYTES {
+            return Err(Error::server(
+                -1,
+                format!(
+                    "缩略图超过 5 MiB 上限（已读取 {} 字节）",
+                    out.len() + chunk.len()
+                ),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    if out.is_empty() {
+        return Err(Error::server(-1, "缩略图响应为空（HTTP 200）"));
+    }
+    wp_core::log_debug!("百度", "缩略图拉取成功：{url}（{} 字节）", out.len());
+    Ok(out)
 }
 
 /// 根目录条目。
@@ -34,6 +149,7 @@ pub(crate) fn root_entry() -> RemoteEntry {
         size: 0,
         modified: None,
         created: None,
+        thumbnail: None,
         raw: None,
     }
 }
@@ -104,6 +220,9 @@ pub(crate) fn entry_from_value(v: &Value, fallback_dir: &str) -> Option<RemoteEn
         size,
         modified,
         created,
+        // `/api/list`、`/api/categorylist`、`/api/filemetas` 的条目都可能带
+        // `thumbs`；目录即使带也保留（上层是否展示由 UI 决定）。
+        thumbnail: thumbnail_from_value(v),
         raw: Some(v.clone()),
     })
 }
@@ -440,6 +559,7 @@ pub(crate) async fn rename(d: &BaiduDrive, path: &str, new_name: &str) -> Result
             size: old.size,
             modified: old.modified,
             created: old.created,
+            thumbnail: None,
             raw: old.raw,
         }),
         Err(e) => Err(e),
@@ -617,5 +737,90 @@ mod tests {
         assert_eq!(task_id_of(&json!({"taskid": 12345})), Some("12345".into()));
         assert_eq!(task_id_of(&json!({"task_id": "abc"})), Some("abc".into()));
         assert_eq!(task_id_of(&json!({})), None);
+    }
+
+    #[test]
+    fn thumbnail_priority_and_literal_u0026_unescape() {
+        // 键优先级：icon > url3 > url2 > url1 > small > middle。
+        let cases = [
+            (
+                json!({
+                    "icon": "https://thumbnail0.baidupcs.com/thumbnail/icon.jpg",
+                    "url3": "https://thumbnail0.baidupcs.com/thumbnail/url3.jpg",
+                    "url2": "https://thumbnail0.baidupcs.com/thumbnail/url2.jpg",
+                    "small": "https://thumbnail0.baidupcs.com/thumbnail/small.jpg"
+                }),
+                "https://thumbnail0.baidupcs.com/thumbnail/icon.jpg",
+            ),
+            (json!({"url3": "u3", "url2": "u2", "url1": "u1"}), "u3"),
+            (json!({"url2": "u2", "url1": "u1"}), "u2"),
+            (json!({"url1": "u1", "small": "s", "middle": "m"}), "u1"),
+            (json!({"small": "s", "middle": "m"}), "s"),
+            (json!({"middle": "m"}), "m"),
+        ];
+        for (thumbs, expect) in cases {
+            let v = json!({"server_filename": "x.jpg", "path": "/x.jpg", "thumbs": thumbs});
+            assert_eq!(thumbnail_from_value(&v).as_deref(), Some(expect));
+        }
+
+        // 二次转义残留的字面量 `\u0026` 必须还原成 `&`，否则签名 URL 打不开。
+        let v = json!({
+            "server_filename": "看海.jpg",
+            "path": "/图片/看海.jpg",
+            "isdir": 0,
+            "thumbs": {
+                "icon": "https://thumbnail0.baidupcs.com/thumbnail/a.jpg?fid=1\\u0026time=2\\u0026sign=abc"
+            }
+        });
+        let entry = entry_from_value(&v, "/图片").unwrap();
+        let thumb = entry.thumbnail.unwrap();
+        assert_eq!(
+            thumb,
+            "https://thumbnail0.baidupcs.com/thumbnail/a.jpg?fid=1&time=2&sign=abc"
+        );
+        assert!(!thumb.contains("\\u0026"));
+    }
+
+    #[test]
+    fn thumbnail_absent_or_degenerate_is_none() {
+        let v = json!({"server_filename": "a.txt", "path": "/a.txt", "isdir": 0});
+        assert!(entry_from_value(&v, "/").unwrap().thumbnail.is_none());
+        assert!(thumbnail_from_value(&json!({"thumbs": {}})).is_none());
+        assert!(thumbnail_from_value(&json!({"thumbs": "not-an-object"})).is_none());
+        assert!(thumbnail_from_value(&json!({"thumbs": {"icon": "   "}})).is_none());
+        // 优先键都没值时，兜底取第一个非空值（与 Python values() 兜底一致）。
+        assert_eq!(
+            thumbnail_from_value(&json!({"thumbs": {"other": "https://x/y"}})).as_deref(),
+            Some("https://x/y")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_thumbnail_without_url_is_readable_error() {
+        // 构造一个不会发请求的驱动实例：无缩略图/非 HTTP URL 都在联网前返回。
+        let d = BaiduDrive {
+            id: "test".into(),
+            name: "测试".into(),
+            data_dir: std::env::temp_dir(),
+            session: std::sync::Mutex::new(Default::default()),
+            qr: std::sync::Mutex::new(None),
+            dir_cache: std::sync::Mutex::new(Default::default()),
+            domain: std::sync::Mutex::new(None),
+            http: crate::http::Http::new().unwrap(),
+        };
+        let mut entry = RemoteEntry::file("a.txt", "/a.txt", 1);
+        let err = fetch_thumbnail(&d, &entry).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "实际：{err:?}");
+        assert!(err.to_string().contains("缩略图"), "实际：{err}");
+
+        // 空白缩略图 URL 同样按“无缩略图”处理。
+        entry.thumbnail = Some("  ".into());
+        let err = fetch_thumbnail(&d, &entry).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "实际：{err:?}");
+
+        // 非绝对 HTTP(S) 地址给出可读错误，且不发起请求。
+        entry.thumbnail = Some("ftp://example.invalid/x.jpg".into());
+        let err = fetch_thumbnail(&d, &entry).await.unwrap_err();
+        assert!(err.to_string().contains("绝对 HTTP URL"), "实际：{err}");
     }
 }

@@ -376,6 +376,40 @@ async fn dispatch(drive: &dyn Drive, cmd: &str, args: &[String]) -> i32 {
                 Err(e) => fail(e),
             }
         }
+        "thumb" => match (args.first(), args.get(1)) {
+            (Some(remote), Some(out)) => {
+                let path = wp_core::util::norm_path(remote);
+                match drive.stat(&path).await {
+                    Ok(mut entry) => {
+                        // 有些网盘的 stat(filemetas) 响应不含缩略图字段，列表接口才带；
+                        // 这里用父目录列表做一次兜底（只多一次列表请求）。
+                        if entry.thumbnail.is_none() && !entry.is_dir {
+                            let parent = wp_core::util::parent_path(&path);
+                            if let Ok(list) = drive.list(&parent).await {
+                                if let Some(found) = list.into_iter().find(|e| e.path == path) {
+                                    entry = found;
+                                }
+                            }
+                        }
+                        match drive.fetch_thumbnail(&entry).await {
+                            Ok(bytes) => {
+                                if let Err(e) = std::fs::write(out, &bytes) {
+                                    return fail(wp_core::Error::Io(e));
+                                }
+                                print_json(&serde_json::json!({
+                                    "文件": path,
+                                    "字节": bytes.len(),
+                                    "输出": out,
+                                }))
+                            }
+                            Err(e) => fail(e),
+                        }
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+            _ => usage("thumb <远端路径> <输出.png>"),
+        },
         "shares" => match drive.list_shares().await {
             Ok(list) => print_json(&list),
             Err(e) => fail(e),
@@ -668,6 +702,7 @@ fn print_help() {
   cloud-tasks                     云任务列表
   records [N]                     上传记录 / 操作记录
   categories [video|audio|image|doc|app|other|all]  按分类列全盘文件（百度）
+  thumb <远端路径> <输出.png>      下载条目缩略图（图片/视频）
   write-probe                     写权限探测
 
 输出：结构化结果一律 JSON（stdout）；进度/错误走 stderr。

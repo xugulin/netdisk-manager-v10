@@ -104,6 +104,9 @@ pub struct RemoteEntry {
     /// 创建时间（Unix 秒）
     #[serde(default)]
     pub created: Option<i64>,
+    /// 缩略图 URL（图片/视频/文档预览；各家服务端给的是带签名的 CDN 地址）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
     /// 原始响应（调试/字段缺失兜底用，不持久化到任务库）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<serde_json::Value>,
@@ -131,6 +134,12 @@ impl RemoteEntry {
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// 设置缩略图 URL（链式调用，供适配器构造条目时使用）。
+    pub fn with_thumbnail(mut self, url: Option<String>) -> Self {
+        self.thumbnail = url.filter(|s| !s.trim().is_empty());
         self
     }
 

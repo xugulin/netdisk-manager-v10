@@ -762,6 +762,32 @@ fn details(app: &mut App, ctx: &egui::Context, d: DetailsDialog) -> Option<Dialo
         ui.set_width(520.0);
         title_row(ui, &t, "文件详情", &mut close);
         ui.add_space(4.0);
+        // 缩略图预览（图片/视频等有 thumbnail 的条目）
+        if crate::thumbs::ThumbCache::is_candidate(&d.entry) {
+            let drive_id = app.active_drive_id();
+            let key = crate::thumbs::ThumbCache::key(&drive_id, &d.entry);
+            if !app.thumbs.has(&key) {
+                app.request_thumbnail(&d.entry);
+            }
+            match app.thumbs.texture(&key).cloned() {
+                Some(tex) => {
+                    let size = tex.size_vec2();
+                    let scale = (240.0 / size.x).min(170.0 / size.y).min(1.0);
+                    let target = size * scale;
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                        tex.id(),
+                        target,
+                    )));
+                    ui.add_space(6.0);
+                }
+                None => {
+                    if !app.thumbs.has(&key) {
+                        ui.label(RichText::new("缩略图加载中…").size(12.0).color(t.text_weak));
+                        ui.add_space(2.0);
+                    }
+                }
+            }
+        }
         widgets::kv_row(ui, &t, "名称", &d.entry.name);
         widgets::kv_row(ui, &t, "路径", &d.entry.path);
         widgets::kv_row(ui, &t, "类型", if d.entry.is_dir { "目录" } else { "文件" });
@@ -810,8 +836,12 @@ fn details(app: &mut App, ctx: &egui::Context, d: DetailsDialog) -> Option<Dialo
             }
         });
     });
-    let _ = close;
-    None
+    // 修复：之前恒返回 None，导致详情弹窗只显示一帧就被关闭
+    if close {
+        None
+    } else {
+        Some(Dialog::Details(d))
+    }
 }
 
 // ═══════════════════════════ 跨盘传输 ═══════════════════════════

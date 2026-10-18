@@ -164,6 +164,27 @@ pub(crate) fn gen_logid() -> String {
 
 /// 解析 JSON 响应。非 2xx 在调用方先处理；这里把“响应不是合法 JSON”
 /// 归为服务端错误（可读片段），与 Python 版的“接口错误”对齐。
+/// 非 2xx 响应里也可能带业务错误 JSON（实测百度 `cloud_dl add_task` 返回
+/// HTTP 403 + `{"error_code":36009,...}`）。能解析出业务错误码时优先按业务
+/// 错误返回，避免把"空间不足"显示成一句 "HTTP 403"。
+pub(crate) fn business_error_from_body(text: &str) -> Option<Error> {
+    let v: Value = serde_json::from_str(text.trim()).ok()?;
+    if let Some(code) = v.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            return Some(Error::server(
+                code,
+                crate::cloud::cloud_add_error_message(code, &v),
+            ));
+        }
+    }
+    if let Some(code) = v.get("errno").and_then(Value::as_i64) {
+        if code != 0 {
+            return Some(map_errno(code, &v));
+        }
+    }
+    None
+}
+
 pub(crate) fn parse_json_body(status: u16, text: &str) -> Result<Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -339,6 +360,9 @@ impl BaiduDrive {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            if let Some(err) = business_error_from_body(&body) {
+                return Err(err);
+            }
             return Err(http_status_error(status.as_u16(), &body));
         }
         let text = resp.text().await.map_err(net_err)?;

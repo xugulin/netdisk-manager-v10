@@ -17,6 +17,7 @@ use wp_core::util::{base_name, breadcrumb, parent_path};
 
 /// 浏览页轻量快照（Arc 共享条目，克隆代价低）。
 struct Snap {
+    drive_id: String,
     path: String,
     entries: Arc<Vec<RemoteEntry>>,
     selected: BTreeSet<String>,
@@ -32,6 +33,7 @@ struct Snap {
 fn snap(app: &App, drive_id: &str) -> Option<Snap> {
     let s: &BrowseState = app.browse_ref(drive_id)?;
     Some(Snap {
+        drive_id: drive_id.to_string(),
         path: s.path.clone(),
         entries: s.entries.clone(),
         selected: s.selected.clone(),
@@ -505,15 +507,37 @@ fn file_table(
                 }
                 x += check_w;
 
-                // 图标 + 名称
-                let icon = widgets::file_icon(e.is_dir, &e.name);
-                ui.painter().text(
-                    egui::pos2(x, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    icon,
-                    egui::FontId::proportional(14.0),
-                    t.text,
-                );
+                // 图标 / 缩略图
+                let thumb_key = crate::thumbs::ThumbCache::key(&s.drive_id, e);
+                let thumb_tex = app.thumbs.texture(&thumb_key);
+                if let Some(tex) = thumb_tex {
+                    let trect = egui::Rect::from_center_size(
+                        egui::pos2(x + 9.0, rect.center().y),
+                        Vec2::splat(18.0),
+                    );
+                    ui.painter().image(
+                        tex.id(),
+                        trect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    let icon = widgets::file_icon(e.is_dir, &e.name);
+                    ui.painter().text(
+                        egui::pos2(x, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        icon,
+                        egui::FontId::proportional(14.0),
+                        t.text,
+                    );
+                    // 视口内且未缓存 → 请求缩略图（每帧限并发，由缓存控制）
+                    if crate::thumbs::ThumbCache::is_candidate(e)
+                        && !app.thumbs.has(&thumb_key)
+                        && rect.intersects(ui.clip_rect())
+                    {
+                        actions.push(Action::LoadThumb(e.clone()));
+                    }
+                }
                 let max_chars = ((name_w - 24.0) / 7.6).max(4.0) as usize;
                 ui.painter().text(
                     egui::pos2(x + 22.0, rect.center().y),
@@ -641,6 +665,7 @@ pub enum Action {
     ToggleSelect(String),
     Open(RemoteEntry),
     OpenTools(ToolsTab),
+    LoadThumb(RemoteEntry),
 }
 
 fn apply(app: &mut App, action: Action) {
@@ -804,6 +829,7 @@ fn apply(app: &mut App, action: Action) {
             }
         }
         Action::Open(e) => app.open_entry(&e),
+        Action::LoadThumb(e) => app.request_thumbnail(&e),
         Action::OpenTools(tab) => {
             app.page = crate::app::Page::Tools;
             app.tools.tab = Some(tab);

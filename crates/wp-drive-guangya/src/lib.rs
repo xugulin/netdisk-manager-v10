@@ -24,7 +24,8 @@
 //! * 回收站列表 / 清空、云添加任务创建 / 列表、上传/操作记录；
 //! * 上传：MD5 → `get_res_center_token` → OSS V1 签名单 PUT（小文件）或
 //!   multipart（大文件）→ 业务完成确认 → 轮询任务；
-//! * 下载：取签名直链 → 单连接断点续传 / 多段并发（`wp-net` 下载器）。
+//! * 下载：取签名直链 → 单连接断点续传 / 多段并发（`wp-net` 下载器）；
+//! * 缩略图：列表条目映射 `thumbnail` URL，按需下载原始字节（5 MB 上限）。
 //!
 //! 不支持的 Drive 能力（无服务端接口）：重命名、移动/复制、搜索、回收站单项
 //! 恢复/彻底删除、分享解析/转存、分类浏览。
@@ -44,6 +45,7 @@ mod recycle;
 mod session;
 mod share;
 mod sign;
+mod thumbnail;
 mod upload;
 
 use async_trait::async_trait;
@@ -443,6 +445,10 @@ impl Drive for GuangyaDrive {
         download::download(self, remote, local, opts, progress).await
     }
 
+    async fn fetch_thumbnail(&self, entry: &wp_core::model::RemoteEntry) -> Result<Vec<u8>> {
+        thumbnail::fetch(self, entry).await
+    }
+
     async fn upload(
         &self,
         local: &std::path::Path,
@@ -715,6 +721,35 @@ mod tests {
         let err = drive.account().await.unwrap_err();
         assert!(err.is_auth());
         assert!(dir.join("device.json").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fetch_thumbnail_without_field_is_readable() {
+        let dir = std::env::temp_dir().join(format!(
+            "wp-gy-thumb-{}-{}",
+            std::process::id(),
+            wp_core::util::random_hex(4)
+        ));
+        let drive = create(DriveInit {
+            id: "guangya-thumb-test".into(),
+            name: String::new(),
+            data_dir: dir.clone(),
+            threads: 0,
+            verbose: false,
+        })
+        .unwrap();
+
+        // 没有 thumbnail / 空白 thumbnail 都必须在发请求前返回可读错误。
+        let mut entry = wp_core::model::RemoteEntry::file("a.jpg", "/a.jpg", 1);
+        for bad in [None, Some(String::new()), Some("   ".into())] {
+            entry.thumbnail = bad;
+            let err = drive.fetch_thumbnail(&entry).await.unwrap_err();
+            assert!(
+                err.to_string().contains("该文件无缩略图"),
+                "错误信息应可读：{err}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

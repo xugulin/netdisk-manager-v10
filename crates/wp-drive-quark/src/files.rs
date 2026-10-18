@@ -129,6 +129,7 @@ pub(crate) fn map_entry(raw: &Value, dir_path: &str) -> Option<RemoteEntry> {
     };
     let modified = parse_timestamp_secs(raw.get("updated_at").or_else(|| raw.get("created_at")));
     let created = parse_timestamp_secs(raw.get("created_at"));
+    let thumbnail = crate::thumbnail::thumbnail_from_raw(raw);
     Some(RemoteEntry {
         id: fid,
         name: name.clone(),
@@ -137,6 +138,7 @@ pub(crate) fn map_entry(raw: &Value, dir_path: &str) -> Option<RemoteEntry> {
         size,
         modified,
         created,
+        thumbnail,
         raw: Some(raw.clone()),
     })
 }
@@ -504,6 +506,7 @@ impl QuarkDrive {
                     size: old.size,
                     modified: old.modified,
                     created: old.created,
+                    thumbnail: old.thumbnail,
                     raw: old.raw,
                 })
             }
@@ -720,5 +723,27 @@ mod tests {
         assert!(!e.is_dir);
         assert_eq!(e.size, 42);
         assert_eq!(map_entry(&json!({"fid":"x"}), "/"), None);
+    }
+
+    #[test]
+    fn map_entry_extracts_thumbnail() {
+        let raw = json!({
+            "fid": "f9",
+            "file_name": "p.jpg",
+            "file_type": 1,
+            "size": "1024",
+            "thumbnail": "https://cdn.example/p.jpg?sign=1\\u0026t=2",
+        });
+        let e = map_entry(&raw, "/图片").unwrap();
+        assert_eq!(
+            e.thumbnail.as_deref(),
+            Some("https://cdn.example/p.jpg?sign=1&t=2")
+        );
+
+        // 空串 / 缺失都当作没有缩略图。
+        let blank = json!({"fid":"f10","file_name":"a.bin","thumbnail":""});
+        assert_eq!(map_entry(&blank, "/").unwrap().thumbnail, None);
+        let missing = json!({"fid":"f11","file_name":"b.bin"});
+        assert_eq!(map_entry(&missing, "/").unwrap().thumbnail, None);
     }
 }

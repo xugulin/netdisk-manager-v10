@@ -164,8 +164,23 @@ pub(crate) fn entry_from_value(v: &Value, parent_path: &str) -> Option<RemoteEnt
         size,
         modified,
         created,
+        thumbnail: thumbnail_from_value(v),
         raw: Some(v.clone()),
     })
+}
+
+/// 取条目里的缩略图 URL（HAR 确认字段名 `thumbnail`，见 Python
+/// `文件接口.py:287-294`）。
+///
+/// 光鸭返回的 URL 里常出现**字面量** `\u0026`（反斜杠 + `u0026` 文本，不是 JSON
+/// 转义），必须还原成 `&`，否则查询参数会整段粘在第一个 `\u0026` 后面。
+/// 空串/纯空白视为没有缩略图（与 Python 源的真值判断一致）。
+pub(crate) fn thumbnail_from_value(v: &Value) -> Option<String> {
+    let raw = v.get("thumbnail").and_then(Value::as_str)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.replace("\\u0026", "&"))
 }
 
 /// 解析目录：返回带 `id` 的目录条目；根目录 id 为空串。
@@ -340,6 +355,34 @@ mod tests {
         assert_eq!(e.size, 12345, "字符串大小要能解析");
         assert_eq!(e.modified, Some(1_700_000_000), "毫秒要转秒");
         assert!(e.raw.is_some());
+    }
+
+    #[test]
+    fn entry_mapping_thumbnail() {
+        // HAR 里是字面量 \u0026（反斜杠 + u0026），要还原成 &。
+        let v = json!({
+            "fileId":"img1","fileName":"封面.jpg","resType":1,
+            "thumbnail":"https://cdn.guangyapan.com/t/abc.jpg?x=1\\u0026y=2\\u0026z=3"
+        });
+        let e = entry_from_value(&v, "/相册").unwrap();
+        assert_eq!(
+            e.thumbnail.as_deref(),
+            Some("https://cdn.guangyapan.com/t/abc.jpg?x=1&y=2&z=3")
+        );
+
+        // 没有字段 -> None
+        let e = entry_from_value(&json!({"fileName":"a.txt","resType":1}), "/").unwrap();
+        assert!(e.thumbnail.is_none());
+
+        // 空串 / 纯空白 -> None
+        for bad in ["", "   ", "\t\n"] {
+            let e = entry_from_value(
+                &json!({"fileName":"b.jpg","resType":1,"thumbnail":bad}),
+                "/",
+            )
+            .unwrap();
+            assert!(e.thumbnail.is_none(), "空缩略图 {bad:?} 应按无处理");
+        }
     }
 
     #[test]

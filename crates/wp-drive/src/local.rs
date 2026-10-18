@@ -80,6 +80,7 @@ impl LocalDrive {
             size: if meta.is_dir() { 0 } else { meta.len() },
             modified,
             created: None,
+            thumbnail: None,
             raw: None,
         }
     }

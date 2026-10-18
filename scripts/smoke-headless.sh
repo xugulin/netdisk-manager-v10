@@ -80,6 +80,7 @@ run_case "19-工具-云任务"    --drive demo --page tools --tools-tab cloud
 run_case "20-工具-上传记录"  --drive demo --page tools --tools-tab records
 run_case "21-工具-分享管理"  --drive demo --page tools --tools-tab shares
 run_case "22-工具-分类浏览"  --drive demo --page tools --tools-tab categories
+run_case "23-网盘-缩略图"    --drive demo --path /影视 --frames 60
 
 echo
 echo "==> 结果：通过 $PASS 项，失败 $FAIL 项（截图目录：$OUT）"

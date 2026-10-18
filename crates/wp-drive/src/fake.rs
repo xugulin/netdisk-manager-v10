@@ -38,6 +38,36 @@ pub struct FakeDrive {
     state: Mutex<State>,
 }
 
+/// 演示用缩略图（图片 / 视频各一张，内嵌 PNG）。
+const 演示缩略图_图片: &[u8] = include_bytes!("demo_thumb_img.png");
+const 演示缩略图_视频: &[u8] = include_bytes!("demo_thumb_vid.png");
+
+fn 缩略图字节(name: &str) -> Option<&'static [u8]> {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let 视频 = matches!(
+        ext.as_str(),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv"
+    );
+    let 图片 = matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic"
+    );
+    if 视频 {
+        Some(演示缩略图_视频)
+    } else if 图片 {
+        Some(演示缩略图_图片)
+    } else {
+        None
+    }
+}
+
+fn 填缩略图(mut e: RemoteEntry) -> RemoteEntry {
+    if 缩略图字节(&e.name).is_some() {
+        e.thumbnail = Some(format!("demo-thumb://{}", e.path.trim_start_matches('/')));
+    }
+    e
+}
+
 /// 创建演示网盘（自动登录）。
 pub fn create(init: DriveInit) -> Result<Arc<dyn Drive>> {
     let data_dir = init.data_dir.join("演示网盘");
@@ -61,6 +91,7 @@ pub fn create(init: DriveInit) -> Result<Arc<dyn Drive>> {
         let mut e = RemoteEntry::file(base_name(path), *path, *size);
         e.id = format!("fake-{i:04}");
         e.modified = Some(wp_core::util::now_ts() - (i as i64 + 1) * 86400);
+        let e = 填缩略图(e);
         entries.insert(path.to_string(), e);
     }
     // 工具页演示数据：回收站 / 云任务 / 上传记录
@@ -809,6 +840,16 @@ impl Drive for FakeDrive {
         Ok(v)
     }
 
+    async fn fetch_thumbnail(&self, entry: &RemoteEntry) -> Result<Vec<u8>> {
+        self.require_login()?;
+        if entry.thumbnail.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(Error::unsupported("该条目没有缩略图"));
+        }
+        缩略图字节(&entry.name)
+            .map(|b| b.to_vec())
+            .ok_or_else(|| Error::unsupported("该文件类型不支持缩略图"))
+    }
+
     async fn write_probe(&self) -> Result<String> {
         Ok("演示网盘允许写入".into())
     }
@@ -874,6 +915,16 @@ mod tests {
         assert!(d.account().await.unwrap_err().is_auth());
         d.login_cookie("x").await.unwrap();
         assert!(d.account().await.is_ok());
+    }
+
+    #[test]
+    fn demo_thumbnail_returns_png_for_media_only() {
+        assert!(缩略图字节("影片.mp4").is_some());
+        assert!(缩略图字节("照片.PNG").is_some());
+        assert!(缩略图字节("文档.txt").is_none());
+        assert!(缩略图字节("无扩展名").is_none());
+        let b = 缩略图字节("影片.mkv").unwrap();
+        assert_eq!(&b[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
     }
 
     #[tokio::test]

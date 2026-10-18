@@ -143,6 +143,7 @@ theme.rs       10 套主题色板 + egui Visuals 映射
 fonts.rs       中文字体探测与注入、QR PNG → 纹理
 widgets.rs     卡片/徽标/按钮/进度条/空态/文件图标等通用小部件
 pages/         browser / transfers / tools / guard_page / logs / settings / about
+thumbs.rs      缩略图缓存（异步拉取 → 解码 → egui 纹理，列表/详情共用）
 dialogs.rs     全部模态对话框（Modal）
 ```
 

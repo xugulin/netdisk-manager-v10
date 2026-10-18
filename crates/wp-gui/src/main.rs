@@ -24,6 +24,7 @@ mod dialogs;
 mod fonts;
 mod pages;
 mod theme;
+mod thumbs;
 mod widgets;
 
 use app::{App, DevOptions};
@@ -76,6 +77,12 @@ fn main() -> eframe::Result<()> {
             "--tools-tab" => {
                 if let Some(t) = next(i) {
                     dev.tools_tab = Some(t);
+                    i += 1;
+                }
+            }
+            "--wait-ms" => {
+                if let Some(ms) = next(i) {
+                    dev.wait_ms = ms.parse().ok();
                     i += 1;
                 }
             }

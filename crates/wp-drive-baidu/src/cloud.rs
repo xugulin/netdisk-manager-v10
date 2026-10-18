@@ -1,11 +1,26 @@
-//! 云添加（离线下载）任务：**只读** `method=list_task`。
+//! 云添加（离线下载）任务：创建（`add_task`）+ 列表（`list_task`）。
 //!
-//! 为什么只做列表、不做“新建任务”：
-//! * HAR 只抓到 `list_task` / `query_task` 两条**只读**请求，创建任务所需的
-//!   `source_url / save_path / od_type / method=add_task …` 参数没有样本；
-//!   Python 源项目也把「云添加」整块删除（PLAN.md：协议未摸清）。
-//! * 因此 `cloud_add` 保持 trait 默认的 Unsupported（caps=false），
-//!   不在生产代码里猜参数。
+//! ## 创建任务（真机反推，2026-10-18，真实 Cookie 会话）
+//!
+//! 以下请求形态已**通过服务端参数校验**：
+//! ```text
+//! POST /rest/2.0/services/cloud_dl
+//!     ?channel=chunlei&clienttype=0&web=1&app_id=250528&bdstoken=<token>
+//!     &method=add_task
+//! form: source_url=<urlencoded 直链>&save_path=/目录
+//!       [&task_name=<可选>][&od_type=4（仅 magnet/BT）]
+//! ```
+//! 真机返回（账号超容，卡在空间检查 —— 恰好证明参数形态被接受）：
+//! `{"error_code":36009,"error_msg":"storage exceed limit",
+//!   "show_msg":"百度网盘空间不足", ...}`
+//! 成功时预期 `{"error_code":0,"task_id":<数字>...}`（HAR 的 list_task
+//! `task_info` 里可见 `task_id`）。
+//!
+//! ⚠️ **该接口的错误字段是 `error_code` / `error_msg` / `show_msg`，不是 `errno`！**
+//! 所以不能依赖 `api_get` 的通用 errno 检查；本模块自己解析 `error_code` 并映射
+//! 中文文案。普通 http 任务 `od_type=0`，可省略；magnet/BT 任务 HAR 里是 `od_type=4`。
+//!
+//! ## 任务列表
 //!
 //! 列表请求完全按 HAR 实测参数还原：
 //! ```text
@@ -22,12 +37,17 @@
 //! `finish_time > 0`；`status=4` 的任务 `finished_size=0`。所以这里用百度自己的
 //! 映射，不能直接套通用函数。
 
+use crate::files;
 use crate::http::ReqOpts;
 use crate::{err_text, now_ms, BaiduDrive};
 use serde_json::Value;
+use url::Url;
 use wp_core::model::CloudTask;
-use wp_core::util::base_name;
-use wp_core::Result;
+use wp_core::util::{base_name, file_name_from_url, norm_path};
+use wp_core::{Error, Result};
+
+/// 离线下载接口路径（创建与列表共用）。
+const CLOUD_DL: &str = "/rest/2.0/services/cloud_dl";
 
 /// 单页任务数（HAR 为 100）。
 const PAGE_SIZE: usize = 100;
@@ -195,6 +215,195 @@ pub(crate) fn tasks_from_response(v: &Value) -> Vec<CloudTask> {
     }
 }
 
+/// 离线任务的来源类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    /// `magnet:?xt=...`（BT/磁力）。
+    Magnet,
+    /// http(s)/ftp 直链。
+    Direct,
+}
+
+/// 校验并判定 `url` 类型（http/https/ftp/magnet）。
+pub(crate) fn source_kind(url: &str) -> Result<SourceKind> {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return Err(Error::other("离线下载地址不能为空"));
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("magnet:") {
+        return Ok(SourceKind::Magnet);
+    }
+    if ["http://", "https://", "ftp://"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return Ok(SourceKind::Direct);
+    }
+    Err(Error::other(format!(
+        "不支持的离线下载地址（仅支持 http/https/ftp/magnet）：{}",
+        raw.chars().take(120).collect::<String>()
+    )))
+}
+
+/// `save_path` 规范化：空串/根目录 → `/`，其余去掉尾部斜杠。
+pub(crate) fn normalize_save_path(dest_dir: &str) -> String {
+    norm_path(dest_dir)
+}
+
+/// 直链的 `task_name`：取 URL 最后一段文件名。
+///
+/// 以 `/` 结尾（目录型 URL）或纯域名（没有 path）时不硬塞 `task_name`，
+/// 交给百度的 `source_url` 自行推断。
+fn task_name_from_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if !parsed.path().rsplit('/').any(|seg| !seg.trim().is_empty()) {
+        return None;
+    }
+    let name = file_name_from_url(parsed.path());
+    // `sanitize_file_name` 对空名字会回退成“未命名”，这里视为没有文件名。
+    (!name.is_empty() && name != "/" && name != "未命名").then_some(name)
+}
+
+/// 构造 `add_task` 的表单字段（纯函数，便于单测）。
+///
+/// * magnet → `od_type=4`（HAR 里 BT 任务），不带 `task_name`（种子名由服务端解析）；
+/// * 直链 → 不传 `od_type`（等价于 `od_type=0`），尽量带 `task_name`
+///   （取 URL 最后一段文件名）。
+fn add_task_form_for(kind: SourceKind, url: &str, save_path: &str) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("source_url".to_string(), url.trim().to_string()),
+        ("save_path".to_string(), normalize_save_path(save_path)),
+    ];
+    match kind {
+        SourceKind::Magnet => form.push(("od_type".to_string(), "4".to_string())),
+        SourceKind::Direct => {
+            if let Some(name) = task_name_from_url(url) {
+                form.push(("task_name".to_string(), name));
+            }
+        }
+    }
+    form
+}
+
+/// 校验 URL 并构造表单（带校验的入口，便于单测）。
+#[cfg(test)]
+fn add_task_form(url: &str, save_path: &str) -> Result<Vec<(String, String)>> {
+    let kind = source_kind(url)?;
+    Ok(add_task_form_for(kind, url, save_path))
+}
+
+/// `add_task` 的官方错误码 → 中文文案（从网页 JS 提取）。
+pub(crate) fn cloud_add_error_label(code: i64) -> Option<&'static str> {
+    Some(match code {
+        36005 => "用户未登录",
+        36006 => "用户未激活",
+        36007 => "用户未授权",
+        36009 => "空间不足，无法创建离线任务",
+        36010 => "文件不存在",
+        36012 => "操作超时",
+        36013 => "同时下载的任务过多",
+        36014 => "存储路径已使用",
+        36016 => "任务已删除",
+        36017 => "任务已完成",
+        36018 => "解析失败，种子文件损坏",
+        36019 => "任务正在处理中",
+        36020 => "任务地址不存在",
+        36021 => "普通用户同时最多 1 个离线任务（需开通离线下载套餐）",
+        36022 => "任务过多",
+        36023 => "普通用户每月只能离线下载 5 个任务",
+        36024 => "本月下载数已超限制",
+        36025 => "分享链接已失效",
+        36026 | 36027 => "链接格式有误",
+        36028 => "暂时无法找到相关种子信息",
+        36031 => "网络繁忙",
+        36032 => "违规内容被屏蔽",
+        _ => return None,
+    })
+}
+
+/// 错误码 → 可读中文；未知码保留服务端 `error_msg/show_msg` 原文。
+pub(crate) fn cloud_add_error_message(code: i64, v: &Value) -> String {
+    let detail = err_text(v, "");
+    let code_text = format!("error_code:{code}");
+    match cloud_add_error_label(code) {
+        Some(label) => {
+            if detail.is_empty() || detail == label {
+                format!("{label}（{code_text}）")
+            } else {
+                format!("{label}（百度返回：{detail}；{code_text}）")
+            }
+        }
+        None => {
+            if detail.is_empty() {
+                format!("云添加失败（{code_text}）")
+            } else {
+                format!("{detail}（{code_text}）")
+            }
+        }
+    }
+}
+
+/// 兼容数字/字符串的 `task_id` 提取；0/空串视为缺失。
+pub(crate) fn response_task_id(v: &Value) -> Option<String> {
+    let raw = ["task_id", "taskId", "taskid"]
+        .iter()
+        .find_map(|key| v.get(*key))?;
+    let text = if let Some(s) = raw.as_str() {
+        s.trim().to_string()
+    } else if let Some(n) = raw.as_i64() {
+        n.to_string()
+    } else if let Some(n) = raw.as_u64() {
+        n.to_string()
+    } else {
+        return None;
+    };
+    if text.is_empty() || text == "0" {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// 解析 `add_task` 响应。
+///
+/// ⚠️ 错误字段是 `error_code`（不是 `errno`）；成功时返回 task_id 字符串。
+pub(crate) fn parse_add_task_response(v: &Value) -> Result<String> {
+    let code = loose_i64(v, &["error_code", "errorCode"]).unwrap_or(0);
+    if code == 0 {
+        if let Some(id) = response_task_id(v) {
+            return Ok(id);
+        }
+        let body: String = v.to_string();
+        return Err(Error::server(
+            -1,
+            format!(
+                "云添加成功但响应缺少 task_id：{}",
+                body.chars().take(300).collect::<String>()
+            ),
+        ));
+    }
+    Err(Error::server(code, cloud_add_error_message(code, v)))
+}
+
+/// 创建离线下载任务，成功返回百度 `task_id`。
+pub(crate) async fn add_task(d: &BaiduDrive, url: &str, dest_dir: &str) -> Result<String> {
+    // 先校验 URL（不发请求/不建目录），再确保保存目录存在。
+    let kind = source_kind(url)?;
+    let dir = files::ensure_dir(d, dest_dir).await?;
+    let save_path = normalize_save_path(&dir.path);
+    let form = add_task_form_for(kind, url, &save_path);
+    let params = vec![("method".to_string(), "add_task".to_string())];
+    // with_bdstoken 会自动补 channel=chunlei；公共 query（clienttype/app_id/
+    // web/dp-logid）由 http.rs 统一附加，与真机请求形态一致。
+    let v = d
+        .api_post_form(CLOUD_DL, &params, &form, ReqOpts::authed().with_bdstoken())
+        .await?;
+    let task_id = parse_add_task_response(&v)?;
+    wp_core::log_info!("百度", "已创建离线任务 {task_id}：{url} → {save_path}");
+    Ok(task_id)
+}
+
 /// 云任务列表（只读；`status=255` = 全部状态）。
 pub(crate) async fn list_tasks(d: &BaiduDrive) -> Result<Vec<CloudTask>> {
     let mut out: Vec<CloudTask> = Vec::new();
@@ -315,5 +524,125 @@ mod tests {
         assert_eq!(status_text(""), "未知");
         // 没有 task_id 的脏条目丢弃。
         assert!(task_from_value(&json!({"status": "0"}), None).is_none());
+    }
+
+    fn form_value<'a>(form: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        form.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn source_kind_accepts_only_supported_schemes() {
+        assert_eq!(
+            source_kind("https://example.com/a.iso").unwrap(),
+            SourceKind::Direct
+        );
+        assert_eq!(
+            source_kind("HTTP://example.com/a.iso").unwrap(),
+            SourceKind::Direct
+        );
+        assert_eq!(
+            source_kind("ftp://example.com/a.iso").unwrap(),
+            SourceKind::Direct
+        );
+        assert_eq!(
+            source_kind("  MAGNET:?xt=urn:btih:abc  ").unwrap(),
+            SourceKind::Magnet
+        );
+        assert!(source_kind("").is_err());
+        assert!(source_kind("   ").is_err());
+        assert!(source_kind("ed2k://|file|a|1|hash|/").is_err());
+        assert!(source_kind("magnet").is_err(), "缺冒号不是合法 magnet");
+    }
+
+    #[test]
+    fn add_task_form_uses_od_type_4_only_for_magnet() {
+        // magnet：od_type=4，不猜 task_name。
+        let form = add_task_form("magnet:?xt=urn:btih:abc", "/下载/BT").unwrap();
+        assert_eq!(
+            form_value(&form, "source_url"),
+            Some("magnet:?xt=urn:btih:abc")
+        );
+        assert_eq!(form_value(&form, "save_path"), Some("/下载/BT"));
+        assert_eq!(form_value(&form, "od_type"), Some("4"));
+        assert_eq!(form_value(&form, "task_name"), None);
+
+        // http 直链：不传 od_type（等价 0），task_name 取 URL 最后一段（去掉 query）。
+        let form = add_task_form(
+            "https://example.com/download/a%20b.iso?token=1#part",
+            "/下载/电影",
+        )
+        .unwrap();
+        assert_eq!(form_value(&form, "od_type"), None);
+        assert_eq!(form_value(&form, "task_name"), Some("a b.iso"));
+
+        // 目录型 URL（以 / 结尾）没有文件名，不硬塞“未命名”。
+        let form = add_task_form("https://example.com/download/", "/").unwrap();
+        assert_eq!(form_value(&form, "task_name"), None);
+    }
+
+    #[test]
+    fn cloud_add_error_codes_map_to_chinese() {
+        let v = json!({
+            "error_code": 36009,
+            "error_msg": "storage exceed limit",
+            "show_msg": "百度网盘空间不足"
+        });
+        let msg = cloud_add_error_message(36009, &v);
+        assert!(msg.contains("空间不足"), "实际：{msg}");
+        assert!(msg.contains("百度网盘空间不足"), "实际：{msg}");
+        match parse_add_task_response(&v) {
+            Err(Error::Server { code, msg }) => {
+                assert_eq!(code, 36009);
+                assert!(msg.contains("空间不足"), "实际：{msg}");
+            }
+            other => panic!("应为 Server(36009)，实际 {other:?}"),
+        }
+
+        let msg = cloud_add_error_message(36021, &json!({"error_code": 36021}));
+        assert!(msg.contains("1 个"), "实际：{msg}");
+        assert!(msg.contains("套餐"), "实际：{msg}");
+        let msg = cloud_add_error_message(36023, &json!({"error_code": 36023}));
+        assert!(msg.contains("5 个"), "实际：{msg}");
+
+        // 未知码保留服务端原文。
+        let msg = cloud_add_error_message(99999, &json!({"error_msg": "weird backend"}));
+        assert!(msg.contains("weird backend"), "实际：{msg}");
+        assert!(msg.contains("99999"), "实际：{msg}");
+        let msg = cloud_add_error_message(99998, &json!({}));
+        assert!(msg.contains("云添加失败"), "实际：{msg}");
+    }
+
+    #[test]
+    fn add_task_response_task_id_number_or_string() {
+        assert_eq!(
+            parse_add_task_response(&json!({"error_code": 0, "task_id": 6273246743i64})).unwrap(),
+            "6273246743"
+        );
+        assert_eq!(
+            parse_add_task_response(&json!({"error_code": "0", "task_id": "abc123"})).unwrap(),
+            "abc123"
+        );
+        assert_eq!(
+            parse_add_task_response(&json!({"errorCode": "0", "taskId": 42})).unwrap(),
+            "42"
+        );
+        // 成功但没有 task_id 属于异常响应，不能假装成功。
+        assert!(parse_add_task_response(&json!({"error_code": 0})).is_err());
+        assert!(parse_add_task_response(&json!({"error_code": 0, "task_id": 0})).is_err());
+        // 非 0：错误字段是 error_code，不是 errno。
+        assert!(parse_add_task_response(&json!({"errno": 0, "error_code": 36021})).is_err());
+    }
+
+    #[test]
+    fn save_path_root_stays_root_and_paths_are_normalized() {
+        assert_eq!(normalize_save_path("/"), "/");
+        assert_eq!(normalize_save_path(""), "/");
+        assert_eq!(normalize_save_path("///"), "/");
+        assert_eq!(normalize_save_path("/我的资源/电影/"), "/我的资源/电影");
+
+        let form = add_task_form("https://example.com/a.iso", "/").unwrap();
+        assert_eq!(form_value(&form, "save_path"), Some("/"));
+        let form = add_task_form("magnet:?xt=urn:btih:abc", "/我的资源/电影").unwrap();
+        assert_eq!(form_value(&form, "save_path"), Some("/我的资源/电影"));
     }
 }

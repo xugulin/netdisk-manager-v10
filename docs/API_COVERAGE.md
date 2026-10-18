@@ -55,7 +55,7 @@
 | 新建目录 | `POST /api/create?isdir=1` | 管理接口.py | ✅ |
 | 删除/重命名/移动/复制 | `POST /api/filemanager?opera=delete/rename/move/copy` | 管理接口.py | ✅ |
 | 分类列表（全盘） | `GET /api/categorylist` | 文件接口.py | ✅ 真机 5000 条（深翻页 31034 已优雅降级） |
-| 缩略图 URL | 条目字段提取 | 文件接口.py | 🟡（解析已有，GUI 未展示） |
+| 缩略图 | 条目 `thumbs` 字段（list/categorylist） | 文件接口.py | ✅ 真机 60x44 JPEG；filemetas 无该字段，父目录列表兜底 |
 | 上传记录/用户操作 | （Python 为 NotImplemented 占位） | 文件接口.py | ❌ 源码无实现 |
 | 目录树/批量下载（HAR 有，未接） | `/api/getsyscfg` 等为网页后台 | HAR | ❌ 非必需 |
 
@@ -84,7 +84,7 @@
 |---|---|---|---|
 | 任务列表（只读） | `GET /rest/2.0/services/cloud_dl?method=list_task` | HAR（响应样本完整） | ✅ 真机只读列表（任务状态 0=完成已单独映射） |
 | 任务查询（只读） | `GET .../?method=query_task` | HAR | 🔷 状态语义与通用表相反（百度 0=完成），已单独映射 |
-| 创建离线任务 | `.../?method=add_task` | — | ❌ 参数无样本，留在文档待抓包 |
+| 创建离线任务 | `POST .../?method=add_task`（form: source_url+save_path；magnet 加 od_type=4） | 真机探测 | 🔷 参数形态已通过服务端校验（账号超容 36009）；错误码 36005~36032 全中文映射；error_code 可能裹在 HTTP 403 JSON 里 |
 
 ## 2. 夸克网盘
 
@@ -108,7 +108,7 @@
 | 重命名 / 移动 | `POST file/rename` / `file/move` | 文件接口.py | ✅ |
 | 复制 | —（夸克无复制接口；分享转存可替代） | — | ❌ |
 | 文件夹树 | `GET file/tree` | 文件接口.py | ❌（目录选择器用逐层列表已够） |
-| 缩略图 URL | 条目字段提取 | 文件接口.py | 🟡 |
+| 缩略图 | 条目 `thumbnail` 字段 | 文件接口.py | ✅ 真机 WebP 133x100（image 需开 webp feature） |
 | 批量下载地址 | `POST file/download`（列表形态） | 文件接口.py | 🟡（单文件直链已够传输引擎用） |
 
 ### 2.3 分享
@@ -159,7 +159,7 @@
 | 删除（进回收站） | `POST /userres/v1/file/delete_file` | 文件接口.py | ✅ |
 | 重命名 / 移动 / 复制 | —（源码与 HAR 均无） | — | ❌ |
 | 搜索 | —（无接口） | — | ❌ |
-| 缩略图 URL | 条目 `thumbnail` 字段 | 文件接口.py | 🟡 |
+| 缩略图 | 条目 `thumbnail` 字段 | 文件接口.py | ✅ 真机 JPEG 128x96（鉴权用 Bearer） |
 | 上传记录 | `POST /userres/v1/get_user_action` | 文件接口.py | ✅ 真机 |
 | 上传任务统计 | `POST /userres/v1/query_uploading_tasks_stat` | 文件接口.py | ❌ 非核心 |
 
@@ -195,12 +195,12 @@
 
 | 未实现 | 归属 | 原因 | 后续 |
 |---|---|---|---|
-| 百度云添加创建任务 | 百度 | HAR 只抓到 `list_task/query_task`（列表已实现为只读🔷），创建参数（source_url/save_path/od_type…）缺失 | 用浏览器抓一次「新建离线下载」即可补全 |
+| 百度云添加「任务成功落地」 | 百度 | 创建参数已通过服务端校验，但该账号已超容（used 9.94TB > total 2.21TB），服务端返回 36009 拒绝创建 | 账号清理空间/续费后复测一次即可 |
 | 百度回收到彻底删除/清空 | 百度 | 源码无公开接口；彻底删除会触发 132 短信风控 | 需要短信验证交互，价值低 |
 | 百度上传记录 | 百度 | Python 源码亦为 `NotImplementedError` | 需抓包 |
 | 夸克云添加/上传记录/复制 | 夸克 | 无对应接口 | — |
 | 光鸭重命名/移动/复制/搜索/转存/回收站恢复 | 光鸭 | 源码与 HAR 均无接口 | 若官方新增接口再补 |
-| 缩略图展示 | 三家 | 接口已有字段解析，GUI 未渲染图片 | P2：需要图片解码 + 列表图标 |
+| 缩略图（已完成） | 三家 | 列表小图 + 详情大图 + 懒加载缓存；夸克 WebP 已解码 | — |
 | 多文件批量直链下载（夸克） | 夸克 | 传输引擎按单文件调度已够用 | 可选优化 |
 
 ## 5. 扫描方法论（可复用）

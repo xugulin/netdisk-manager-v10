@@ -18,6 +18,7 @@ mod files;
 mod recycle;
 mod session;
 mod share;
+mod thumbnail;
 mod upload;
 
 use async_trait::async_trait;
@@ -68,6 +69,7 @@ pub(crate) struct QuarkDrive {
     pub(crate) login_http: reqwest::Client,
     pub(crate) oss_http: reqwest::Client,
     pub(crate) download_http: reqwest::Client,
+    pub(crate) thumb_http: reqwest::Client,
     pub(crate) qr: Mutex<Option<auth::QrSession>>,
     pub(crate) cache: Mutex<files::PathCache>,
     pub(crate) dir_lock: tokio::sync::Mutex<()>,
@@ -88,6 +90,7 @@ pub fn create(init: DriveInit) -> Result<Arc<dyn Drive>> {
     let login_http = build_login_client()?;
     let oss_http = build_oss_client()?;
     let download_http = build_download_client()?;
+    let thumb_http = build_thumbnail_client()?;
     let id = if init.id.trim().is_empty() {
         "quark".into()
     } else {
@@ -105,6 +108,7 @@ pub fn create(init: DriveInit) -> Result<Arc<dyn Drive>> {
         login_http,
         oss_http,
         download_http,
+        thumb_http,
         qr: Mutex::new(None),
         cache: Mutex::new(files::PathCache::new(CACHE_TTL)),
         dir_lock: tokio::sync::Mutex::new(()),
@@ -133,6 +137,18 @@ pub(crate) fn build_login_client() -> Result<reqwest::Client> {
 
 pub(crate) fn build_oss_client() -> Result<reqwest::Client> {
     base_builder(300).build().map_err(wp_net::client::net_err)
+}
+
+fn build_thumbnail_client() -> Result<reqwest::Client> {
+    // 缩略图是短请求：整体 20 秒超时，允许 CDN 跳转，但绝不能拖住界面。
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(thumbnail::THUMBNAIL_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .no_proxy()
+        .http1_only()
+        .build()
+        .map_err(wp_net::client::net_err)
 }
 
 pub(crate) fn build_download_client() -> Result<reqwest::Client> {
@@ -512,6 +528,10 @@ impl Drive for QuarkDrive {
         self.download_to_file(remote, local, opts, progress).await
     }
 
+    async fn fetch_thumbnail(&self, entry: &RemoteEntry) -> Result<Vec<u8>> {
+        self.fetch_thumbnail_impl(entry).await
+    }
+
     async fn upload(
         &self,
         local: &Path,
@@ -667,6 +687,23 @@ mod tests {
         let e = classify_http_error(500, None, &s);
         let text = e.to_string();
         assert!(text.chars().count() <= 320);
+    }
+
+    #[tokio::test]
+    async fn fetch_thumbnail_without_url_is_readable_error() {
+        let init = DriveInit {
+            id: "q-thumb".into(),
+            name: "q-thumb".into(),
+            data_dir: std::env::temp_dir()
+                .join(format!("wp-quark-thumb-test-{}", std::process::id())),
+            threads: 0,
+            verbose: false,
+        };
+        let d = create(init).unwrap();
+        let entry = RemoteEntry::file("a.jpg", "/a.jpg", 1);
+        let err = d.fetch_thumbnail(&entry).await.unwrap_err();
+        assert_eq!(err.to_string(), "该文件无缩略图");
+        assert_eq!(err.kind(), ErrorKind::Other);
     }
 
     #[test]
