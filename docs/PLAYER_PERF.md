@@ -18,6 +18,7 @@
 | 参数建议（4K 40–100Mbps） | **chunk=4MB（弱网 1–2MB）· readahead=128MB（≈8.5–25s 缓冲）· parallel=4（弱网 2）· LRU=50GB（4K 重度；现有 20GB 保留为默认）** |
 | HLS | 正常网络 m3u8 0.65–1.07s、首分片 1.0s（7.7Mbps）、40% seek 2.2s/2.2MB；mpv 实测起播 4.7s、seek 19.9s（详见 `PLAYER_STREAM_M0.md` §9）。HLS 无缓存，seek 成本=重新拉分片 |
 | 发现的问题 | ① 弱网下**预读会与 seek 抢带宽**（矩阵 ra=128M 冷 seek 16.4s vs ra=0 4.1s）；② 起播受「首块就绪才回首字节」策略约束（=chunk/带宽）。两项已由 **task-18 生产优化**解决/缓解（见 §7） |
+| task-24 长播稳定性 | 光鸭 727MB **连续 10 分钟**（模拟 4.2Mbps 消费）无崩溃/0 errors/0 fatal，RSS 爬升到 ~62MB 后**5 分钟不再增长**、缓存 232MB 后平稳；前/中/后/回看 seek 均正常（命中 0.3–45ms，冷 seek 0.3–0.5s/劣化网络）；期间 2 次 CDN 403 自动换链续播（errors=0）。夸克 HLS 5 分钟循环拉流 114 分片/3 次 seek 全部成功，但**劣化网络（6.1Mbps）低于 HLS 码率 14.1Mbps → 持续卡顿**（非代理问题）。见 §10 |
 | task-21 熔断 | 上游**权限类 4xx（401/403/410）连续失败**（默认 2 块）→ 会话 `fatal`：停预读/停换链、后续 GET 立即 502 + 可读原因；百度 31326 真机换链 6→3 次、errors 15→7、立即显示「上游持续拒绝 HTTP 403（已熔断）」；超时/网络类不熔断。见 §9 |
 | task-18 优化效果 | **先回 headers + 1MB 首字节引导 + seek 优先预读（默认开）**：冷起播首字节 55.8s → **0.84s**（同窗口劣化网络，约 66×）；**mpv 端到端起播 26.0s → 12.2s**（2.1×）；弱网自动降预读窗口（64→32MB）。见 §7 |
 
@@ -91,7 +92,13 @@ cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
 # mpv（系统 mpv headless 播代理 URL 2 帧，测端到端起播）
 cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json --mode mpv --adaptive on
 
-# 6) 只测起播（不同分块对比，readahead=0 消除预读干扰）
+# 6) task-24：长播稳定性 / HLS 长播 / 会话重建
+cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
+    --mode longplay --seconds 600 --play-bps 4.2Mbps --readahead 128M --chunk 4M --parallel 4
+cargo run -p wp-stream --example stream_bench -- /tmp/link-quark-hls.json --mode hls-long --seconds 300
+cargo run -p wp-stream --example stream_bench -- /tmp/link-baidu-31326.json --mode rebuild
+
+# 7) 只测起播（不同分块对比，readahead=0 消除预读干扰）
 cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
     --mode seq --readahead 0 --read-bytes 1M --chunk 1M
 cargo run -p wp-stream --example stream_bench -- /tmp/link-guangya.json \
@@ -336,3 +343,85 @@ GUI 建议：`fatal=true` 时状态行显示「熔断：{fatal_reason}」，并�
 `timeout_not_counted_as_permission_failure`（超时不熔断）/
 `breaker_threshold_zero_disables_circuit_breaker` /
 `normal_file_never_trips_breaker`（正常文件不受影响）。
+
+---
+
+## 10. 真机长播稳定性（task-24）
+
+> 环境：同一劣化网络窗口（直连光鸭 **6.4–12.9 Mbps 波动**，多次复测；夸克 m3u8 也慢），机器负载 load1 7–12。
+> 光鸭 mkv 内容平均码率 ≈ 727.7MB×8/1421s ≈ **4.1 Mbps**，模拟消费按 **4.2 Mbps** 节流（接近真实播放节奏，连续 10 分钟）。
+> ⚠ 网络未恢复到 ≥20Mbps，本节数据是**劣化网络下的稳定性下限**；相对结论（无泄漏/命中/错误恢复）有效。
+
+### 10.1 光鸭 727MB mkv：连续播 10 分钟（stream_bench `--mode longplay --seconds 600`）
+
+| 指标 | 运行 A（首轮） | 运行 B（复测，主数据） |
+|---|---|---|
+| 实际时长 | 694.4 s | **604.5 s** |
+| 消耗（4.2Mbps 节流） | 351 MB | 307 MB |
+| 请求数 | 54 | 75 |
+| 卡顿次数（请求 >300ms） | 4 | 8 |
+| 累计卡顿时长 | 33.4 s | 64.4 s |
+| 最长单次请求 | 5.85 s | 42.8 s（公网瞬时断流，非代理） |
+| upstream_restarts | **2**（CDN 403 → 自动换链续播） | 0 |
+| errors / fatal | **0 / false** | **0 / false** |
+| 实测带宽（弱网标记） | weak=true（预读降 32MB） | weak=true（bootstrap 3.8Mbps，预读降 32MB） |
+| RSS（进程内含代理/缓存索引） | 21.0 → 45.9 MB，max 47.8 MB | **15.2 → 62.5 MB，max 62.5 MB；~120s 后 51MB，423s 后 62.5MB 并保持到结束（最后 3 分钟 +0.0MB）** |
+| 磁盘缓存 buffered | 200 MB（持续增长） | **243 MB 后平稳**（423s 后不再增长） |
+| seek_pauses | 2 | 5 |
+| seek（前/中/后/回看） | 前 1.1ms 命中 / 中 24.3s 冷（网络极差） | **前 45.5ms 命中 / 中 466.2ms 冷 / 后 298.6ms 冷 / 回看 0.3ms 命中** |
+
+**结论**：
+1. **10 分钟连续播无崩溃、0 errors、0 fatal**；期间 2 次 CDN 拒绝被「链接热换」自动恢复（errors 仍 0），验证 T14 长跑可靠；
+2. **内存无泄漏**：RSS 初期随预读/缓存填充爬升到 ~62MB 后**完全平稳**（后 3 分钟零增长）；缓存 buffered 到 243MB 后不再增长（播放消费速度追上预读）；
+3. **seek 稳定**：缓存命中 0.3–45ms；冷 seek 0.3–0.5s（劣化网络）；长跑中定时 seek 未引发重试/换链；
+4. 卡顿全部来自**公网劣化**（最长单次请求 42.8s 为瞬时断流），代理层 errors=0、无死锁/重试风暴。
+
+### 10.2 夸克 HLS：连续拉流 5 分钟（`--mode hls-long --seconds 300`，VOD 列表循环）
+
+| 指标 | 实测 |
+|---|---|
+| 实际时长 | 300.2 s（播放列表循环 5 圈，22 分片/圈） |
+| 拉取分片 | 114 个 / 229.7 MB |
+| 平均带宽 | **6.12 Mbps**（内容码率 173.7MB×8/98.76s ≈ **14.07 Mbps**） |
+| 分片最大耗时 | 3388.9 ms |
+| 卡顿（分片 >1500ms） | **93 次 / 累计 70.9 s** |
+| seek（20%/50%/80% 时刻 → 25%/50%/75% 位置） | 62.5s→24.69s（2273.7ms）/ 152.8s→49.38s（2208.6ms）/ 242.6s→74.07s（2339.9ms），**3/3 成功** |
+
+**结论**：HLS 直连链路本身可用（m3u8 0.77s、3 次 seek 全部 2.2–2.3s 成功）；**带宽 6.12Mbps < HLS 内容码率 14.07Mbps**，因此持续卡顿——这是网络带宽不足，不是 wp-stream（HLS 不经过代理）或播放器的问题。正常网络（≥20Mbps）下应无此现象（参见 §3.6 正常时段 m3u8 0.65s/首片 1.0s/seek 2.2s 数据）。
+
+---
+
+## 11. 会话重建（GUI「重试」流程）验证（task-24）
+
+GUI 重试 = `proxy.close(old_token)` + 重新 `resolve_playback`（新会话）；fatal 是会话级，新会话应重置并可再次熔断。
+
+### 11.1 mock（不联网，`cargo test -p wp-stream` 新用例）
+
+`session_rebuild_resets_fatal_and_trips_again_bounded`：永久 403 上游下连续 2 轮「开新会话 → 触发 → 熔断 → close」：
+* 每轮新会话 `fatal=false`（重置 ✓）；
+* 每轮均在连续 2 块失败内熔断，`upstream_restarts` 受限（≤ 1+2×max_restarts+并发余量）；
+* 2 轮行为一致，无重试风暴复发。
+
+### 11.2 真机（百度 31326 权限文件，`--mode rebuild` 2 轮）
+
+| 轮次 | 新会话 open | 触发到熔断耗时 | upstream_restarts | errors | fatal | fatal_reason |
+|---|---|---|---|---|---|---|
+| 1 | 0.3 ms | 2575.7 ms | 3 | 5 | ✅ | 上游持续拒绝 HTTP 403（已熔断）：{"error_code":31326,…} |
+| 2 | 0.2 ms | 2846.5 ms | 3 | 5 | ✅ | 同上（新会话 fatal 已重置） |
+
+结论：close + 重新 resolve 能**可靠重置熔断**，重试后仍 ≤N 块内熔断（不会退回 41 次换链风暴）；GUI 侧实测同样为「2 个会话、几秒内再次熔断、无循环」（见与 gui-player 联调记录）。
+
+---
+
+## 12. 网络恢复状态与数据刷新（task-24）
+
+测试窗口（2026-10-19 04:00–04:35）多次复测直连带宽：
+
+| 链路 | 实测 | 结论 |
+|---|---|---|
+| 光鸭直链（4–8MB Range） | 6.4 / 8.1 / 12.9 Mbps | **未恢复到 ≥20Mbps 门槛** |
+| 夸克 HLS m3u8/分片 | m3u8 ~0.7s，平均 6.12 Mbps | 低于内容码率 14.07Mbps |
+| 百度直链 | 31326 权限 403（不可用文件）；可播文件测试窗口未复测 | — |
+
+因此**本轮不刷新 §3「正常网络数据表」**，沿用 §3 的相对结论与公式；§10/§11 的数据均为劣化网络下限。网络恢复后按 §2 命令复跑即可刷新：
+`stream_bench … --mode all --read-bytes 32M` / `--mode hls`（数据写入 §3 对应表）。

@@ -57,6 +57,12 @@ enum Mode {
     Matrix,
     /// 代理 + 系统 mpv 直连冒烟（测「代理起播」端到端耗时）
     Mpv,
+    /// 长播稳定性（代理模拟消费 ≥N 秒 + 定时 seek + 内存/缓存采样，task-24）
+    Longplay,
+    /// HLS 长播稳定性（分片按自然速率循环消费 N 秒 + seek，task-24）
+    HlsLong,
+    /// 会话重建验证（close token + 重新 resolve，fatal 应重置，task-24）
+    Rebuild,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +194,9 @@ fn parse_args() -> Result<Options, String> {
                     "hls" => Mode::Hls,
                     "matrix" => Mode::Matrix,
                     "mpv" => Mode::Mpv,
+                    "longplay" => Mode::Longplay,
+                    "hls-long" => Mode::HlsLong,
+                    "rebuild" => Mode::Rebuild,
                     other => return Err(format!("未知 mode：{other}")),
                 };
             }
@@ -251,7 +260,7 @@ fn print_help() {
 用法：stream_bench <direct-link.json> [远端路径] [选项]
 
 选项：
-  --mode <all|seq|prefetch|seek|paced|weak|hls|matrix|mpv>  默认 all
+  --mode <all|seq|prefetch|seek|paced|weak|hls|hls-long|matrix|mpv|longplay|rebuild>  默认 all
   --chunk <4M>        代理分块大小
   --readahead <64M>   预读窗口（0=关闭）
   --parallel <2>      并行预取连接数
@@ -1101,6 +1110,413 @@ async fn bench_hls(
     }))
 }
 
+// ───────────────────────── task-24：长播 / 重建 ─────────────────────────
+
+/// 读取当前进程 RSS（KB；非 Linux 返回 None）。
+fn rss_kb() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<u64>()
+                .ok();
+        }
+    }
+    None
+}
+
+fn stats_snapshot(st: &wp_stream::StreamStats) -> serde_json::Value {
+    serde_json::json!({
+        "downloaded_bytes": st.downloaded_bytes,
+        "buffered_bytes": st.buffered_bytes,
+        "upstream_restarts": st.upstream_restarts,
+        "errors": st.errors,
+        "fatal": st.fatal,
+        "consecutive_failures": st.consecutive_failures,
+        "weak_network": st.weak_network,
+        "seek_pauses": st.seek_pauses,
+        "bootstrap_bytes": st.bootstrap_bytes,
+        "bootstrap_mbps": round1(st.bootstrap_mbps),
+        "effective_readahead_bytes": st.effective_readahead_bytes,
+    })
+}
+
+/// 长播稳定性：按 `play_bps` 自然消费 `seconds` 秒，在 25/45/65/85% 时间点做
+/// 前/中/后/回看 seek；每 15s 采样内存/缓存/错误，汇总卡顿与最长请求。
+async fn longplay(
+    bench: &Bench,
+    handle: &wp_stream::StreamHandle,
+    total: u64,
+    seconds: f64,
+    play_bps: u64,
+    play_chunk: u64,
+) -> Result<serde_json::Value, String> {
+    let t0 = Instant::now();
+    // 起播：读首个 2 块，记录首字节
+    let startup_need = (play_chunk * 2).min(total).max(1);
+    let (_, startup_ttfb, startup_total) =
+        read_range(&bench.client, &handle.url, 0, startup_need - 1).await?;
+    let mut read_pos = startup_need;
+    // played = 已消费字节（节拍时钟，seek 不重置）；read_pos = 实际读取偏移
+    let mut played: u64 = startup_need;
+    let mut stalls = 0u64;
+    let mut stall_ms_total = 0f64;
+    let mut max_req_ms = 0f64;
+    let mut requests = 0u64;
+    let mut samples: Vec<serde_json::Value> = Vec::new();
+    let mut seeks: Vec<serde_json::Value> = Vec::new();
+    let rss0 = rss_kb();
+    let mut rss_max = rss0.unwrap_or(0);
+    let mut last_sample = Instant::now();
+
+    // 定时 seek：时刻比例 → 目标偏移比例（前/中/后/回看）
+    let seek_plan: [(f64, f64, &str); 4] = [
+        (0.25, 0.0, "前"),
+        (0.45, 0.5, "中"),
+        (0.65, 0.95, "后"),
+        (0.85, 0.0, "回看-前"),
+    ];
+    let mut next_seek = 0usize;
+
+    while t0.elapsed().as_secs_f64() < seconds {
+        let elapsed = t0.elapsed().as_secs_f64();
+        // 到点 seek
+        if next_seek < seek_plan.len() && elapsed >= seek_plan[next_seek].0 * seconds {
+            let (_, target_frac, label) = seek_plan[next_seek];
+            let target = ((total as f64 * target_frac) as u64).min(total - 1);
+            let before = bench
+                .proxy
+                .stats(&handle.token)
+                .map(|s| s.downloaded_bytes)
+                .unwrap_or(0);
+            let req0 = Instant::now();
+            let got = read_range(
+                &bench.client,
+                &handle.url,
+                target,
+                (target + 65535).min(total - 1),
+            )
+            .await
+            .map(|(b, ttfb, _)| (b.len() as u64, ttfb))
+            .unwrap_or((0, 0.0));
+            let lat = req0.elapsed().as_secs_f64() * 1000.0;
+            let after = bench
+                .proxy
+                .stats(&handle.token)
+                .map(|s| s.downloaded_bytes)
+                .unwrap_or(0);
+            if lat > STALL_THRESHOLD.as_secs_f64() * 1000.0 {
+                stalls += 1;
+                stall_ms_total += lat - STALL_THRESHOLD.as_secs_f64() * 1000.0;
+            }
+            seeks.push(serde_json::json!({
+                "label": label,
+                "at_sec": round1(elapsed),
+                "offset": target,
+                "ttfb_ms": round1(got.1),
+                "total_ms": round1(lat),
+                "cache_hit": after.saturating_sub(before) == 0,
+                "downloaded_delta": after.saturating_sub(before),
+            }));
+            read_pos = target + got.0;
+            if read_pos >= total {
+                read_pos = 0;
+            }
+            next_seek += 1;
+            continue;
+        }
+        // 按码率消费（节拍由 played 决定，seek 后继续）
+        let due = Duration::from_secs_f64(played as f64 * 8.0 / play_bps as f64);
+        if due > t0.elapsed() {
+            tokio::time::sleep(due - t0.elapsed()).await;
+        }
+        let end = (read_pos + play_chunk - 1).min(total - 1);
+        let req0 = Instant::now();
+        let got = read_range(&bench.client, &handle.url, read_pos, end)
+            .await
+            .map(|(b, _, _)| b.len() as u64)
+            .unwrap_or(0);
+        let req_ms = req0.elapsed().as_secs_f64() * 1000.0;
+        max_req_ms = max_req_ms.max(req_ms);
+        requests += 1;
+        if req0.elapsed() > STALL_THRESHOLD {
+            stalls += 1;
+            stall_ms_total += (req0.elapsed() - STALL_THRESHOLD).as_secs_f64() * 1000.0;
+        }
+        if got == 0 {
+            break;
+        }
+        played = played.saturating_add(got);
+        read_pos += got;
+        if read_pos >= total {
+            read_pos = 0; // 播完回卷继续压测（节拍时钟不重置）
+        }
+        // 每 15s 采样
+        if last_sample.elapsed().as_secs_f64() >= 15.0 {
+            last_sample = Instant::now();
+            let st = bench.proxy.stats(&handle.token).unwrap_or_default();
+            let rss = rss_kb().unwrap_or(0);
+            rss_max = rss_max.max(rss);
+            samples.push(serde_json::json!({
+                "at_sec": round1(t0.elapsed().as_secs_f64()),
+                "downloaded_bytes": st.downloaded_bytes,
+                "buffered_bytes": st.buffered_bytes,
+                "upstream_restarts": st.upstream_restarts,
+                "errors": st.errors,
+                "fatal": st.fatal,
+                "weak_network": st.weak_network,
+                "rss_kb": rss,
+            }));
+        }
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let st = bench.proxy.stats(&handle.token).unwrap_or_default();
+    let rss_end = rss_kb();
+    let consumed = played;
+    Ok(serde_json::json!({
+        "requested_seconds": seconds,
+        "actual_seconds": round1(elapsed),
+        "play_bps": play_bps,
+        "play_bps_mbps": round2(play_bps as f64 / 1_000_000.0),
+        "startup_ttfb_ms": round1(startup_ttfb),
+        "startup_total_ms": round1(startup_total),
+        "requests": requests,
+        "stalls": stalls,
+        "stall_ms_total": round1(stall_ms_total),
+        "max_req_ms": round1(max_req_ms),
+        "avg_mbps": round2(consumed as f64 * 8.0 / elapsed.max(0.001) / 1_000_000.0),
+        "consumed_bytes": consumed,
+        "stats_end": stats_snapshot(&st),
+        "rss_kb_start": rss0,
+        "rss_kb_end": rss_end,
+        "rss_kb_max": rss_max,
+        "samples": samples,
+        "seeks": seeks,
+    }))
+}
+
+/// HLS 长播稳定性：按分片自然速率循环拉流 `seconds` 秒，并在 20/50/80% 时间 seek 到
+/// 25/50/75% 位置（单分片重新拉取计时）；统计停顿/最长分片耗时/实际带宽。
+async fn hls_longplay(link: &DirectLink, seconds: f64) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("HLS HTTP 客户端失败：{e}"))?;
+    let headers = link.headers.clone();
+    let (body, m3u8_ttfb, m3u8_total) = hls_get(&client, &link.url, &headers).await?;
+    let text = String::from_utf8_lossy(&body).to_string();
+    let mut segments: Vec<HlsSegment> = Vec::new();
+    let mut pending_dur: Option<f64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("#EXTINF:") {
+            pending_dur = v
+                .split(',')
+                .next()
+                .and_then(|s| s.trim().parse::<f64>().ok());
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if let Some(dur) = pending_dur.take() {
+                segments.push(HlsSegment {
+                    duration: dur,
+                    url: join_url(&link.url, line),
+                });
+            }
+        }
+    }
+    if segments.is_empty() {
+        return Err("m3u8 里没有分片（可能是 master playlist）".into());
+    }
+    let duration: f64 = segments.iter().map(|s| s.duration).sum();
+    let t0 = Instant::now();
+    let mut idx = 0usize;
+    let mut pos_time = 0f64;
+    let mut seg_fetched = 0u64;
+    let mut bytes = 0u64;
+    let mut loops = 0u64;
+    let mut stalls = 0u64;
+    let mut stall_ms = 0f64;
+    let mut max_seg_ms = 0f64;
+    let mut seeks: Vec<serde_json::Value> = Vec::new();
+    let mut next_seek = 0usize;
+    let seek_plan: [(f64, f64); 3] = [(0.2, 0.25), (0.5, 0.5), (0.8, 0.75)];
+    while t0.elapsed().as_secs_f64() < seconds {
+        // 到点 seek（跳到目标比例对应分片，记录单分片拉取耗时）
+        if next_seek < seek_plan.len()
+            && t0.elapsed().as_secs_f64() >= seek_plan[next_seek].0 * seconds
+        {
+            let (_, frac) = seek_plan[next_seek];
+            let target_time = duration * frac;
+            let mut acc = 0f64;
+            let mut ti = 0usize;
+            for (i, s) in segments.iter().enumerate() {
+                if acc + s.duration > target_time {
+                    ti = i;
+                    break;
+                }
+                acc += s.duration;
+            }
+            let st = Instant::now();
+            let fetched = hls_get(&client, &segments[ti].url, &headers).await;
+            let lat = st.elapsed().as_secs_f64() * 1000.0;
+            max_seg_ms = max_seg_ms.max(lat);
+            if lat > 1500.0 {
+                stalls += 1;
+                stall_ms += lat - 1500.0;
+            }
+            if let Ok((b, _, _)) = &fetched {
+                bytes += b.len() as u64;
+                seg_fetched += 1;
+            }
+            seeks.push(serde_json::json!({
+                "at_sec": round1(t0.elapsed().as_secs_f64()),
+                "target_secs": round2(target_time),
+                "segment_index": ti,
+                "fetch_ms": round1(lat),
+                "ok": fetched.is_ok(),
+                "bytes": fetched.as_ref().map(|(b,_,_)| b.len()).unwrap_or(0),
+            }));
+            idx = (ti + 1) % segments.len();
+            pos_time = target_time + segments[ti].duration;
+            next_seek += 1;
+            continue;
+        }
+        // 自然速率：等到该分片应在的时间点
+        if pos_time > t0.elapsed().as_secs_f64() {
+            tokio::time::sleep(Duration::from_secs_f64(
+                (pos_time - t0.elapsed().as_secs_f64()).min(1.0),
+            ))
+            .await;
+            continue;
+        }
+        let seg = &segments[idx];
+        let st = Instant::now();
+        let fetched = hls_get(&client, &seg.url, &headers).await;
+        let lat = st.elapsed().as_secs_f64() * 1000.0;
+        max_seg_ms = max_seg_ms.max(lat);
+        if lat > 1500.0 {
+            stalls += 1;
+            stall_ms += lat - 1500.0;
+        }
+        if let Ok((b, _, _)) = fetched {
+            bytes += b.len() as u64;
+            seg_fetched += 1;
+        }
+        pos_time += seg.duration;
+        idx += 1;
+        if idx >= segments.len() {
+            idx = 0;
+            loops += 1;
+        }
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    Ok(serde_json::json!({
+        "requested_seconds": seconds,
+        "actual_seconds": round1(elapsed),
+        "content_duration_secs": round2(duration),
+        "segments_total": segments.len(),
+        "segments_fetched": seg_fetched,
+        "playlist_loops": loops,
+        "m3u8_total_ms": round1(m3u8_total),
+        "m3u8_ttfb_ms": round1(m3u8_ttfb),
+        "bytes": bytes,
+        "avg_mbps": round2(bytes as f64 * 8.0 / elapsed.max(0.001) / 1_000_000.0),
+        "stalls": stalls,
+        "stall_ms_total": round1(stall_ms),
+        "max_segment_ms": round1(max_seg_ms),
+        "seeks": seeks,
+        "stall_threshold_ms": 1500,
+    }))
+}
+
+/// 会话重建：close token → 重新 resolve_playback（新会话）→ fatal 应重置并可再次熔断。
+async fn rebuild_test(
+    link: DirectLink,
+    remote_path: &str,
+    cfg: &StreamConfig,
+    opts: &Options,
+) -> Result<serde_json::Value, String> {
+    let mut rounds: Vec<serde_json::Value> = Vec::new();
+    // 模拟 GUI：同一个 StreamProxy，close 旧 token 后重新 resolve
+    let proxy = StreamProxy::new(cfg.clone());
+    for round in 1..=2u32 {
+        let provider = Arc::new(FixedProvider {
+            link: link.clone(),
+            key: format!("rebuild-{}", opts.remote_path),
+        });
+        let t0 = Instant::now();
+        let source = resolve_playback_with_provider(&proxy, provider, remote_path)
+            .await
+            .map_err(|e| format!("第 {round} 轮 resolve 失败：{e}"))?;
+        let token = source.token().map(|s| s.to_string());
+        let open_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if let Some(tk) = &token {
+            let url = source.url().to_string();
+            // 触发一次读取（永久 403 场景会失败；正常文件会成功）
+            let req_status = match read_range(&proxy_client(), &url, 0, 65535).await {
+                Ok((_, _, _)) => serde_json::json!({"ok": true}),
+                Err(e) => serde_json::json!({"ok": false, "error": e}),
+            };
+            // 轮询最多 10s 等待熔断/稳定
+            let mut fatal = false;
+            for _ in 0..100 {
+                if let Some(st) = proxy.stats(tk) {
+                    if st.fatal {
+                        fatal = true;
+                        let st = proxy.stats(tk).unwrap();
+                        rounds.push(serde_json::json!({
+                            "round": round,
+                            "open_ms": round1(open_ms),
+                            "request": req_status,
+                            "fatal": fatal,
+                            "stats": stats_snapshot(&st),
+                            "fatal_reason": st.fatal_reason,
+                            "waited_ms": round1(t0.elapsed().as_secs_f64() * 1000.0),
+                        }));
+                        break;
+                    }
+                }
+                if t0.elapsed().as_secs_f64() > 10.0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !fatal {
+                let st = proxy.stats(tk).unwrap_or_default();
+                rounds.push(serde_json::json!({
+                    "round": round,
+                    "open_ms": round1(open_ms),
+                    "request": req_status,
+                    "fatal": false,
+                    "stats": stats_snapshot(&st),
+                    "note": "10s 内未熔断",
+                }));
+            }
+            proxy.close(tk);
+        } else {
+            rounds.push(serde_json::json!({
+                "round": round, "direct_hls": true, "note": "HLS 直连无代理会话"
+            }));
+        }
+        // 稍微等待旧会话任务退出
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    proxy.shutdown().await;
+    Ok(serde_json::json!({
+        "rounds": rounds,
+        "note": "每轮 close 旧 token + 重新 resolve_playback（模拟 GUI 重试）；fatal 应为新会话重置",
+    }))
+}
+
+fn proxy_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("bench client")
+}
+
 // ───────────────────────── matrix ─────────────────────────
 
 fn matrix_configs() -> Vec<(u64, u64, usize)> {
@@ -1288,6 +1704,16 @@ async fn run() -> Result<(), String> {
         },
     });
 
+    // HLS 长播稳定性（必须先于通用 HLS 分支：is_hls=true 时避免被先截获）
+    if opts.mode == Mode::HlsLong {
+        if !link.is_hls {
+            return Err("--mode hls-long 需要输入 is_hls=true 的直链 JSON".into());
+        }
+        result["hls_long"] = hls_longplay(&link, opts.seconds.max(30.0)).await?;
+        let _ = std::fs::remove_dir_all(&base_dir);
+        return emit(result, opts.out.as_deref());
+    }
+
     // HLS 分支（HLS 直链不经过 Range 代理）
     if link.is_hls || opts.mode == Mode::Hls {
         if !link.is_hls {
@@ -1320,6 +1746,33 @@ async fn run() -> Result<(), String> {
         max_link_restarts: opts.max_restarts,
         ..StreamConfig::default()
     };
+
+    // 长播稳定性：代理模拟按码率连续消费 N 秒 + 定时 seek（前/中/后/回看）+ 内存/缓存采样
+    if opts.mode == Mode::Longplay {
+        let bench = Bench::new(make_cfg("longplay"))?;
+        let handle = bench.open(link.clone(), &opts.remote_path).await?;
+        result["longplay"] = longplay(
+            &bench,
+            &handle,
+            total,
+            opts.seconds.max(60.0),
+            opts.play_bps,
+            opts.chunk,
+        )
+        .await?;
+        bench.proxy.close(&handle.token);
+        bench.finish().await;
+        let _ = std::fs::remove_dir_all(&base_dir);
+        return emit(result, opts.out.as_deref());
+    }
+
+    // 会话重建：close 旧 token + 重新 resolve（新会话），fatal 应重置并再次在 ≤N 块内熔断
+    if opts.mode == Mode::Rebuild {
+        result["rebuild"] =
+            rebuild_test(link.clone(), &opts.remote_path, &make_cfg("rebuild"), &opts).await?;
+        let _ = std::fs::remove_dir_all(&base_dir);
+        return emit(result, opts.out.as_deref());
+    }
 
     // mpv 端到端冒烟：代理 URL + 系统 mpv（headless）→ 起播耗时（区分代理慢 vs 渲染慢）
     if opts.mode == Mode::Mpv {

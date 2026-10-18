@@ -1510,3 +1510,57 @@ async fn normal_file_never_trips_breaker() {
     assert!(stats.fatal_reason.is_empty());
     cleanup(&proxy).await;
 }
+
+#[tokio::test]
+async fn session_rebuild_resets_fatal_and_trips_again_bounded() {
+    let tmp = TempDir::new("t24-rebuild");
+    let data = body_of(4 * 1024 * 1024);
+    let broken = MockUpstream::start(data.clone(), true).await;
+    broken.state.set_forced_status(Some(403));
+    let provider = MockProvider::new(broken.url.clone(), data.len() as u64);
+    let proxy = StreamProxy::new(breaker_config(
+        tmp.path(),
+        1024 * 1024,
+        8 * 1024 * 1024,
+        2,
+        2,
+    ));
+    let mut rounds = Vec::new();
+    for round in 0..2u32 {
+        let handle = proxy
+            .open_with_provider(provider.clone(), "/no-access.mp4")
+            .await
+            .unwrap();
+        // 新会话 fatal 应已重置
+        let fresh = proxy.stats(&handle.token).unwrap();
+        assert!(!fresh.fatal, "第 {round} 轮新会话 fatal 应重置：{fresh:?}");
+        // 触发失败并等待熔断
+        let _ = client()
+            .get(&handle.url)
+            .header("Range", "bytes=0-65535")
+            .send()
+            .await;
+        let mut fatal = false;
+        for _ in 0..100 {
+            if proxy.stats(&handle.token).map(|s| s.fatal).unwrap_or(false) {
+                fatal = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let st = proxy.stats(&handle.token).unwrap();
+        assert!(fatal, "第 {round} 轮应熔断：{st:?}");
+        assert!(st.fatal_reason.contains("403"));
+        assert!(st.consecutive_failures >= 2);
+        rounds.push((st.upstream_restarts, st.consecutive_failures));
+        proxy.close(&handle.token);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    for (i, (restarts, consec)) in rounds.iter().enumerate() {
+        assert!(
+            *restarts <= 1 + 2 * 2 + 2,
+            "第 {i} 轮换链应被熔断限制：restarts={restarts} consecutive={consec}"
+        );
+    }
+    cleanup(&proxy).await;
+}
