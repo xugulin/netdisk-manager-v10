@@ -4,7 +4,7 @@
 //! `${httpHeader.cookie}` 与 `__puus`。因此请求头必须带完整 Cookie + Referer，
 //! 被拒后强制 `GET member` 刷新 `__puus` 再重试一次（并把新值持久化）。
 
-use crate::{as_str, as_u64, data_of, QuarkDrive, UA_QQ};
+use crate::{as_str, as_u64, data_of, play, QuarkDrive, UA_QQ};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -82,9 +82,66 @@ impl QuarkDrive {
         if entry.is_dir {
             return Err(Error::other(format!("目录没有下载直链：{path}")));
         }
+        self.direct_link_for_entry(&entry).await
+    }
+
+    /// 为已解析条目取播放/下载直链。
+    ///
+    /// 夸克对大文件（实测 >100MB）的 `file/download` 返回 23018
+    /// `download file size limit`；视频可改走云端转码 HLS（`is_hls=true`，
+    /// 详见 [`crate::play`]），非视频只能返回可读业务错误。
+    pub(crate) async fn direct_link_for_entry(&self, entry: &RemoteEntry) -> Result<DirectLink> {
+        let is_video = play::is_video_entry(entry);
+        // 大视频优先走云端转码（省掉一次注定失败的 file/download 请求）；
+        // 转码不可用时再退化到直链，由直链给出精确的可读错误。
+        if is_video && entry.size > play::DOWNLOAD_SIZE_LIMIT_BYTES {
+            match self.fetch_play_link(entry).await {
+                Ok(link) => {
+                    wp_core::log_debug!(
+                        "夸克",
+                        "大文件改走云端转码 HLS：{}（{:.1}MB）",
+                        entry.name,
+                        entry.size as f64 / 1048576.0
+                    );
+                    return Ok(link);
+                }
+                Err(e) if play::is_play_unavailable(&e) => {
+                    wp_core::log_warn!(
+                        "夸克",
+                        "大视频云端转码不可用，回退直链：{}",
+                        wp_core::error::err_line(&e)
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
         // 直链本身不强制 __puus，但下载会；顺手补一次（失败不阻塞取链接）。
         let _ = self.api.refresh_puus(false).await;
-        let info = self.fetch_download_info(&entry.id).await?;
+        match self.fetch_download_info(&entry.id).await {
+            Ok(info) => {
+                let mut link = self.direct_link_from_info(entry, &info)?;
+                link.is_hls = false;
+                Ok(link)
+            }
+            Err(e) if play::is_download_limit_error(&e) => {
+                // 未预先走 HLS 的视频（体积判据偏差/接口未给 size）在这里兜底。
+                if is_video {
+                    return match self.fetch_play_link(entry).await {
+                        Ok(link) => Ok(link),
+                        Err(pe) if play::is_play_unavailable(&pe) => {
+                            Err(play::download_limit_error(entry, true))
+                        }
+                        Err(pe) => Err(pe),
+                    };
+                }
+                Err(play::download_limit_error(entry, false))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `file/download` 返回项 → [`DirectLink`]（普通 Range 直链，`is_hls=false`）。
+    fn direct_link_from_info(&self, entry: &RemoteEntry, info: &Value) -> Result<DirectLink> {
         let url = as_str(info.get("download_url")).unwrap_or_default();
         if url.trim().is_empty() {
             return Err(Error::other(format!("未取到下载直链（fid={}）", entry.id)));
@@ -99,6 +156,7 @@ impl QuarkDrive {
             expire_at: None,
             size,
             file_name,
+            is_hls: false,
         })
     }
 
@@ -115,7 +173,16 @@ impl QuarkDrive {
             return Err(Error::other(format!("不能下载目录：{remote}")));
         }
         let _ = self.api.refresh_puus(false).await;
-        let info = self.fetch_download_info(&entry.id).await?;
+        let info = match self.fetch_download_info(&entry.id).await {
+            Ok(info) => info,
+            Err(e) if play::is_download_limit_error(&e) => {
+                return Err(play::download_limit_error(
+                    &entry,
+                    play::is_video_entry(&entry),
+                ))
+            }
+            Err(e) => return Err(e),
+        };
         let url = as_str(info.get("download_url")).unwrap_or_default();
         if url.trim().is_empty() {
             return Err(Error::other(format!("未取到下载直链（fid={}）", entry.id)));

@@ -10,12 +10,14 @@ wp-core.workspace = true
 wp-subtitle.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 reqwest.workspace = true
 async-trait.workspace = true
-futures-util.workspace = true
+sha2.workspace = true
 
 [features]
 default = []
+# 本地 LLM Provider：OpenAI 兼容本地服务（llama-server / vLLM / Ollama）。
 local-llm = []
+# 本地 ASR Provider：whisper.cpp 的 whisper-cli 外部进程。
 local-whisper = []

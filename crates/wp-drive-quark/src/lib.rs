@@ -15,6 +15,7 @@
 mod auth;
 mod download;
 mod files;
+mod play;
 mod recycle;
 mod session;
 mod share;
