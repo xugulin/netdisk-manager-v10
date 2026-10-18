@@ -31,8 +31,8 @@ fn main() {
         ..AssOptions::default()
     };
     let report = build_bilingual_ass_from_doc(&doc, &translated, &opts);
-    eprint!(
-        "matched={} missing={} bytes={}\n",
+    eprintln!(
+        "matched={} missing={} bytes={}",
         report.matched,
         report.missing,
         report.content.len()

@@ -1,0 +1,182 @@
+{
+  "note": "弹幕格式矩阵期望值（人工编写）。source: BilibiliXml/LocalFile/Generated；texts=精确文本；modes=Scroll/Top/Bottom；colors=0xRRGGBB 十进制；users=Option<String>（null=无）；返回 roundtrip 由测试计算。",
+  "files": [
+    {
+      "file": "01_bilibili_basic.xml",
+      "kind": "bilibili_xml",
+      "source": "BilibiliXml",
+      "comment_count": 4,
+      "first_time_ms": 1500,
+      "last_time_ms": 4750,
+      "texts": [
+        "普通滚动",
+        "顶部红色",
+        "底部蓝色 & 转义",
+        "绿色 <标签>"
+      ],
+      "modes": [
+        "Scroll",
+        "Top",
+        "Bottom",
+        "Scroll"
+      ],
+      "colors": [
+        16777215,
+        16711680,
+        255,
+        65280
+      ],
+      "font_sizes": [
+        25.0,
+        30.0,
+        18.0,
+        25.0
+      ],
+      "users": [
+        "user_a",
+        "user_b",
+        null,
+        "user_d"
+      ]
+    },
+    {
+      "file": "02_bilibili_bad_lines.xml",
+      "kind": "bilibili_xml",
+      "source": "BilibiliXml",
+      "comment_count": 2,
+      "first_time_ms": 0,
+      "last_time_ms": 4000,
+      "texts": [
+        "负时间裁剪",
+        "正常一条"
+      ],
+      "modes": [
+        "Scroll",
+        "Scroll"
+      ]
+    },
+    {
+      "file": "03_bilibili_escapes.xml",
+      "kind": "bilibili_xml",
+      "source": "BilibiliXml",
+      "comment_count": 1,
+      "first_time_ms": 1000,
+      "last_time_ms": 1000,
+      "texts": [
+        "A & B < C > \"D\" 'E' 'F' 中文"
+      ]
+    },
+    {
+      "file": "04_json_bilibili_api.json",
+      "kind": "json",
+      "source": "BilibiliXml",
+      "comment_count": 3,
+      "first_time_ms": 1500,
+      "last_time_ms": 3500,
+      "texts": [
+        "API 滚动 & 实体",
+        "API 顶部",
+        "API 底部"
+      ],
+      "modes": [
+        "Scroll",
+        "Top",
+        "Bottom"
+      ],
+      "colors": [
+        16777215,
+        16711680,
+        255
+      ],
+      "font_sizes": [
+        25.0,
+        30.0,
+        18.0
+      ],
+      "users": [
+        "abc",
+        "def",
+        null
+      ]
+    },
+    {
+      "file": "05_json_plain_array.json",
+      "kind": "json",
+      "source": "LocalFile",
+      "comment_count": 3,
+      "first_time_ms": 1500,
+      "last_time_ms": 3500,
+      "texts": [
+        "秒时间",
+        "毫秒时间",
+        "简写字段"
+      ],
+      "modes": [
+        "Scroll",
+        "Top",
+        "Bottom"
+      ],
+      "colors": [
+        16711680,
+        16777215,
+        65280
+      ]
+    },
+    {
+      "file": "06_json_doc_format.json",
+      "kind": "json",
+      "source": "Generated",
+      "comment_count": 2,
+      "first_time_ms": 500,
+      "last_time_ms": 1500,
+      "texts": [
+        "文档格式A",
+        "文档格式B"
+      ],
+      "modes": [
+        "Scroll",
+        "Top"
+      ],
+      "colors": [
+        255,
+        16711680
+      ],
+      "font_sizes": [
+        25.0,
+        30.0
+      ],
+      "users": [
+        "u1",
+        null
+      ]
+    },
+    {
+      "file": "07_import.ass",
+      "kind": "ass_import",
+      "source": "LocalFile",
+      "comment_count": 3,
+      "first_time_ms": 1500,
+      "last_time_ms": 5000,
+      "texts": [
+        "红色滚动",
+        "蓝色顶部",
+        "普通换行 第二行"
+      ],
+      "modes": [
+        "Scroll",
+        "Top",
+        "Scroll"
+      ],
+      "colors": [
+        16711680,
+        255,
+        16777215
+      ],
+      "font_sizes": [
+        25.0,
+        30.0,
+        25.0
+      ]
+    }
+  ]
+}

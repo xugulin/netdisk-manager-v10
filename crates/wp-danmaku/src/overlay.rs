@@ -374,7 +374,7 @@ mod tests {
         assert!(approx(small.font_px, 25.0 * 0.5));
         assert!(approx(large.font_px, 25.0));
         // 窗口缩放后相对位置一致
-        assert!(approx((small.x / 1920.0) as f32, (large.x / 1920.0) as f32));
+        assert!(approx(small.x / 1920.0, large.x / 1920.0));
     }
 
     #[test]

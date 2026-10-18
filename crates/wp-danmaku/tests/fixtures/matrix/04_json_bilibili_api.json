@@ -1,0 +1,31 @@
+{
+  "code": 0,
+  "data": {
+    "elems": [
+      {
+        "progress": 1500,
+        "mode": 1,
+        "fontsize": 25,
+        "color": 16777215,
+        "midHash": "abc",
+        "content": "API 滚动 &amp; 实体"
+      },
+      {
+        "progress": 2500,
+        "mode": 5,
+        "fontsize": 30,
+        "color": 16711680,
+        "midHash": "def",
+        "content": "API 顶部"
+      },
+      {
+        "progress": 3500,
+        "mode": 4,
+        "fontsize": 18,
+        "color": 255,
+        "midHash": "0",
+        "content": "API 底部"
+      }
+    ]
+  }
+}

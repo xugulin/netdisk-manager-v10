@@ -17,7 +17,13 @@ pub fn decode_entities(s: &str) -> String {
         out.push_str(&rest[..idx]);
         let tail = &rest[idx..];
         // 实体最多 ~12 字符，避免把正文里孤立的 & 当实体
-        let window = &tail[..tail.len().min(12)];
+        // 只取前 12 字节做实体窗口；必须落在 char 边界上（CJK/emoji 会被切坏）
+        let cut = tail
+            .char_indices()
+            .find(|(index, _)| *index >= 12)
+            .map(|(index, _)| index)
+            .unwrap_or(tail.len());
+        let window = &tail[..cut];
         if let Some(semi) = window.find(';') {
             let entity = &tail[1..semi];
             let decoded = match entity {
@@ -193,6 +199,13 @@ pub fn split_leading_override(s: &str) -> (Option<String>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unescape_entity_followed_by_cjk_no_panic() {
+        // `&amp; 转义` 的实体窗口 12 字节会切到 CJK 中间（历史 panic 回归）
+        let decoded = super::decode_entities("A &amp; 转义 与 &amp; 中文 🎉");
+        assert_eq!(decoded, "A & 转义 与 & 中文 🎉");
+    }
 
     #[test]
     fn newlines_and_bom() {

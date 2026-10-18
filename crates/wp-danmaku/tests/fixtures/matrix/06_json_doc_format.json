@@ -1,0 +1,21 @@
+{
+  "source": "Generated",
+  "comments": [
+    {
+      "time_ms": 500,
+      "mode": "Scroll",
+      "color": 255,
+      "font_size": 25.0,
+      "text": "文档格式A",
+      "user": "u1"
+    },
+    {
+      "time_ms": 1500,
+      "mode": "Top",
+      "color": 16711680,
+      "font_size": 30.0,
+      "text": "文档格式B",
+      "user": null
+    }
+  ]
+}

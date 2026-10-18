@@ -329,10 +329,12 @@ mod tests {
 
     #[test]
     fn options_sanitized() {
-        let mut o = AssOptions::default();
-        o.font_size = 0;
-        o.margin_v = -10;
-        o.font_name = "  ".into();
+        let o = AssOptions {
+            font_size: 0,
+            margin_v: -10,
+            font_name: "  ".into(),
+            ..AssOptions::default()
+        };
         let s = o.sanitized();
         assert_eq!(s.font_size, 48);
         assert_eq!(s.margin_v, 0);

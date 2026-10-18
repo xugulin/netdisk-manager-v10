@@ -1,0 +1,157 @@
+{
+  "note": "字幕格式矩阵期望值（人工编写）。字段：format/cue_count/first_start_ms/last_end_ms；texts=精确文本；text_lens=文本字符数；raw_style_first=首条 raw_style；header_contains=解析后 ass_header 应包含的子串。",
+  "files": [
+    {
+      "file": "01_srt_basic.srt",
+      "format": "Srt",
+      "cue_count": 2,
+      "first_start_ms": 1000,
+      "last_end_ms": 6000,
+      "texts": [
+        "第一句",
+        "Second line"
+      ]
+    },
+    {
+      "file": "02_srt_multiline_html.srt",
+      "format": "Srt",
+      "cue_count": 2,
+      "first_start_ms": 1000,
+      "last_end_ms": 6000,
+      "texts": [
+        "斜体与彩色混合\n第二行\n第三行",
+        "A & B < C"
+      ]
+    },
+    {
+      "file": "03_srt_ass_prefix.srt",
+      "format": "Srt",
+      "cue_count": 1,
+      "first_start_ms": 1000,
+      "last_end_ms": 2000,
+      "texts": [
+        "顶部文本"
+      ],
+      "raw_style_first": "{\\an8}{\\pos(960,50)}"
+    },
+    {
+      "file": "04_srt_bad_lines.srt",
+      "format": "Srt",
+      "cue_count": 2,
+      "first_start_ms": 1000,
+      "last_end_ms": 7000,
+      "texts": [
+        "好的一行",
+        "另一条好的"
+      ]
+    },
+    {
+      "file": "05_srt_negative_overhour.srt",
+      "format": "Srt",
+      "cue_count": 3,
+      "first_start_ms": 0,
+      "last_end_ms": 356401000,
+      "texts": [
+        "跨零起点",
+        "跨小时",
+        "超长时长"
+      ]
+    },
+    {
+      "file": "06_vtt_note_settings.vtt",
+      "format": "Vtt",
+      "cue_count": 2,
+      "first_start_ms": 1000,
+      "last_end_ms": 6000,
+      "texts": [
+        "你好 & 世界",
+        "短格式时刻"
+      ]
+    },
+    {
+      "file": "07_vtt_cue_ids_multi.vtt",
+      "format": "Vtt",
+      "cue_count": 3,
+      "first_start_ms": 500,
+      "last_end_ms": 125500,
+      "texts": [
+        "第一句",
+        "第二句\n多行第二行",
+        "第四分钟"
+      ]
+    },
+    {
+      "file": "08_ass_full.ass",
+      "format": "Ass",
+      "cue_count": 2,
+      "first_start_ms": 1000,
+      "last_end_ms": 6000,
+      "texts": [
+        "第一句\n换行",
+        "Hello, this, has commas"
+      ],
+      "raw_style_first": "{\\pos(960,100)\\fad(200,200)}",
+      "header_contains": [
+        "[V4+ Styles]",
+        "[Fonts]",
+        "Style: CN,",
+        "PlayResX: 1920"
+      ]
+    },
+    {
+      "file": "09_ssa_legacy.ssa",
+      "format": "Ssa",
+      "cue_count": 1,
+      "first_start_ms": 1000,
+      "last_end_ms": 2500,
+      "texts": [
+        "SSA 特效测试斜体"
+      ],
+      "header_contains": [
+        "ScriptType: v4.00",
+        "[V4 Styles]"
+      ]
+    },
+    {
+      "file": "10_ass_missing_fields.ass",
+      "format": "Ass",
+      "cue_count": 1,
+      "first_start_ms": 1000,
+      "last_end_ms": 2000,
+      "texts": [
+        "字段乱序也能解析"
+      ]
+    },
+    {
+      "file": "11_ja_emoji_long.srt",
+      "format": "Srt",
+      "cue_count": 2,
+      "first_start_ms": 1000,
+      "last_end_ms": 5000,
+      "texts": [
+        "こんにちは 🎉 世界！& テスト"
+      ],
+      "text_lens": [
+        null,
+        280
+      ]
+    },
+    {
+      "file": "12_srt_dot_coords.srt",
+      "format": "Srt",
+      "cue_count": 1,
+      "first_start_ms": 1250,
+      "last_end_ms": 3750,
+      "texts": [
+        "坐标弹幕"
+      ]
+    },
+    {
+      "file": "13_empty.srt",
+      "format": "Srt",
+      "cue_count": 0,
+      "first_start_ms": 0,
+      "last_end_ms": 0
+    }
+  ]
+}

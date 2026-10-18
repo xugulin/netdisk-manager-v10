@@ -283,10 +283,12 @@ mod tests {
     fn alpha_and_font_options() {
         let cfg = LayoutConfig::hd1080();
         let placed = vec![placed_scroll(0, 4000, "半透明", 0x00FF00)];
-        let mut opts = AssRenderOptions::default();
-        opts.alpha = 128;
-        opts.font_name = "Custom Font".into();
-        opts.outline = 2.0;
+        let opts = AssRenderOptions {
+            alpha: 128,
+            font_name: "Custom Font".into(),
+            outline: 2.0,
+            ..AssRenderOptions::default()
+        };
         let ass = generate_ass_with_options(&placed, &cfg, &opts);
         assert!(ass.contains("\\alpha&H80&"));
         assert!(ass.contains("Style: Danmaku,Custom Font,25,"));
