@@ -5147,6 +5147,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wp-cli"
+version = "1.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wp-core",
+ "wp-drive",
+ "wp-drive-baidu",
+ "wp-drive-guangya",
+ "wp-drive-quark",
+]
+
+[[package]]
 name = "wp-core"
 version = "1.0.0"
 dependencies = [

@@ -200,6 +200,15 @@ pub(crate) async fn upload(
         return Err(Error::server(code, "上传令牌的 STS 凭证不完整"));
     }
     let base = token.endpoint_base()?;
+    wp_core::log_debug!(
+        "光鸭",
+        "上传令牌：endpoint={} bucket={} object={} gcid={} task={}",
+        base,
+        token.bucket_name,
+        token.object_path,
+        token.gcid,
+        token.task_id
+    );
     let content_type = sign::content_type_for(&file_name);
     let (chunk_size, part_count) = part_plan(size, opts.chunk_size);
     let use_multipart = size > SINGLE_PUT_LIMIT || (part_count > 1);
@@ -370,7 +379,13 @@ async fn multipart_upload(
     task_id: &mut String,
 ) -> Result<String> {
     let date = wp_net::crypto::rfc1123_now();
+    wp_core::log_debug!(
+        "光鸭",
+        "multipart: initiate upload 开始 object={}",
+        token.object_path
+    );
     let upload_id = initiate_multipart(drive, token, creds, base, content_type, &date).await?;
+    wp_core::log_debug!("光鸭", "multipart: initiate 成功 upload_id={}", upload_id);
     if drive.verbose {
         wp_core::log_debug!(
             "光鸭",
@@ -464,6 +479,11 @@ async fn multipart_upload(
         )));
     }
 
+    wp_core::log_debug!(
+        "光鸭",
+        "multipart: 分片全部上传完成（{} 片），OSS complete 开始",
+        parts.len()
+    );
     match complete_multipart(
         drive,
         token,
@@ -476,6 +496,7 @@ async fn multipart_upload(
     .await
     {
         Ok(etag) => {
+            wp_core::log_debug!("光鸭", "multipart: OSS complete 成功 etag={}", etag);
             // 通知光鸭业务服务端：taskId/gcid/parts（etag 原样带引号）。
             let parts_json: Vec<Value> = parts
                 .iter()
@@ -486,12 +507,24 @@ async fn multipart_upload(
                 "gcid": token.gcid,
                 "parts": parts_json,
             });
+            wp_core::log_debug!(
+                "光鸭",
+                "multipart: 业务 complete 请求 taskId={} parts={}",
+                task_id,
+                parts_json.len()
+            );
             if let Err(e) = drive
                 .api_post("/userres/v1/multipart/complete", notify, &[])
                 .await
             {
-                abort_multipart(drive, token, creds, base, &upload_id).await;
-                return Err(e);
+                // ⚠️ 真机实测（2026-10-18）：业务 complete 偶发 HTTP 410 code=128
+                //    "路径不允许访问"，但光鸭侧文件其实已经落地（列表可见、大小正确）。
+                //    因此这里**不能 abort/报错**，交给上层 wait_task(get_info_by_task_id)
+                //    用真实文件信息做最终判定：拿得到文件 → 成功；拿不到 → 再报错。
+                wp_core::log_warn!(
+                    "光鸭",
+                    "multipart: 业务 complete 返回异常（{e}），改由 get_info_by_task_id 确认文件是否落地"
+                );
             }
             report_progress(progress, pct(size, 950), size)?;
             Ok(etag)

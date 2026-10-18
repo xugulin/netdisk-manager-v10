@@ -351,10 +351,93 @@ impl BaiduDrive {
         Ok(token)
     }
 
-    /// 会话引导：`GET /api/gettemplatevariable`，刷新 bdstoken / uk。
+    /// 会话引导：优先 `GET /api/gettemplatevariable`，失败回退 `GET /api/loginStatus`。
     ///
-    /// 只补 CSRF 令牌，**不能续期 BDUSS/STOKEN**（文档 §3.7）。
+    /// 只补 CSRF 令牌，**不能续期 BDUSS/STOKEN**。
+    ///
+    /// ⚠️ 真机实测（2026-10-18 扫码会话 + V2 源码 `后端_百度.py:149/576` 记录）：
+    /// 有效会话下 `/api/gettemplatevariable` 也可能回 `errno:-6`，
+    /// 而 `/api/loginStatus?clienttype=1&channel=web` 会下发 bdstoken/uk。
+    /// 因此必须做双通道回退，否则扫码登录后会误判为「未登录」。
     pub(crate) async fn refresh_template(&self) -> Result<()> {
+        match self.refresh_via_template_variable().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                wp_core::log_warn!(
+                    "百度",
+                    "gettemplatevariable 刷新失败（{e}），回退 /api/loginStatus"
+                );
+            }
+        }
+        self.refresh_via_login_status().await
+    }
+
+    /// 回退通道：`GET /api/loginStatus?clienttype=1&app_id=250528&web=1&channel=web&version=0`。
+    ///
+    /// 请求特征（真机 HAR 实测）：**不带**业务公共参数（无 dp-logid / clienttype=0），
+    /// 响应 `login_info.{bdstoken,uk,username,vip_type}`。
+    async fn refresh_via_login_status(&self) -> Result<()> {
+        let url = format!(
+            "{PAN}/api/loginStatus?clienttype=1&app_id={APP_ID}&web=1&channel=web&version=0"
+        );
+        let cookie = self.cookie_header();
+        let mut req = self
+            .http
+            .api
+            .get(&url)
+            .header(ACCEPT, "application/json, text/plain, */*")
+            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+            .header(REFERER, "https://pan.baidu.com/")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .timeout(Duration::from_secs(20));
+        if !cookie.is_empty() {
+            req = req.header(COOKIE, cookie);
+        }
+        let resp = req.send().await.map_err(net_err)?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(net_err)?;
+        let v = parse_json_body(status, &text)?;
+        let errno = v.get("errno").and_then(Value::as_i64).unwrap_or(-1);
+        if errno != 0 {
+            return Err(map_errno(errno, &v));
+        }
+        let info = v
+            .get("login_info")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::server(-1, "loginStatus 响应缺少 login_info"))?;
+        let bdstoken = info
+            .get("bdstoken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if bdstoken.is_empty() {
+            return Err(Error::auth("会话无效：loginStatus 未返回 bdstoken"));
+        }
+        let uk = info.get("uk").and_then(Value::as_i64);
+        let username = info
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.mutate_session(|s| {
+            s.bdstoken = bdstoken;
+            if let Some(u) = uk {
+                s.uk = Some(u);
+            }
+        });
+        wp_core::log_info!(
+            "百度",
+            "会话已通过 /api/loginStatus 刷新：bdstoken({}) uk={:?} username={}",
+            self.bdstoken_value().len(),
+            self.uk_value(),
+            username
+        );
+        Ok(())
+    }
+
+    /// 主通道：`GET /api/gettemplatevariable`，刷新 bdstoken / uk。
+    async fn refresh_via_template_variable(&self) -> Result<()> {
         let fields = r#"["bdstoken","token","uk","isdocuser","servertime"]"#;
         let params = vec![("fields".to_string(), fields.to_string())];
         // 这里必须 Box::pin：refresh_template ↔ api_get ↔ execute_once ↔

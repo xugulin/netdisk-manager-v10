@@ -39,7 +39,7 @@ jobs:
             libgl1-mesa-dev xvfb fonts-noto-cjk
 
       - name: 编译（release）
-        run: cargo build --release -p wp-gui
+        run: cargo build --release -p wp-gui -p wp-cli
 
       - name: 单元测试
         run: cargo test --release -p wp-core -p wp-net -p wp-drive -p wp-transfer
@@ -54,7 +54,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p 出/网盘管理-${{ matrix.target }}
-          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys,os;m=json.load(sys.stdin);print(os.path.join(m["target_directory"],"release","网盘管理"))')" 出/网盘管理-${{ matrix.target }}/
+          T=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;m=json.load(sys.stdin);print(m["target_directory"])')
+          cp "$T/release/网盘管理" 出/网盘管理-${{ matrix.target }}/
+          cp "$T/release/wp-cli" 出/网盘管理-${{ matrix.target }}/
           cp -r docs 出/网盘管理-${{ matrix.target }}/
           cp README.md 出/网盘管理-${{ matrix.target }}/
           touch 出/网盘管理-${{ matrix.target }}/portable
@@ -69,6 +71,7 @@ jobs:
           $out = "出\网盘管理-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
           Copy-Item $src (Join-Path $out "网盘管理.exe")
+          Copy-Item (Join-Path $meta.target_directory "release\wp-cli.exe") (Join-Path $out "wp-cli.exe")
           Copy-Item docs (Join-Path $out "docs") -Recurse
           Copy-Item README.md $out
           New-Item -ItemType File -Path (Join-Path $out "portable") | Out-Null

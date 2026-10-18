@@ -9,8 +9,9 @@ members = [
     "crates/wp-drive-guangya",
     "crates/wp-transfer",
     "crates/wp-gui",
+    "crates/wp-cli",
 ]
-default-members = ["crates/wp-gui"]
+default-members = ["crates/wp-gui", "crates/wp-cli"]
 
 [workspace.package]
 version = "1.0.0"

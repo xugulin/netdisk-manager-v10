@@ -18,9 +18,9 @@ Set-Location $root
 
 Write-Host "==> 构建" -ForegroundColor Cyan
 if ($Debug) {
-  cargo build -p wp-gui
+  cargo build -p wp-gui -p wp-cli
 } else {
-  cargo build --release -p wp-gui
+  cargo build --release -p wp-gui -p wp-cli
 }
 
 # 用 cargo metadata 解析真实产物路径（尊重 CARGO_TARGET_DIR）
@@ -36,6 +36,8 @@ if ($Portable) {
   if (Test-Path $out) { Remove-Item -Recurse -Force $out }
   New-Item -ItemType Directory -Path $out | Out-Null
   Copy-Item $bin (Join-Path $out "网盘管理.exe")
+  $cli = Join-Path $meta.target_directory (Join-Path $mode "wp-cli.exe")
+  if (Test-Path $cli) { Copy-Item $cli (Join-Path $out "wp-cli.exe") }
   Copy-Item "docs" (Join-Path $out "docs") -Recurse -ErrorAction SilentlyContinue
   Copy-Item "README.md" $out -ErrorAction SilentlyContinue
   # 绿色版标记：数据写在 exe 旁（U 盘/解压即用）

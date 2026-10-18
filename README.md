@@ -81,7 +81,22 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Portable
                                                                   # delete/move/share/crosscopy/details/filepicker
 ```
 
-### 2.4 自动化验收结果（本机实测）
+### 2.4 命令行入口 `wp-cli`（真机联调 / 脚本化）
+
+GUI 之外还有同一套适配器的 CLI，适合批量验证、自动化和无显示环境（所有结果输出 JSON）：
+
+```bash
+./出/网盘管理-linux-x64/wp-cli --drive guangya login-qr --qr-out /tmp/qr.png  # 二维码存 PNG
+./出/网盘管理-linux-x64/wp-cli --drive guangya ls /
+./出/网盘管理-linux-x64/wp-cli --drive quark upload /tmp/a.bin /测试目录
+./出/网盘管理-linux-x64/wp-cli --drive quark download /测试目录/a.bin /tmp/a.bin
+./出/网盘管理-linux-x64/wp-cli --drive baidu account   # 账号/容量
+./出/网盘管理-linux-x64/wp-cli --help
+```
+
+（`--data-dir <目录>` 与 GUI 共用数据目录。）
+
+### 2.5 自动化验收结果（本机实测）
 
 | 项 | 结果 |
 |---|---|
@@ -89,6 +104,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Portable
 | `cargo test --workspace` | ✅ **159** 个测试全部通过 |
 | `cargo build --release -p wp-gui` | ✅ 单文件约 24 MB |
 | `scripts/smoke-headless.sh` | ✅ 17 项截图全部通过（页面 + 10 类对话框） |
+| **真机联调**（真实账号） | ✅ 光鸭/夸克全链路（登录/列目录/上传分片/下载 **sha256 一致**/直链/分享/删除）；百度读操作 ✅、写操作受官方扫码会话权限限制（需 Cookie 登录）——详见 [待验证清单](docs/待验证清单.md) |
 
 详细报告：[docs/验收报告.md](docs/验收报告.md)
 

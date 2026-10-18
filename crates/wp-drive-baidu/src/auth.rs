@@ -21,6 +21,7 @@ use wp_core::model::{AccountInfo, QrState, Quota};
 use wp_core::util::now_ts;
 use wp_core::{Error, Result};
 use wp_drive::{QrChallenge, QrPoll};
+use wp_net::crypto::url_encode;
 
 const PAN_MAIN: &str = "https://pan.baidu.com/disk/main";
 
@@ -394,28 +395,106 @@ async fn exchange_token(d: &BaiduDrive, login_token: &str) -> Result<()> {
     Ok(())
 }
 
+/// 建立 pan 域会话：**手动跟随 302 并收集每一跳的 Set-Cookie**。
+///
+/// 为什么不能交给 reqwest 自动跟随：pan 域的 STOKEN 只会出现在重定向链的
+/// `Set-Cookie` 里，自动跟随会丢掉中间响应头。不抓到它，会话里留的是
+/// passport 域那份 STOKEN —— 读接口能过，写接口恒 `errno:-6`（V2 源码
+/// `桥/后端_百度.py:43` 的真机结论）。
 async fn establish_pan_session(d: &BaiduDrive) {
-    let params = vec![
-        ("return_type".to_string(), "5".to_string()),
-        ("tpl".to_string(), "netdisk".to_string()),
-        ("u".to_string(), PAN_MAIN.to_string()),
-    ];
-    let url = format!("{PASSPORT}/v3/login/api/auth/");
-    let cookie = d.cookie_header();
-    let mut req = d
-        .http
-        .passport_follow
-        .get(&url)
-        .query(&params)
-        .header(REFERER, "https://pan.baidu.com/")
-        .timeout(Duration::from_secs(20));
-    if !cookie.is_empty() {
-        req = req.header(reqwest::header::COOKIE, cookie);
+    let mut url = format!(
+        "{PASSPORT}/v3/login/api/auth/?return_type=5&tpl=netdisk&u={}",
+        url_encode(PAN_MAIN)
+    );
+    let mut set_cookies: Vec<String> = Vec::new();
+    // pan 域 STOKEN 的权威来源：302 Location 里的 `stoken=<128字符>` 查询参数。
+    // 真机 HAR 实测：passport 域 STOKEN 是 64 字符、只能读；pan 域是 128 字符，
+    // 写接口（/api/create、上传）必须同时带 BDUSS + 这个 STOKEN。
+    let mut pan_stoken: Option<String> = None;
+    for hop in 0..6 {
+        let cookie = d.cookie_header();
+        let mut req = d
+            .http
+            .passport
+            .get(&url)
+            .header(REFERER, "https://pan.baidu.com/")
+            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+            .timeout(Duration::from_secs(20));
+        if !cookie.is_empty() {
+            req = req.header(reqwest::header::COOKIE, cookie);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                wp_core::log_warn!("百度", "pan 域会话建立失败（不影响登录）：{e}");
+                return;
+            }
+        };
+        let status = resp.status();
+        for raw in resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+        {
+            set_cookies.push(raw.to_string());
+        }
+        wp_core::log_debug!("百度", "pan 域会话 第 {hop} 跳 → HTTP {}", status.as_u16());
+        if !status.is_redirection() {
+            break;
+        }
+        let Some(loc) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            break;
+        };
+        // 从跳转地址里提取 pan 域 STOKEN（只认 128 字符以上的那份）
+        if pan_stoken.is_none() {
+            if let Ok(target) = url::Url::parse(&url).and_then(|base| base.join(loc)) {
+                for (k, v) in target.query_pairs() {
+                    if k == "stoken" && v.len() > 64 {
+                        pan_stoken = Some(v.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        url = match url::Url::parse(&url)
+            .ok()
+            .and_then(|base| base.join(loc).ok())
+        {
+            Some(u) => u.to_string(),
+            None => loc.to_string(),
+        };
     }
-    match req.send().await {
-        Ok(resp) => wp_core::log_debug!("百度", "pan 域会话建立 → HTTP {}", resp.status().as_u16()),
-        Err(e) => wp_core::log_warn!("百度", "pan 域会话建立失败（不影响登录）：{e}"),
+    if set_cookies.is_empty() {
+        wp_core::log_warn!("百度", "pan 域会话未收到任何 Set-Cookie（写操作可能只读）");
+        return;
     }
+    let captured = set_cookies.len();
+    let mut names: Vec<String> = Vec::new();
+    let mut old_len = 0usize;
+    d.mutate_session(|s| {
+        old_len = s.stoken.len();
+        for sc in &set_cookies {
+            if let Some(name) = s.apply_set_cookie(sc) {
+                names.push(name.to_string());
+            }
+        }
+        if let Some(st) = &pan_stoken {
+            s.stoken = st.clone();
+        }
+    });
+    wp_core::log_info!(
+        "百度",
+        "pan 域会话建立完成：STOKEN {} → {}（{} 个 Set-Cookie；捕获 {}）",
+        old_len,
+        d.session_snapshot().stoken.len(),
+        captured,
+        names.join("/")
+    );
 }
 
 async fn plant_subdomains(d: &BaiduDrive) {
@@ -484,8 +563,10 @@ pub(crate) async fn account(d: &BaiduDrive) -> Result<AccountInfo> {
     if !d.session_valid() {
         return Err(Error::auth("未登录：缺少 BDUSS/STOKEN"));
     }
-    // 同时充当会话有效性校验（文档建议：是否有效 && gettemplatevariable）。
-    d.refresh_template().await?;
+    // 同时充当会话有效性校验；双通道（模板变量 → loginStatus）都失败才告警。
+    if let Err(e) = d.refresh_template().await {
+        wp_core::log_warn!("百度", "会话刷新失败，仍尝试读取账号信息：{e}");
+    }
 
     let uk = d
         .uk_value()

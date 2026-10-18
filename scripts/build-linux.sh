@@ -26,9 +26,9 @@ done
 
 echo "==> 构建（$MODE）"
 if [ "$MODE" = "release" ]; then
-  cargo build --release -p wp-gui
+  cargo build --release -p wp-gui -p wp-cli
 else
-  cargo build -p wp-gui
+  cargo build -p wp-gui -p wp-cli
 fi
 
 # 用 cargo metadata 解析真实产物路径（尊重 CARGO_TARGET_DIR）
@@ -37,22 +37,23 @@ import json, subprocess, sys
 root, mode = sys.argv[1], sys.argv[2]
 meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=root))
 target_dir = meta["target_directory"]
-name = "网盘管理"
-print(f"{target_dir}/{mode}/{name}")
+print(f"{target_dir}/{mode}/网盘管理")
 PY
 )"
+CLI_BIN="$(dirname "$BIN")/wp-cli"
 if [ ! -x "$BIN" ]; then
   echo "构建产物不存在：$BIN" >&2
   exit 1
 fi
 echo "==> 产物：$BIN"
-ls -lh "$BIN"
+ls -lh "$BIN" "$CLI_BIN" 2>/dev/null || true
 
 if [ "$PORTABLE" = "1" ]; then
   OUT="$ROOT/出/网盘管理-linux-x64"
   rm -rf "$OUT"
   mkdir -p "$OUT"
   cp "$BIN" "$OUT/网盘管理"
+  [ -x "$CLI_BIN" ] && cp "$CLI_BIN" "$OUT/wp-cli"
   cp -r docs "$OUT/docs" 2>/dev/null || true
   cp README.md "$OUT/README.md" 2>/dev/null || true
   # 绿色版标记：数据写在可执行文件旁（U 盘/解压即用）
