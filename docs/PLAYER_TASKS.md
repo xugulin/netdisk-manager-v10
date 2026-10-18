@@ -252,9 +252,9 @@
 | 里程碑 | 状态 | 关键证据 |
 |---|---|---|
 | M0 技术验证 | ✅ 完成 | `docs/PLAYER_M0_RESULTS.md`（E1–E5 全部有数据） |
-| M1 播放内核 | ✅ 基本完成 | GUI 真实 libmpv 渲染截图 `出/验收截图/25-真实播放.png`；workspace 543 tests 全绿；headless 冒烟 24/24 |
+| M1 播放内核 | ✅ 完成（Linux） | GUI 真实 libmpv 渲染截图 `出/验收截图/25-真实播放.png`（bbox ≤1px）；workspace 543 tests 全绿；headless 冒烟 25/25（含真实播放 case） |
 | M2 完整字幕 | 🟡 内核完成（59+5 测试）、播放器面板已接 | 待真实内嵌字幕/PGS 真机矩阵与 AI 注入联调 |
-| M3 源接入 | 🟡 真机三盘 Range/HLS 完成；GUI 网盘播放待接线 | `wp_stream::playback::resolve_playback` 已就绪 |
+| M3 源接入 | 🟡 真机三盘播放矩阵完成（[PLAYER_REAL_DEVICE_MATRIX.md](PLAYER_REAL_DEVICE_MATRIX.md)）；GUI 网盘播放接线进行中（task-15） | `wp_stream::playback::resolve_playback` 已就绪 |
 | M4 AI 翻译 | 🟡 地基+闭环完成 | 待真实 key/本地 llama-server 真机评估与 GUI 按钮接线 |
 | M5 弹幕 | 🟡 内核完成（80+6）、GUI overlay 已接 | 待在线弹幕源/发送/搜索跳转接线与真机密度压测 |
 | M6 打包验收 | ⏳ 未开始 | 运行时打包脚本/Windows ANGLE 实测/许可合规清单 |

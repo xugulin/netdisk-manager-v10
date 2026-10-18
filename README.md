@@ -293,7 +293,8 @@ crates/
 | 里程碑 | 状态 | 证据 |
 |---|---|---|
 | **M0 技术验证** | ✅ 完成 | [PLAYER_M0_RESULTS.md](docs/PLAYER_M0_RESULTS.md)：LGPL libmpv 一键构建（3.3MB/3min）、Mode A render API 出帧+UI 同帧合成、ASS 弹幕副字幕轨、VAAPI copy-back（4K HEVC CPU 0.76→0.27 核）、HLS 真机播放+seek |
-| **M1 播放内核** | ✅ 基本完成 | GUI 已接真实 libmpv：`25-真实播放.png`（真实帧渲染 1920x1080，hwdec=vaapi-copy）；`cargo test --workspace` **543 passed / 0 failed**；headless 冒烟 **24/24**；真机桌面零拷贝/4K60 指标待下一轮 |
+| **M1 播放内核** | ✅ 完成（Linux） | GUI 真实 libmpv 播放：`25-真实播放.png`（真实帧满铺，bbox 偏差 ≤1px，00:17/00:20）；`cargo test --workspace` **543 passed / 0 failed**；headless 冒烟 **25/25**（含真实播放 case）；真机桌面零拷贝/4K60/Windows ANGLE 待下一轮 |
+| **M3 真机矩阵** | ✅ 三盘验证 | [PLAYER_REAL_DEVICE_MATRIX.md](docs/PLAYER_REAL_DEVICE_MATRIX.md)：百度/夸克/光鸭 6 用例（含夸克 HLS 173MB、光鸭 727MB）mpv 可播+seek；脚本可复跑 |
 | 流代理 | ✅ 完成 | [PLAYER_STREAM_M0.md](docs/PLAYER_STREAM_M0.md)：三盘 Range 206、磁盘预读缓存/过期换链、夸克 HLS 决策 |
 | 夸克大文件 | ✅ 完成 | [PLAYER_QUARK_STREAM.md](docs/PLAYER_QUARK_STREAM.md)：23018 突破 → 云端转码 HLS 真机可播可 seek |
 | 字幕/弹幕内核 | ✅ 完成 | 字幕 59+5、弹幕 80+6 测试；格式矩阵与集成素材在 `出/验收截图/字幕弹幕/` |
