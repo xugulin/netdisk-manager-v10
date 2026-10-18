@@ -181,10 +181,20 @@ pub(crate) fn err_text(v: &Value, fallback: &str) -> String {
 pub(crate) fn map_errno(code: i64, v: &Value) -> Error {
     let msg = err_text(v, "");
     match code {
+        // 真机实测：扫码登录的会话天然只读 —— 读接口正常、写接口恒 -6。
+        // 这里给出可执行的指引，而不是笼统的"未登录"。
         -6 => Error::auth(if msg.is_empty() {
-            "未登录或登录已过期（errno:-6）".to_string()
+            "未登录或会话只读（errno:-6）：读接口可用但写操作需要浏览器登录态；\
+             请在「登录 → Cookie」里导入 pan.baidu.com 的 Cookie"
+                .to_string()
         } else {
-            format!("未登录或登录已过期（errno:-6）：{msg}")
+            format!("未登录或会话只读（errno:-6）：{msg}")
+        }),
+        // 真机实测：filemetas/部分接口对"不存在"返回 12（无 errmsg）。
+        12 => Error::not_found(if msg.is_empty() {
+            "路径或文件不存在（errno:12）".to_string()
+        } else {
+            format!("路径或文件不存在（errno:12）：{msg}")
         }),
         -9 => Error::not_found(if msg.is_empty() {
             "目录或文件不存在（errno:-9）".to_string()

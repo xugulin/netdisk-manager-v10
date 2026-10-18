@@ -174,7 +174,16 @@ pub(crate) async fn stat(d: &BaiduDrive, path: &str) -> Result<RemoteEntry> {
     if full == "/" {
         return Ok(root_entry());
     }
-    let info = filemeta_value(d, &full, false).await?;
+    let info = match filemeta_value(d, &full, false).await {
+        Ok(v) => v,
+        // ⚠️ 真机实测（2026-10-18）：`/api/filemetas` 对**不存在**的路径返回
+        //   errno:12（响应里没有 errmsg），而不是 -9/404。不把 12 归一成
+        //   NotFound，`ensure_dir` 的"stat 探测再创建"就会直接失败。
+        Err(Error::Server { code: 12, .. }) => {
+            return Err(Error::not_found(format!("路径不存在：{full}")));
+        }
+        Err(e) => return Err(e),
+    };
     entry_from_value(&info, &parent_path(&full))
         .ok_or_else(|| Error::not_found(format!("路径不存在：{full}")))
 }

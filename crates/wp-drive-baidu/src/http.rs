@@ -234,7 +234,15 @@ impl BaiduDrive {
                                 }
                             }
                         }
-                        Some(c) => return Err(map_errno(c, &v)),
+                        Some(c) => {
+                            let body: String = v.to_string();
+                            wp_core::log_debug!(
+                                "百度",
+                                "接口 {path} 返回 errno={c}，响应={}",
+                                body.chars().take(600).collect::<String>()
+                            );
+                            return Err(map_errno(c, &v));
+                        }
                     }
                 }
                 Err(Error::Auth(msg)) if opts.auth && !healed => {
