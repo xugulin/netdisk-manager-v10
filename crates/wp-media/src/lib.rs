@@ -139,6 +139,9 @@ pub struct PlaybackSnapshot {
     pub audio_track: Option<i64>,
     pub subtitle_track: Option<i64>,
     pub secondary_subtitle_visible: bool,
+    /// 副字幕轨 id（mpv `secondary-sid`；None=关闭/未选）。T8：双语/AI 译文轨选择。
+    #[serde(default)]
+    pub secondary_subtitle_track: Option<i64>,
     pub disc: Option<DiscInfo>,
     /// 实际使用的硬件解码器（如 vaapi/d3d11va/vulkan），用于诊断面板。
     pub hwdec: Option<String>,
@@ -169,6 +172,10 @@ pub enum PlayerCommand {
     },
     /// 主/副字幕可见性。
     SetSecondarySubtitleVisible(bool),
+    /// 选择副字幕轨（mpv `secondary-sid`；`id=-1` 关闭副字幕）。
+    SelectSecondarySubtitleTrack {
+        id: i64,
+    },
     /// 字幕延迟（秒，正=延后）。
     SetSubtitleDelay(f64),
     /// 外挂字幕文件（AI 翻译/下载的字幕也走这里注入）。
@@ -339,6 +346,13 @@ impl MediaEngine for MockEngine {
             PlayerCommand::SetSecondarySubtitleVisible(v) => {
                 self.snapshot.secondary_subtitle_visible = v
             }
+            PlayerCommand::SelectSecondarySubtitleTrack { id } => {
+                self.snapshot.secondary_subtitle_track = (id >= 0).then_some(id);
+                if id >= 0 {
+                    // 选中副字幕轨默认让它可见（与 mpv secondary-sid 行为一致）。
+                    self.snapshot.secondary_subtitle_visible = true;
+                }
+            }
             _ => {}
         }
         self.emit(PlayerEvent::StateChanged(self.snapshot.state));
@@ -354,4 +368,55 @@ impl MediaEngine for MockEngine {
     }
 
     fn shutdown(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opened_mock() -> MockEngine {
+        let mut engine = MockEngine::new();
+        engine
+            .open(MediaSource::Local(PathBuf::from("/tmp/mock.mkv")))
+            .expect("MockEngine 打开本地媒体");
+        engine
+    }
+
+    #[test]
+    fn mock_select_secondary_subtitle_track_records_snapshot() {
+        let mut engine = opened_mock();
+        engine
+            .command(PlayerCommand::SelectSecondarySubtitleTrack { id: 2 })
+            .expect("选择副字幕轨");
+        let snap = engine.snapshot();
+        assert_eq!(snap.secondary_subtitle_track, Some(2));
+        assert!(
+            snap.secondary_subtitle_visible,
+            "选中副字幕轨应同时让副字幕可见"
+        );
+
+        engine
+            .command(PlayerCommand::SelectSecondarySubtitleTrack { id: -1 })
+            .expect("关闭副字幕轨");
+        assert_eq!(engine.snapshot().secondary_subtitle_track, None);
+    }
+
+    #[test]
+    fn mock_subtitle_delay_and_visibility_commands_are_ok() {
+        let mut engine = opened_mock();
+        engine
+            .command(PlayerCommand::SetSubtitleDelay(1.5))
+            .expect("字幕延迟命令");
+        engine
+            .command(PlayerCommand::SetSecondarySubtitleVisible(false))
+            .expect("副字幕开关命令");
+        assert!(!engine.snapshot().secondary_subtitle_visible);
+
+        // 再选副字幕轨会重新打开可见性
+        engine
+            .command(PlayerCommand::SelectSecondarySubtitleTrack { id: 1 })
+            .expect("选择副轨");
+        assert_eq!(engine.snapshot().secondary_subtitle_track, Some(1));
+        assert!(engine.snapshot().secondary_subtitle_visible);
+    }
 }

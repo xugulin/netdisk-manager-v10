@@ -17,6 +17,10 @@ pub struct SubtitleUi {
     pub enabled: bool,
     /// 副字幕可见性（`--secondary-sub-visible`）。
     pub secondary_visible: bool,
+    /// 副字幕轨 id（mpv `secondary-sid`；None=关闭）。多字幕轨时默认第二条。
+    pub secondary_track: Option<i64>,
+    /// 字体目录（`MpvConfig.fonts_dir` / `--sub-fonts-dir`；重建引擎后生效）。
+    pub fonts_dir: String,
     /// 当前选中的字幕轨 id（None=关闭）。
     pub selected: Option<i64>,
     /// 字幕延迟（秒，正=延后）。
@@ -46,6 +50,8 @@ impl Default for SubtitleUi {
         Self {
             enabled: true,
             secondary_visible: false,
+            secondary_track: None,
+            fonts_dir: String::new(),
             selected: None,
             delay_secs: 0.0,
             font_size: 1.0,
@@ -84,6 +90,13 @@ impl SubtitleUi {
             .map(|tr| tr.id);
         self.selected = selected;
         self.enabled = selected.is_some();
+        // 副字幕轨默认取第二条字幕轨（多字幕时）；少于 2 条则关闭（mpv secondary-sid=no）。
+        let sub_ids: Vec<i64> = subs.iter().map(|tr| tr.id).collect();
+        self.secondary_track = if sub_ids.len() >= 2 {
+            Some(sub_ids[1])
+        } else {
+            None
+        };
         self.current_cue = None;
         self.secondary_cue = None;
     }
@@ -213,6 +226,79 @@ pub fn show(player: &mut PlayerUi, t: &Theme, ui: &mut Ui, actions: &mut Vec<Pla
             widgets::hint(ui, t, &meta.join(" · "));
         }
     }
+
+    // ── 副字幕轨（mpv `secondary-sid`；AI 双语/译文轨走副字幕层） ──
+    ui.add_space(6.0);
+    ui.label(RichText::new("副字幕轨").size(13.0).strong().color(t.text));
+    ui.horizontal(|ui| {
+        let current = player.subtitle.secondary_track;
+        let selected_text = match current {
+            Some(id) => tracks
+                .iter()
+                .find(|tr| tr.id == id)
+                .map(|tr| {
+                    if tr.title.is_empty() {
+                        format!("轨 {id}（{}）", tr.codec)
+                    } else {
+                        format!("轨 {id} {}", tr.title)
+                    }
+                })
+                .unwrap_or_else(|| format!("轨 {id}")),
+            None => "关闭（无副字幕）".to_string(),
+        };
+        egui::ComboBox::from_id_salt("secondary_subtitle_track")
+            .width(190.0)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(current.is_none(), "关闭（无副字幕）")
+                    .clicked()
+                {
+                    player.subtitle.secondary_track = None;
+                    cmds.push(PlayerCommand::SelectSecondarySubtitleTrack { id: -1 });
+                }
+                for tr in &tracks {
+                    let label = if tr.title.is_empty() {
+                        format!("轨 {}（{}）", tr.id, tr.codec)
+                    } else {
+                        format!("轨 {} {}", tr.id, tr.title)
+                    };
+                    if ui.selectable_label(current == Some(tr.id), label).clicked() {
+                        player.subtitle.secondary_track = Some(tr.id);
+                        cmds.push(PlayerCommand::SelectSecondarySubtitleTrack { id: tr.id });
+                    }
+                }
+            });
+    });
+    widgets::hint(
+        ui,
+        t,
+        "副字幕轨 = mpv secondary-sid（AI 双语译文轨放这里；主+副可同屏）",
+    );
+
+    // ── 字体目录（MpvConfig.fonts_dir / --sub-fonts-dir，open 前生效） ──
+    ui.add_space(6.0);
+    ui.label(RichText::new("字体目录").size(13.0).strong().color(t.text));
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut player.subtitle.fonts_dir)
+                .desired_width(210.0)
+                .hint_text("/path/to/fonts"),
+        );
+        if ui.small_button("应用").clicked() {
+            let dir = player.subtitle.fonts_dir.trim().to_string();
+            player.subtitle.status = if dir.is_empty() {
+                "字体目录已清空（重建播放引擎后生效）".to_string()
+            } else {
+                format!("字体目录已记录（重建播放引擎后生效）：{dir}")
+            };
+        }
+    });
+    widgets::hint(
+        ui,
+        t,
+        "对应 MpvConfig.fonts_dir；mpv 初始化时扫描字体目录，需重建引擎生效",
+    );
 
     // ── 同步（延迟） ──
     ui.add_space(8.0);
@@ -431,6 +517,18 @@ mod tests {
         }]);
         assert_eq!(ui.selected, None);
         assert!(!ui.enabled);
+    }
+
+    #[test]
+    fn on_tracks_picks_second_subtitle_as_secondary() {
+        let mut ui = SubtitleUi::default();
+        ui.on_tracks(&[track(2, true), track(5, false)]);
+        assert_eq!(ui.selected, Some(2));
+        assert_eq!(ui.secondary_track, Some(5), "多字幕轨时第二条作副字幕");
+        assert!(ui.fonts_dir.is_empty());
+
+        ui.on_tracks(&[track(2, true)]);
+        assert_eq!(ui.secondary_track, None, "单字幕轨时无副字幕");
     }
 
     #[test]

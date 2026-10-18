@@ -6,6 +6,8 @@
 > 素材生成器：`cargo run -p wp-subtitle --example m2_probe_kit`（一条命令重建全部素材 + 矩阵脚本）
 > 证据目录：`出/验收截图/字幕弹幕/字幕联调/`（`assets/` 素材、`raw/` JSON+日志+PPM、`screens/` PNG、`raw/case-metrics.txt` 像素指标）
 > 代码：本任务只新增示例/文档与证据，未改 `wp-subtitle`/`wp-danmaku` 既有 API 语义
+>
+> **更新（task-22 已补齐本报告 §5 的两个接口缺口）**：`PlayerCommand::SelectSecondarySubtitleTrack { id }`（mpv `secondary-sid`，id=-1 关闭）+ `MpvConfig::{fonts_dir, sub_auto}`（由 `props::build_options()` 组装 `--sub-fonts-dir` / `--sub-auto`）已进 `wp-media`/`wp-media-mpv`，含 Mock/纯映射/真机 libmpv 属性测试；GUI 字幕面板已接「副字幕轨下拉 + 字体目录入口」。
 
 ---
 
@@ -29,7 +31,7 @@
 | 14 | 副字幕开关 `secondary-sub-visibility=no` | ✅ 只关副字幕，主字幕保留 | `screens/14-secondary-off.png`（底 2507 / 顶 0） |
 | 15 | egui UI 与视频/字幕**同帧合成** | ✅（Mode A 叠加层可用） | `screens/show-10-window.png`（红色 `UI OVERLAY 同帧合成` 角标 + 视频 + 双语字幕） |
 | — | **PGS/VobSub 位图字幕** | ⚠ 本机无样本，**未测**（需蓝光样本，见 §6） | — |
-| — | ASS 内嵌字体（`[Fonts]` 段）/ `--sub-fonts-dir` | ⚠ 未做样本 / 引擎无入口（样式覆盖已用 `sub-font` 验证字体路径） | — |
+| — | ASS 内嵌字体（`[Fonts]` 段） | ⚠ 未做样本（样式覆盖已用 `sub-font` 验证字体路径）；`--sub-fonts-dir` 引擎入口已由 task-22 补齐（`MpvConfig.fonts_dir`） | — |
 
 **一句话结论**：libmpv/libass 在本机 Xvfb + 软件 GL 下对 SRT/VTT/ASS **外挂、内嵌、主副叠加、样式/字体/位置/延迟/开关、以及 wp-ai 生成的双语 ASS 全部显示正确**；M2 字幕面板所需的操作路径除「副字幕轨选择」外都已有正式 `PlayerCommand`（见 §5），可进入 GUI 集成。
 
@@ -170,7 +172,7 @@ magick raw/01-srt.ppm screens/01-srt.png
 ```
 - 截图 `05-main-secondary.png`：底带 AE=2507、顶带 AE=2981，两带同时出现字幕像素。
 - 关闭副字幕（`secondary-sub-visibility=no`，`14-secondary-off.png`）：底带仍 2507、顶带 0 → 只影响副字幕，不误伤主字幕。
-- ⚠ 当前 `wp_media::PlayerCommand` 只有 `SetSecondarySubtitleVisible`，**没有**「选择副字幕轨」命令 → 实际实现用 `MediaEngine::set_property("secondary-sid", ...)` 逃生门；建议 T8 增加 `SelectSecondarySubtitleTrack { id }`（GUI 需要选「哪条作副字幕」）。
+- ✅ **task-22 已补正式命令**：`PlayerCommand::SelectSecondarySubtitleTrack { id }`（wp-media-mpv 侧写 mpv `secondary-sid`，`id=-1` → `"no"` 关闭，并回写快照 `secondary_subtitle_track`）；GUI 字幕面板已接「副字幕轨下拉」。本报告早期验证时用的是 `set_property("secondary-sid", ...)` 逃生门，两者等价。
 
 ### 4.3 样式覆盖 / 字体 / 位置 / 延迟 / 开关
 
@@ -235,7 +237,9 @@ ai_source.srt（3 句中文）
 | 选择内嵌字幕轨 | `PlayerCommand::SelectTrack { kind: Subtitle, id }`（mpv `sid=<id>`） | ✅（`sid=1` 显式选轨截图） |
 | 主字幕延迟 ±s | `PlayerCommand::SetSubtitleDelay(f64)`（mpv `sub-delay`） | ✅（本报告 `sub-delay=2.0`） |
 | 副字幕开关 | `PlayerCommand::SetSecondarySubtitleVisible(bool)`（`secondary-sub-visibility`） | ✅ |
-| **选择副字幕轨** | ⚠ 用 `MediaEngine::set_property("secondary-sid", "<id>")`；建议补 `SelectSecondarySubtitleTrack` | ✅（逃生门实测；正式命令缺失） |
+| **选择副字幕轨** | `PlayerCommand::SelectSecondarySubtitleTrack { id }`（`id=-1` 关闭；mpv `secondary-sid`） | ✅（task-22 正式命令；逃生门等价实测 + Mock/真机属性测试） |
+| 字体目录（`--sub-fonts-dir`） | `MpvConfig.fonts_dir: Option<PathBuf>`（open 前组装；重建引擎生效） | ✅（task-22 新增，`props::build_options` 单测覆盖） |
+| 外挂字幕自动加载 | `MpvConfig.sub_auto: String`（默认 `"no"`；可 `fuzzy`/`exact`/`all`） | ✅（task-22 新增，默认行为不变） |
 | 字号 | ⚠ `set_property("sub-font-size", px)` | ✅ |
 | 颜色（前景/描边） | ⚠ `set_property("sub-color", ...)` / `sub-border-color` | ✅（`sub-color`） |
 | 字体 | ⚠ `set_property("sub-font", name)`（需系统有该字体） | ✅（serif/默认对比） |
@@ -245,9 +249,9 @@ ai_source.srt（3 句中文）
 | 截图（含字幕） | `PlayerCommand::Screenshot { path }`（mpv `screenshot-to-file`） | 🟡 未直接验证该命令（render_probe 用 FBO 直读截图，字幕已烧入） |
 | 轨道变化刷新 | 引擎 `track-list` 属性观察 → `snapshot.tracks` 刷新 | 🟡 由 media-core 已有逻辑提供 |
 
-**建议给 media-core 的两个小改动（M2 联调暴露）**：
-1. `PlayerCommand` 增加 `SelectSecondarySubtitleTrack { id }`（现在只能 set_property 逃生门）；
-2. `MpvConfig` 增加 `fonts_dir` / `sub_auto` 配置项（当前 `sub-auto=no` 写死；`--sub-fonts-dir` 需要 open 前设置，GUI 无法动态指定）。
+**两个缺口已在 task-22 补齐（现为正式 API，不再需要 escape hatch）**：
+1. `PlayerCommand::SelectSecondarySubtitleTrack { id }`：wp-media 枚举 + Mock 快照、wp-media-mpv `secondary-sid` 实现 + 快照回写；测试：Mock 命令→快照 / 纯映射（-1→"no"）/ **真机 libmpv 属性→快照**；
+2. `MpvConfig::{fonts_dir: Option<PathBuf>, sub_auto: String}`：`props::build_options()` 真正组装 `sub-fonts-dir`（空路径忽略）与 `sub-auto`（默认 `"no"`，行为不变；T9 同名自动加载可设 `fuzzy`），单测覆盖默认/可配/空路径；GUI 字幕面板已加字体目录入口（提示重建引擎生效）。
 
 ---
 
@@ -258,7 +262,7 @@ ai_source.srt（3 句中文）
 | 1 | **PGS/VobSub/DVB 位图字幕未测** | 本机无蓝光/内嵌位图样本。mpv 走 `sd_lavc` 解码后由 render API 混合，预期可用；**下轮（E5/蓝光任务）**用 ISO/BDMV 实测并补截图。 |
 | 2 | ASS 内嵌字体（`[Fonts]` 段）未做样本 | 本次用 `sub-ass-override` + `sub-font` 验证字体覆盖路径。字体嵌入/提取属 T9，下轮加「带 [Fonts] 的 ASS」样本与 `--sub-fonts-dir` 验证。 |
 | 3 | `ReloadSubtitles`（sub-reload）未截图验证 | 本次每用例独立进程；AI 重译更新场景需 GUI 集成后验证（改临时文件 → sub-reload → 画面更新）。 |
-| 4 | 副字幕轨选择无正式命令 | 见 §5 建议 1；T8 进命令后 GUI 才能做「选哪条作副字幕」的完整 UI。 |
+| 4 | ~~副字幕轨选择无正式命令~~ **已解决（task-22）** | `SelectSecondarySubtitleTrack` 已进 `PlayerCommand`，GUI 字幕面板已接副字幕轨下拉；后续只需真机 GUI 冒烟。 |
 | 5 | 软件 GL / 软解，性能数字无效 | 本报告只证明字幕正确性；4K/真机 GPU/HDR 字幕亮度属 E5/M6 性能任务。 |
 | 6 | VTT cue settings 位置未逐项断言 | 只验证了显示/文本/时间；下轮加 VTT `line/align/position` 矩阵。 |
 | 7 | 双语 ASS 原文/译文颜色相同 | 用样式名 + MarginV 区分上下两行；如需颜色区分可扩展 `AssOptions`（如 translated_primary_color）。 |

@@ -370,6 +370,17 @@ impl Drop for MpvEngine {
     }
 }
 
+/// 副字幕轨 id → mpv `secondary-sid` 属性值（`-1`/负数 → `"no"` 关闭）。
+///
+/// 单独抽成纯函数：命令 → 属性值的映射可在没有 libmpv 的环境里单测。
+fn secondary_subtitle_track_value(id: i64) -> String {
+    if id < 0 {
+        "no".to_string()
+    } else {
+        id.to_string()
+    }
+}
+
 // ============================ 引擎线程 ============================
 
 /// 事件消费结果。
@@ -565,6 +576,7 @@ impl Worker {
             s.audio_track = None;
             s.subtitle_track = None;
             s.secondary_subtitle_visible = false;
+            s.secondary_subtitle_track = None;
             s.disc = None;
             s.hwdec = None;
             s.video_size = None;
@@ -641,6 +653,19 @@ impl Worker {
                 self.core
                     .shared
                     .update(|s| s.secondary_subtitle_visible = visible);
+                Ok(())
+            }
+            PlayerCommand::SelectSecondarySubtitleTrack { id } => {
+                // `secondary-sid` 是字符串/choice 属性：-1 → "no"（关闭），否则为轨道 id。
+                let value = secondary_subtitle_track_value(id);
+                self.raw().set_property_string("secondary-sid", &value)?;
+                self.core.shared.update(|s| {
+                    s.secondary_subtitle_track = (id >= 0).then_some(id);
+                    if id >= 0 {
+                        // 选中副字幕轨默认可见（与 mpv secondary-sid 行为一致）。
+                        s.secondary_subtitle_visible = true;
+                    }
+                });
                 Ok(())
             }
             PlayerCommand::SetSubtitleDelay(delay) => {
@@ -1307,5 +1332,49 @@ mod tests {
             engine.command(PlayerCommand::Play).is_err(),
             "关闭后命令应报错"
         );
+    }
+
+    /// 命令 → mpv 属性值的纯映射（不依赖 libmpv，可在无 mpv 环境跑）。
+    #[test]
+    fn secondary_subtitle_track_command_maps_to_property_value() {
+        assert_eq!(secondary_subtitle_track_value(2), "2");
+        assert_eq!(secondary_subtitle_track_value(0), "0");
+        assert_eq!(secondary_subtitle_track_value(-1), "no");
+        assert_eq!(secondary_subtitle_track_value(-99), "no");
+    }
+
+    /// 真机（有 libmpv 时）：`SelectSecondarySubtitleTrack` 应真的写入 `secondary-sid`
+    /// 并回写快照；`id=-1` 关闭。无 libmpv 环境自动跳过。
+    #[test]
+    fn secondary_subtitle_track_command_hits_mpv_property() {
+        let Ok(mut engine) = MpvEngine::new(MpvConfig {
+            extra_options: vec!["vo=null".into(), "ao=null".into()],
+            ..MpvConfig::default()
+        }) else {
+            return; // 无 libmpv 环境跳过
+        };
+        engine
+            .command(PlayerCommand::SelectSecondarySubtitleTrack { id: 2 })
+            .expect("设置 secondary-sid 命令应被接受");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                engine.snapshot().secondary_subtitle_track == Some(2)
+            }),
+            "secondary-sid=2 应回写快照；错误：{:?}",
+            engine.last_error()
+        );
+        assert!(engine.snapshot().secondary_subtitle_visible);
+
+        engine
+            .command(PlayerCommand::SelectSecondarySubtitleTrack { id: -1 })
+            .expect("关闭 secondary-sid 命令应被接受");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                engine.snapshot().secondary_subtitle_track.is_none()
+            }),
+            "secondary-sid=no 应清空快照副字幕轨"
+        );
+
+        engine.shutdown();
     }
 }

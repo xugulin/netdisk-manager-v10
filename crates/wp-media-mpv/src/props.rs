@@ -285,8 +285,8 @@ pub fn build_options(config: &MpvConfig) -> Vec<(String, String)> {
         ("cache-secs".into(), config.network_cache_secs.to_string()),
         ("demuxer-max-bytes".into(), "200MiB".into()),
         ("demuxer-max-back-bytes".into(), "100MiB".into()),
-        // 字幕：外挂字幕由上层显式注入，先不做同名自动加载（E5 再开 fuzzy）
-        ("sub-auto".into(), "no".into()),
+        // 字幕：默认不做同名自动加载（上层显式注入）；T9 可配 fuzzy/exact/all
+        ("sub-auto".into(), config.sub_auto.clone()),
         // 截图控制
         ("screenshot-format".into(), "png".into()),
         (
@@ -296,6 +296,12 @@ pub fn build_options(config: &MpvConfig) -> Vec<(String, String)> {
         // 音频设备名（PipeWire/PulseAudio 里显示成「网盘管理」）
         ("audio-client-name".into(), "网盘管理".into()),
     ];
+    // 字体目录：mpv 只在初始化/换文件时扫描，必须在 open 前作为选项传入。
+    if let Some(dir) = &config.fonts_dir {
+        if !dir.as_os_str().is_empty() {
+            opts.push(("sub-fonts-dir".into(), dir.display().to_string()));
+        }
+    }
     match config.render_mode {
         RenderMode::EmbeddedGl => {
             // render API 的硬性要求：vo 必须是 libmpv，画面交给上层 GL。
@@ -585,6 +591,56 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("gpu")
         );
+    }
+
+    #[test]
+    fn build_options_sub_auto_defaults_to_no_and_is_configurable() {
+        let opts = build_options(&MpvConfig::default());
+        let sub_auto = |opts: &[(String, String)]| {
+            opts.iter()
+                .rev()
+                .find(|(k, _)| k == "sub-auto")
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            sub_auto(&opts),
+            Some("no".to_string()),
+            "默认 sub-auto=no（字幕由上层显式注入）"
+        );
+        assert!(
+            !opts.iter().any(|(k, _)| k == "sub-fonts-dir"),
+            "未配置 fonts_dir 时不应设置 sub-fonts-dir"
+        );
+
+        let cfg = MpvConfig {
+            sub_auto: "fuzzy".into(),
+            ..MpvConfig::default()
+        };
+        assert_eq!(sub_auto(&build_options(&cfg)), Some("fuzzy".to_string()));
+    }
+
+    #[test]
+    fn build_options_fonts_dir_set_before_open() {
+        let cfg = MpvConfig {
+            fonts_dir: Some(std::path::PathBuf::from("/tmp/wp-fonts")),
+            ..MpvConfig::default()
+        };
+        let opts = build_options(&cfg);
+        assert_eq!(
+            opts.iter()
+                .find(|(k, _)| k == "sub-fonts-dir")
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/wp-fonts")
+        );
+
+        // 空路径应忽略（否则 mpv 会把工作目录当字体目录）
+        let cfg = MpvConfig {
+            fonts_dir: Some(std::path::PathBuf::new()),
+            ..MpvConfig::default()
+        };
+        assert!(!build_options(&cfg)
+            .iter()
+            .any(|(k, _)| k == "sub-fonts-dir"));
     }
 
     #[test]

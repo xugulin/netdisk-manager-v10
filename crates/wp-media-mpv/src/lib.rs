@@ -79,6 +79,15 @@ pub struct MpvConfig {
     pub render_mode: RenderMode,
     /// 启动额外 mpv 选项（调试用，如 `vo=null` / `ao=null`，最后应用可覆盖默认值）。
     pub extra_options: Vec<String>,
+    /// 字幕字体目录（`--sub-fonts-dir`，open 前设置；None=用 mpv 默认字体搜索）。
+    ///
+    /// mpv 在初始化/换文件时扫描该目录；运行期修改需重建引擎（见 `render_probe`/GUI 入口）。
+    pub fonts_dir: Option<PathBuf>,
+    /// 外挂字幕自动加载模式（`--sub-auto`：`no` / `exact` / `fuzzy` / `all`）。
+    ///
+    /// 默认 `no`：本应用由上层显式注入字幕（避免同名字幕乱入）；
+    /// T9「同名自动加载」可设为 `fuzzy`。
+    pub sub_auto: String,
 }
 
 impl Default for MpvConfig {
@@ -89,6 +98,8 @@ impl Default for MpvConfig {
             network_cache_secs: 10,
             render_mode: RenderMode::EmbeddedGl,
             extra_options: Vec::new(),
+            fonts_dir: None,
+            sub_auto: "no".into(),
         }
     }
 }
