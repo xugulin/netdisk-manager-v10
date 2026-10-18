@@ -276,3 +276,15 @@ crates/
 
 > 本项目是**独立重写**：源项目只读参考，未修改任何源文件；研究规格文档保留了
 > `文件:行号` 引用，便于回溯核对。
+
+## 10. 播放器规划（只读调研阶段，未实现）
+
+计划新增「播放器页」：播放**网盘视频**（走直链 + 本机流代理）与**本地视频**。
+
+- **调研报告与方案评估**：[docs/PLAYER_RESEARCH.md](docs/PLAYER_RESEARCH.md)
+  （只读研究 tealinux-iso / VLC；评测 libVLC vmem、VLC4 GPU、libmpv render、GStreamer、纯 FFmpeg、外部播放器 6 条路线）
+- **任务计划**：[docs/PLAYER_TASKS.md](docs/PLAYER_TASKS.md)
+  （M0 可行性实验 → M1 MVP → M2 体验 → M3 发行；约 9–13 人日，待确认后开工）
+
+> 阶段结论：推荐 **libVLC 3.x（LGPL 动态链接）+ 自研薄 FFI + 本地流代理 + vmem 回读**，
+> 外部播放器兜底；两个必须先验证的点是「三盘直链 Range 支持」与「vmem 收帧性能/字幕限制」。
