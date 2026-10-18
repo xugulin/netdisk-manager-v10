@@ -110,6 +110,7 @@ set -euo pipefail
 pacman -S --needed --noconfirm base-devel git curl tar xz p7zip meson ninja pkgconf nasm \
   mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-python \
+  mingw-w64-ucrt-x86_64-meson \
   mingw-w64-ucrt-x86_64-libass \
   mingw-w64-ucrt-x86_64-libplacebo \
   mingw-w64-ucrt-x86_64-libbluray
@@ -160,22 +161,43 @@ export PKG_CONFIG_PATH='__PREFIX__/ffmpeg/lib/pkgconfig:/ucrt64/lib/pkgconfig'
 # （"This python3 seems to be msys/python ... but you are in a MinGW environment"）。
 # 解法：用 mingw-w64 python 安装并运行 meson。
 export PATH="/ucrt64/bin:$PATH"
-PY=""
-for cand in /ucrt64/bin/python.exe /ucrt64/bin/python; do
-  if [ -x "$cand" ]; then PY="$cand"; break; fi
-done
-if [ -z "$PY" ]; then
-  echo "错误：未找到 UCRT64 python（请安装 mingw-w64-ucrt-x86_64-python）" >&2
-  exit 3
+# 优先用 MSYS2 的 mingw meson（/ucrt64/bin/meson.exe）：它自带 UCRT64 python，
+# 不会触发 meson 对「MSYS python + MinGW 环境」的拒绝，也不需要 pip。
+MESON="/ucrt64/bin/meson.exe"
+if [ -x "$MESON" ]; then
+  echo "使用 mingw meson：$MESON"
+else
+  echo "未找到 /ucrt64/bin/meson.exe（缺 mingw-w64-ucrt-x86_64-meson），尝试 mingw python + pip 兜底" >&2
+  PY=""
+  for cand in /ucrt64/bin/python.exe /ucrt64/bin/python; do
+    if [ -x "$cand" ]; then PY="$cand"; break; fi
+  done
+  if [ -z "$PY" ]; then
+    echo "错误：未找到 UCRT64 python" >&2
+    exit 3
+  fi
+  "$PY" -m pip --version >/dev/null 2>&1 || {
+    echo "mingw python 无 pip，下载 get-pip.py 安装" >&2
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+    "$PY" get-pip.py || exit 4
+  }
+  "$PY" -c 'import mesonbuild' >/dev/null 2>&1 || "$PY" -m pip install --quiet meson
+  MESON="$PY -m mesonbuild.mesonmain"
 fi
-"$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
-"$PY" -c 'import mesonbuild' >/dev/null 2>&1 || "$PY" -m pip install --quiet meson
 rm -rf mpv-build
-"$PY" -m mesonbuild.mesonmain setup mpv-build mpv-src \
-  --buildtype=release --prefix='__PREFIX__/mpv' \
-  -Dgpl=false -Dlibmpv=true -Dcplayer=false -Dbuild-date=false \
-  -Dlua=disabled -Djavascript=disabled -Drubberband=disabled \
-  -Dtests=false -Dmanpage-build=disabled
+if [ "$MESON" = "/ucrt64/bin/meson.exe" ]; then
+  "$MESON" setup mpv-build mpv-src \
+    --buildtype=release --prefix='__PREFIX__/mpv' \
+    -Dgpl=false -Dlibmpv=true -Dcplayer=false -Dbuild-date=false \
+    -Dlua=disabled -Djavascript=disabled -Drubberband=disabled \
+    -Dtests=false -Dmanpage-build=disabled
+else
+  $MESON setup mpv-build mpv-src \
+    --buildtype=release --prefix='__PREFIX__/mpv' \
+    -Dgpl=false -Dlibmpv=true -Dcplayer=false -Dbuild-date=false \
+    -Dlua=disabled -Djavascript=disabled -Drubberband=disabled \
+    -Dtests=false -Dmanpage-build=disabled
+fi
 ninja -C mpv-build
 ninja -C mpv-build install
 '@
