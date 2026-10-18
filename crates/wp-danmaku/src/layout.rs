@@ -341,22 +341,34 @@ impl PlacedTimeline {
         self.placed.is_empty()
     }
 
-    /// 某一时刻可见的弹幕（O(log n + k)）。
-    pub fn active(&self, time_ms: i64) -> Vec<&PlacedComment> {
+    /// 某一时刻可见弹幕在 [`Self::placed`] 中的下标（O(log n + k)）。
+    pub fn active_indices(&self, time_ms: i64) -> Vec<usize> {
         let hi = self.placed.partition_point(|p| p.start_ms <= time_ms);
         let lo = self
             .placed
             .partition_point(|p| p.start_ms <= time_ms - self.max_duration_ms)
             .min(hi);
-        self.placed[lo..hi]
-            .iter()
-            .filter(|p| p.end_ms > time_ms)
+        (lo..hi)
+            .filter(|&i| self.placed[i].end_ms > time_ms)
             .collect()
     }
 
-    /// 某一时刻同屏弹幕数（密度热力图/性能诊断用）。
+    /// 某一时刻可见的弹幕（O(log n + k)）。
+    pub fn active(&self, time_ms: i64) -> Vec<&PlacedComment> {
+        self.active_indices(time_ms)
+            .into_iter()
+            .map(|i| &self.placed[i])
+            .collect()
+    }
+
+    /// 某一时刻同屏弹幕数（比 `active()` 少一次分配；密度诊断/热力图用）。
+    pub fn active_count(&self, time_ms: i64) -> usize {
+        self.active_indices(time_ms).len()
+    }
+
+    /// 某一时刻同屏弹幕数（`active_count` 的语义化别名）。
     pub fn density_at(&self, time_ms: i64) -> usize {
-        self.active(time_ms).len()
+        self.active_count(time_ms)
     }
 
     /// 下一次画面变化的时间（没有则 None）——用于避免空转重绘。

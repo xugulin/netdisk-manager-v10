@@ -32,6 +32,7 @@
 pub mod filter;
 pub mod layout;
 pub mod model;
+pub mod overlay;
 pub mod parse_ass_import;
 pub mod parse_bilibili;
 pub mod parse_json;
@@ -45,6 +46,7 @@ pub use model::{
     comment_weight, AssRenderOptions, Comment, DanmakuDoc, DanmakuMode, DanmakuSource,
     DensityPolicy, LayoutConfig, LayoutGeometry, LayoutStats, PlacedComment,
 };
+pub use overlay::{DanmakuGlyph, EguiGlyph, OverlayStyle, VideoRect};
 pub use parse_ass_import::import_ass;
 pub use parse_bilibili::{export_bilibili_xml, parse_bilibili_xml, parse_p_attr};
 pub use parse_json::{export_json, parse_json};

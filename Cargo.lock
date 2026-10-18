@@ -1010,6 +1010,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "egui_system_font_provider",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -4084,6 +4085,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -5188,10 +5190,10 @@ name = "wp-ai"
 version = "1.0.0"
 dependencies = [
  "async-trait",
- "futures-util",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "wp-core",
  "wp-subtitle",
@@ -5210,6 +5212,7 @@ dependencies = [
  "wp-drive-baidu",
  "wp-drive-guangya",
  "wp-drive-quark",
+ "wp-stream",
 ]
 
 [[package]]
@@ -5359,6 +5362,10 @@ dependencies = [
 name = "wp-media-mpv"
 version = "1.0.0"
 dependencies = [
+ "eframe",
+ "egui",
+ "egui_glow",
+ "glow",
  "libloading 0.9.0",
  "serde",
  "serde_json",

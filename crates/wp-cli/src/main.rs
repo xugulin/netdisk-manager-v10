@@ -131,10 +131,10 @@ fn real_main() -> i32 {
     };
     let cmd = rest[0].clone();
     let cmd_args = &rest[1..];
-    rt.block_on(async move { dispatch(&*drive, &cmd, cmd_args).await })
+    rt.block_on(async move { dispatch(&drive, &cmd, cmd_args).await })
 }
 
-async fn dispatch(drive: &dyn Drive, cmd: &str, args: &[String]) -> i32 {
+async fn dispatch(drive: &Arc<dyn Drive>, cmd: &str, args: &[String]) -> i32 {
     match cmd {
         "auth-caps" => match drive.auth_caps().await {
             Ok(caps) => print_json(&caps),
@@ -144,7 +144,7 @@ async fn dispatch(drive: &dyn Drive, cmd: &str, args: &[String]) -> i32 {
             Ok(info) => print_json(&info),
             Err(e) => fail(e),
         },
-        "login-qr" => cmd_login_qr(drive, args).await,
+        "login-qr" => cmd_login_qr(drive.as_ref(), args).await,
         "login-cookie" => {
             let text = join_text(args);
             if text.trim().is_empty() {
@@ -284,9 +284,9 @@ async fn dispatch(drive: &dyn Drive, cmd: &str, args: &[String]) -> i32 {
             },
             None => usage("link <remote_path>"),
         },
-        "upload" => cmd_upload(drive, args).await,
-        "download" => cmd_download(drive, args).await,
-        "share" => cmd_share(drive, args).await,
+        "upload" => cmd_upload(drive.as_ref(), args).await,
+        "download" => cmd_download(drive.as_ref(), args).await,
+        "share" => cmd_share(drive.as_ref(), args).await,
         "recycle-list" => match drive.recycle_list().await {
             Ok(list) => {
                 eprintln!("# 回收站 {} 项", list.len());
@@ -426,6 +426,13 @@ async fn dispatch(drive: &dyn Drive, cmd: &str, args: &[String]) -> i32 {
         "write-probe" => match drive.write_probe().await {
             Ok(msg) => print_json(&serde_json::json!({"可写": true, "消息": msg})),
             Err(e) => fail(e),
+        },
+        "probe-range" => match args.first() {
+            Some(path) => match wp_stream::probe_range(drive.clone(), path).await {
+                Ok(report) => print_json(&report),
+                Err(e) => fail(e),
+            },
+            None => usage("probe-range 需要远端路径，例如：probe-range /目录/视频.mp4"),
         },
         other => usage(&format!("未知命令：{other}（--help 看用法）")),
     }
@@ -687,6 +694,7 @@ fn print_help() {
   cp <目标目录> <路径...>          复制
   search <关键词> [目录]           搜索
   link <远端路径>                 取下载直链
+  probe-range <远端路径>          探测直链 HEAD/Range 能力（M0-E1，输出 JSON）
   upload <本地文件> <远端目录> [--name 名字]
   download <远端路径> <本地路径>
   share <路径...> [--days N] [--password P]
