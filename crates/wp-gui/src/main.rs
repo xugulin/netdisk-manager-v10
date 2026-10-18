@@ -113,6 +113,25 @@ fn main() -> eframe::Result<()> {
                     i += 1;
                 }
             }
+            "--play-remote" => {
+                // 用法：--play-remote <drive_id> <远端路径>（配合 WP_DATA_DIR=出/真机联调数据）
+                if let (Some(drive), Some(path)) = (next(i), args.get(i + 2).cloned()) {
+                    dev.play_remote = Some((drive, path));
+                    i += 2;
+                }
+            }
+            "--seek-ms" => {
+                if let Some(ms) = next(i) {
+                    dev.seek_ms = ms.parse().ok();
+                    i += 1;
+                }
+            }
+            "--wait-media-ms" => {
+                if let Some(ms) = next(i) {
+                    dev.wait_media_ms = ms.parse().ok();
+                    i += 1;
+                }
+            }
             other if other.starts_with("--drive=") => {
                 dev.initial_drive = Some(other["--drive=".len()..].to_string());
             }

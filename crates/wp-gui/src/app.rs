@@ -243,6 +243,16 @@ pub enum Event {
     // ── 播放器 ──
     /// 播放引擎事件（wp_media::PlayerEvent 经 mpsc 回到 UI 线程）
     Player(wp_media::PlayerEvent),
+    /// 网盘播放源解析完成（wp_stream::playback::resolve_playback 异步结果）
+    RemotePlayResolved {
+        seq: u64,
+        drive: String,
+        path: String,
+        label: String,
+        size: u64,
+        resume_at: f64,
+        result: Result<wp_stream::PlaybackSource, wp_core::Error>,
+    },
 }
 
 /// 共享守卫钩子（传输引擎上传前调用）。
@@ -503,6 +513,20 @@ pub struct App {
     pub thumbs: crate::thumbs::ThumbCache,
     /// 播放器页状态：引擎句柄 + 快照 + 字幕/弹幕/AI 面板（pages/player）
     pub player: crate::pages::player::PlayerUi,
+    /// 网盘流代理（懒启动；缓存目录 `数据/播放器/缓存/stream`）
+    pub stream_proxy: Arc<wp_stream::StreamProxy>,
+    /// 当前代理流 token（切换媒体/播放结束时 close）
+    pub stream_token: Option<String>,
+    /// 当前网盘播放目标（链接过期时重新取链续播用）
+    pub remote_target: Option<crate::pages::player::RemotePlayTarget>,
+    /// 播放源解析请求序号（防旧请求覆盖新请求）
+    pub remote_seq: u64,
+    /// 可恢复错误是否已重试取链（每次打开新媒体重置）
+    pub remote_retried: bool,
+    /// 待首帧后执行的 seek（秒；`--seek-ms`/续播用，避免 open 后立即 seek 触发网络竞态）
+    pub pending_seek: Option<f64>,
+    /// 网盘流「上游连续失败」可读提示是否已弹（每次打开新媒体重置）
+    pub proxy_hint_shown: bool,
     /// 应用 logo 纹理（顶栏 / 关于页；懒加载一次）
     pub logo: Option<egui::TextureHandle>,
     pub guard_new_word: String,
@@ -515,6 +539,8 @@ pub struct App {
     /// 开发/验收：启动参数
     pub dev: DevOptions,
     pub frames: u64,
+    /// 验收用：`--wait-media-ms` 是否已执行（只阻塞一次）
+    pub waited_media: bool,
     pub last_transfer_tick: Instant,
     pub transfer_snapshot: Vec<TransferTask>,
     pub transfer_stats: TransferStats,
@@ -555,6 +581,12 @@ pub struct DevOptions {
     pub wait_ms: Option<u64>,
     /// 验收用：启动即用播放器打开该本地媒体文件（真实 libmpv 播放截图）
     pub media: Option<PathBuf>,
+    /// 验收用：启动即播放网盘文件（drive_id, 远端路径）；配合 `WP_DATA_DIR=出/真机联调数据`
+    pub play_remote: Option<(String, String)>,
+    /// 验收用：打开媒体后 seek 到指定毫秒（网盘播放 seek 截图）
+    pub seek_ms: Option<u64>,
+    /// 验收用：媒体打开（has_media）后阻塞等待毫秒数（网盘流首帧/缓冲慢时用）
+    pub wait_media_ms: Option<u64>,
 }
 
 impl App {
@@ -651,6 +683,13 @@ impl App {
         // 真实 libmpv 引擎 + Mode A 渲染桥：启动时尝试一次；失败回退演示引擎并在状态行提示。
         // WP_PLAYER_ENGINE=mock 可强制 Mock（无 libmpv 环境/CI 截图）。
         player.init_real_engine(cc.get_proc_address.clone(), cc.egui_ctx.clone());
+        // 网盘流代理：懒启动（首次解析网盘播放源时才监听本地端口）；缓存目录 数据/播放器/缓存/stream
+        let stream_cache = paths.root.join("播放器").join("缓存").join("stream");
+        let _ = std::fs::create_dir_all(&stream_cache);
+        let stream_proxy = Arc::new(wp_stream::StreamProxy::new(wp_stream::StreamConfig {
+            cache_dir: stream_cache,
+            ..Default::default()
+        }));
         let settings_draft = settings_from_config(&cfg);
         let mut app = Self {
             paths,
@@ -680,6 +719,13 @@ impl App {
             },
             thumbs: crate::thumbs::ThumbCache::default(),
             player,
+            stream_proxy,
+            stream_token: None,
+            remote_target: None,
+            remote_seq: 0,
+            remote_retried: false,
+            pending_seek: None,
+            proxy_hint_shown: false,
             logo: None,
             guard_new_word: String::new(),
             guard_new_instance_word: String::new(),
@@ -690,6 +736,7 @@ impl App {
             ctx: None,
             dev,
             frames: 0,
+            waited_media: false,
             last_transfer_tick: Instant::now(),
             transfer_snapshot: Vec::new(),
             transfer_stats: TransferStats::default(),
@@ -716,9 +763,15 @@ impl App {
         if let Some(name) = app.dev.dialog.clone() {
             app.open_dev_dialog(&name);
         }
-        // 启动即打开指定本地媒体（验收/截图真实播放用）
-        if let Some(media) = app.dev.media.clone() {
+        // 启动即打开媒体（验收/截图用）
+        if let Some((drive, path)) = app.dev.play_remote.clone() {
+            // `--play-remote <drive> <path>`：网盘真实播放（需 WP_DATA_DIR=出/真机联调数据 会话）
+            app.page = Page::Player;
+            app.start_remote_resolve(drive, path, 0.0, None);
+            app.toasts.clear();
+        } else if let Some(media) = app.dev.media.clone() {
             app.open_player_local_file(media);
+            app.follow_dev_seek();
             // 启动自动打开不弹提示条：截图回归画面要干净
             app.toasts.clear();
         } else if app.page == Page::Player {
@@ -1596,6 +1649,15 @@ impl App {
                 Err(_) => self.thumbs.put_failed(&key),
             },
             Event::Player(ev) => self.on_player_event(ev),
+            Event::RemotePlayResolved {
+                seq,
+                drive,
+                path,
+                label,
+                size,
+                resume_at,
+                result,
+            } => self.on_remote_play_resolved(seq, drive, path, label, size, resume_at, result),
             Event::PickerListed { path, result } => {
                 if let Some(Dialog::DirPicker(d)) = self.dialog.as_mut() {
                     d.loading = false;
@@ -1664,6 +1726,73 @@ impl eframe::App for App {
             if let Some(ms) = self.dev.wait_ms {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
+        }
+        // 验收模式：媒体打开后阻塞等待（网盘流 demux/解码/预缓冲慢时给首帧时间）
+        // 网盘流代理诊断：上游错误/换链计数回填状态行；连续失败且零下载时给可读 toast 一次
+        if let Some(token) = self.stream_token.as_ref() {
+            if let Some(stats) = self.stream_proxy.stats(token) {
+                let diag = crate::pages::player::ProxyDiag {
+                    downloaded: stats.downloaded_bytes,
+                    errors: stats.errors as u32,
+                    restarts: stats.upstream_restarts as u32,
+                };
+                self.player.proxy_diag = Some(diag);
+                if diag.is_stalled() && !self.proxy_hint_shown {
+                    self.proxy_hint_shown = true;
+                    self.toast(
+                        ToastKind::Error,
+                        format!(
+                            "网盘流上游连续失败（错误 {} 次/换链 {} 次，已下载 0 B）：文件可能无权限或链接受限（如百度 31326），请换文件或重新登录",
+                            diag.errors, diag.restarts
+                        ),
+                    );
+                }
+            }
+        }
+
+        if let Some(ms) = self.dev.wait_media_ms {
+            // 触发条件：媒体已打开 **且** 视频区至少画过一帧（render bridge 已初始化、
+            // 引擎排队的 defer-open 已执行），此时阻塞才会让 mpv 真正开始拉流/解码。
+            let render_started = self
+                .player
+                .render
+                .as_ref()
+                .map(|render| render.stats().paint_calls > 0)
+                .unwrap_or(false);
+            let media_ready = self.player.has_media() && render_started;
+            if !self.waited_media && media_ready {
+                self.waited_media = true;
+                wp_core::log_info!(
+                    "播放器",
+                    "验收：视频区已渲染，阻塞等待 {ms}ms 让 mpv 拉流/首帧"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                self.player.tick(&ctx);
+            }
+        }
+
+        // 验收诊断：WP_PLAYER_DIAG=1 时每 120 帧打印播放器状态时间线
+        if std::env::var("WP_PLAYER_DIAG").is_ok()
+            && self.frames % 120 == 0
+            && self.page == Page::Player
+        {
+            let snap = &self.player.snapshot;
+            let stats = self.player.render.as_ref().map(|render| render.stats());
+            let proxy = self
+                .stream_token
+                .as_ref()
+                .and_then(|token| self.stream_proxy.stats(token));
+            println!(
+                "PLAYER_TICK frames={} pos={:.2} state={:?} playing={} real={} render={:?} proxy_buffered={:?} downloaded={:?}",
+                self.frames,
+                snap.position_secs,
+                snap.state,
+                self.player.is_playing(),
+                self.player.is_real_playback(),
+                stats.map(|s| (s.paint_calls, s.frames_rendered, s.first_frame)),
+                proxy.as_ref().map(|s| s.buffered_bytes),
+                proxy.as_ref().map(|s| s.downloaded_bytes),
+            );
         }
 
         // 主题切换
@@ -1754,6 +1883,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        // 先关闭网盘代理会话，再按序释放渲染桥 → 引擎
+        self.close_stream_session();
         // 顺序：先销毁渲染桥（释放 mpv render ctx/FBO/纹理）→ 再停引擎；
         // 反序会让 mpv 访问已释放的 GL 资源（media-core 明确要求）。
         self.player.shutdown_all(gl);
@@ -2280,8 +2411,12 @@ impl App {
             if self.page == Page::Player {
                 let snap = self.player.snapshot.clone();
                 let stats = self.player.render.as_ref().map(|render| render.stats());
+                let proxy_stats = self
+                    .stream_token
+                    .as_ref()
+                    .and_then(|token| self.stream_proxy.stats(token));
                 println!(
-                    "PLAYER_DIAG position={:.3} state={:?} hwdec={:?} dropped={} real={} render_stats={:?} render_err={:?}",
+                    "PLAYER_DIAG position={:.3} state={:?} hwdec={:?} dropped={} real={} render_stats={:?} render_err={:?} proxy={:?}",
                     snap.position_secs,
                     snap.state,
                     snap.hwdec,
@@ -2298,6 +2433,7 @@ impl App {
                         .render
                         .as_ref()
                         .and_then(|render| render.last_error()),
+                    proxy_stats,
                 );
             }
             let p = path.clone();

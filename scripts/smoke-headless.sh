@@ -123,6 +123,33 @@ else
   echo "==> 跳过 25-真实播放（无 ffmpeg 或 libmpv 不可用）"
 fi
 
+# ── 可选：真机网盘播放（真实账号+外网；默认跳过，WP_SMOKE_REAL_NET=1 才跑）
+# 注意：需要 WP_DATA_DIR 指向真机会话目录；llvmpipe 下首帧慢，wait-media-ms 给足。
+if [ "${WP_SMOKE_REAL_NET:-0}" = "1" ] && [ -d "$ROOT/出/真机联调数据" ]; then
+  REAL_DATA="$ROOT/出/真机联调数据"
+  real_play_case() { # <名字> <drive> <path> <seek-ms> <wait-ms>
+    local name="$1" drive="$2" path="$3" seek="$4" wait="$5"
+    echo "==> 截图：$name（真实网盘：$drive $path）"
+    if WP_DATA_DIR="$REAL_DATA" WP_PLAYER_HWDEC=no WP_PLAYER_AO_NULL=1 \
+        WP_SCREENSHOT_FRAME=60 LIBGL_ALWAYS_SOFTWARE=1 \
+        xvfb-run -a -s "-screen 0 1440x900x24 +extension GLX" \
+        "$BIN" --play-remote "$drive" "$path" --seek-ms "$seek" \
+        --screenshot "$OUT/$name.png" --frames 120 --wait-media-ms "$wait" \
+        > "$OUT/$name.log" 2>&1 && [ -f "$OUT/$name.png" ]; then
+      echo "    ✅ $(ls -lh "$OUT/$name.png" | awk '{print $5}')"
+      PASS=$((PASS+1))
+    else
+      echo "    ❌ 真实网盘播放失败（见 $OUT/$name.log）" >&2
+      FAIL=$((FAIL+1))
+    fi
+  }
+  real_play_case "26-网盘播放-光鸭mkv" guangya '/来自：分享/东京复仇者/东京复仇者.S01E25.2021.1080p.mkv' 120000 45000
+  real_play_case "27-网盘播放-夸克HLS" quark '/video_20260903_171534.mp4' 60000 45000
+  real_play_case "28-网盘播放-百度不可播提示" baidu '/来自：V2408A/DCIM/Camera/video_20250714_182340.mp4' 0 20000
+else
+  echo "==> 跳过 26/27/28（真机网盘用例；WP_SMOKE_REAL_NET=1 且存在 出/真机联调数据 才跑）"
+fi
+
 echo
 echo "==> 结果：通过 $PASS 项，失败 $FAIL 项（截图目录：$OUT）"
 if [ "$FAIL" -ne 0 ]; then exit 1; fi

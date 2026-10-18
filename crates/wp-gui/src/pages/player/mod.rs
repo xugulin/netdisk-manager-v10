@@ -78,6 +78,128 @@ impl PlayerPanel {
     }
 }
 
+/// 网盘播放链路信息（代理流 / HLS 直连；本地文件为 None）。
+#[derive(Debug, Clone, Default)]
+pub struct PlayerNetwork {
+    /// 链路模式：`代理流` / `HLS 直连`。
+    pub mode: String,
+    /// 文件大小（字节，0=未知）。
+    pub size: u64,
+}
+
+impl PlayerNetwork {
+    pub fn label(&self) -> String {
+        if self.size > 0 {
+            format!("{} · {}", self.mode, human_size(self.size))
+        } else {
+            self.mode.clone()
+        }
+    }
+}
+
+/// 当前网盘播放目标（链接过期时重新取链 + 续播用）。
+#[derive(Debug, Clone)]
+pub struct RemotePlayTarget {
+    pub drive: String,
+    pub path: String,
+    pub label: String,
+    pub size: u64,
+    pub resume_at: f64,
+}
+
+/// 人类可读文件大小。
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// `wp_stream::PlaybackSource` → `MediaSource`（纯函数，可单测）。
+///
+/// 返回 `(播放源, 链路展示信息, 代理 token)`；代理流播放结束需用 token `proxy.close(token)`。
+pub fn media_source_from_playback(
+    playback: wp_stream::PlaybackSource,
+    drive: &str,
+    path: &str,
+) -> (MediaSource, PlayerNetwork, Option<String>) {
+    let (url, headers, display, size, token, mode) = match playback {
+        wp_stream::PlaybackSource::Proxied { handle } => (
+            handle.url,
+            handle.headers,
+            handle.display,
+            handle.total_bytes,
+            Some(handle.token),
+            "代理流",
+        ),
+        wp_stream::PlaybackSource::DirectHls {
+            url,
+            headers,
+            display,
+            size,
+        } => (url, headers, display, size, None, "HLS 直连"),
+    };
+    let cache_key = format!("{drive}:{path}:{size}");
+    let source = MediaSource::Network(NetworkSource {
+        display,
+        url,
+        headers,
+        cache_key,
+        size,
+    });
+    (
+        source,
+        PlayerNetwork {
+            mode: mode.to_string(),
+            size,
+        },
+        token,
+    )
+}
+
+/// 网盘/播放错误 → 用户可读文案（23018/31326/登录/超时等）。
+pub fn readable_playback_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("31326") {
+        format!(
+            "网盘拒绝播放该文件（百度 31326：账号无权限或 CDN 限制；可换文件或重新登录后再试）— {raw}"
+        )
+    } else if lower.contains("23018") {
+        format!("夸克大文件直链受限（23018）：通常需等云端转码后走 HLS 播放 — {raw}")
+    } else if lower.contains("401") || lower.contains("403") || lower.contains("unauthorized") {
+        format!("播放链接被拒绝（登录失效/无权限），请到「网盘」页确认登录 — {raw}")
+    } else if lower.contains("timeout") || lower.contains("超时") || lower.contains("timed out") {
+        format!("网络超时，请重试 — {raw}")
+    } else if raw.contains("未登录") || raw.contains("登录已过期") {
+        format!("登录状态失效，请重新登录 — {raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// 网盘流代理诊断（状态行展示；上游反复失败时给可读提示）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProxyDiag {
+    pub downloaded: u64,
+    pub errors: u32,
+    pub restarts: u32,
+}
+
+impl ProxyDiag {
+    /// 是否处于「上游连续失败且零下载」的异常态（文件无权限/链接失效）。
+    pub fn is_stalled(&self) -> bool {
+        self.errors >= 5 && self.downloaded == 0
+    }
+}
+
 /// UI 动作：页面/快捷键统一收集后由 `App` 应用（避免 UI 闭包里与 `&mut App` 冲突）。
 #[derive(Debug, Clone)]
 pub enum PlayerAction {
@@ -177,6 +299,10 @@ pub struct PlayerUi {
     pub engine_note: Option<String>,
     /// 最近错误。
     pub error: Option<String>,
+    /// 网盘播放链路信息（代理流/HLS 直连；本地文件为 None）
+    pub network: Option<PlayerNetwork>,
+    /// 网盘代理流诊断（上游错误/换链计数；HLS 直连为 None）
+    pub proxy_diag: Option<ProxyDiag>,
     last_tick: Instant,
     pub subtitle: SubtitleUi,
     pub danmaku: DanmakuUi,
@@ -215,6 +341,8 @@ impl PlayerUi {
             panel: PlayerPanel::Subtitles,
             engine_note: None,
             error: None,
+            network: None,
+            proxy_diag: None,
             last_tick: Instant::now(),
             subtitle: SubtitleUi::default(),
             danmaku: DanmakuUi::default(),
@@ -424,6 +552,8 @@ impl PlayerUi {
         self.speed = 1.0;
         self.error = None;
         self.engine_note = None;
+        self.network = None;
+        self.proxy_diag = None;
         self.subtitle.reset();
     }
 
@@ -754,6 +884,12 @@ impl App {
     /// 打开媒体源并切到播放器页（浏览器入口/外部调用方统一走这里）。
     pub fn open_player(&mut self, source: MediaSource, label: impl Into<String>) {
         let label = label.into();
+        // 切换媒体：关闭上一个网盘代理流，重置重试/诊断状态
+        self.close_stream_session();
+        self.remote_retried = false;
+        self.proxy_hint_shown = false;
+        self.player.network = None;
+        self.player.proxy_diag = None;
         self.player.open_source(source, label);
         self.page = Page::Player;
         self.player.set_fullscreen(false, self.ctx.as_ref());
@@ -775,20 +911,170 @@ impl App {
     /// 网盘文件当前先构造占位 `NetworkSource`（MockEngine 只展示名称）；
     /// T15 完成后由 `wp-stream` 生成真实代理 URL 填入 `NetworkSource.url`。
     pub fn open_player_remote_entry(&mut self, entry: &RemoteEntry) {
-        let kind = self.active_slot().map(|slot| slot.kind());
-        let source = if kind == Some(DriveKind::Local) {
-            MediaSource::Local(PathBuf::from(&entry.path))
-        } else {
-            MediaSource::Network(NetworkSource {
-                display: entry.path.clone(),
-                // TODO(T15/wp-stream)：替换为 StreamProxy::start().url_for(...)
-                url: String::new(),
-                headers: Vec::new(),
-                cache_key: format!("{}:{}:{}", self.active_drive_id(), entry.path, entry.size),
-                size: entry.size,
-            })
+        let Some(slot) = self.active_slot() else {
+            self.toast(ToastKind::Warn, "当前没有可用网盘");
+            return;
         };
-        self.open_player(source, display_name_for_entry(entry));
+        let kind = slot.kind();
+        let drive_id = slot.id().to_string();
+        if kind == DriveKind::Local {
+            self.open_player_local_file(PathBuf::from(&entry.path));
+            return;
+        }
+        // 网盘文件：异步「取直链 → 判 HLS → 代理/直连」，结果经 Event::RemotePlayResolved 回 UI
+        let label = display_name_for_entry(entry);
+        self.start_remote_resolve(drive_id, entry.path.clone(), 0.0, Some(label));
+    }
+
+    /// 启动网盘播放源解析（异步；结果经 `Event::RemotePlayResolved` 回 UI）。
+    pub fn start_remote_resolve(
+        &mut self,
+        drive_id: String,
+        path: String,
+        resume_at: f64,
+        label: Option<String>,
+    ) {
+        let (drive, drive_name) = match self.slot_by_id(&drive_id) {
+            Some(slot) => match slot.drive.clone() {
+                Some(drive) => (drive, slot.display().to_string()),
+                None => {
+                    self.toast(
+                        ToastKind::Error,
+                        format!("网盘「{drive_id}」不可用（未初始化或初始化失败）"),
+                    );
+                    return;
+                }
+            },
+            None => {
+                self.toast(ToastKind::Error, format!("找不到网盘实例：{drive_id}"));
+                return;
+            }
+        };
+        let label = label
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path.as_str()).to_string());
+        self.remote_seq += 1;
+        let seq = self.remote_seq;
+        let proxy = self.stream_proxy.clone();
+        let drive_for_task = drive.clone();
+        let path_for_task = path.clone();
+        let label_for_task = label.clone();
+        let drive_id_for_task = drive_id.clone();
+        self.toast(
+            ToastKind::Info,
+            format!("正在解析网盘播放源（{drive_name}）：{label}"),
+        );
+        self.spawn(async move {
+            let mut result = wp_stream::playback::resolve_playback(
+                &proxy,
+                drive_for_task.clone(),
+                &path_for_task,
+            )
+            .await;
+            // 夸克大文件首次播放可能返回「云端转码中」（21002）：等 ~13s 自动重试一次
+            if let Err(err) = &result {
+                let msg = err.to_string();
+                if msg.contains("21002") || msg.contains("转码") || msg.contains("稍后") {
+                    wp_core::log_warn!("播放器", "网盘播放源转码中，13s 后重试：{msg}");
+                    tokio::time::sleep(std::time::Duration::from_secs(13)).await;
+                    result = wp_stream::playback::resolve_playback(
+                        &proxy,
+                        drive_for_task,
+                        &path_for_task,
+                    )
+                    .await;
+                }
+            }
+            Event::RemotePlayResolved {
+                seq,
+                drive: drive_id_for_task,
+                path: path_for_task,
+                label: label_for_task,
+                size: 0,
+                resume_at,
+                result,
+            }
+        });
+    }
+
+    /// 解析结果回调：建 MediaSource → 播放器打开 → 记录代理 token。
+    pub fn on_remote_play_resolved(
+        &mut self,
+        seq: u64,
+        drive: String,
+        path: String,
+        label: String,
+        _size: u64,
+        resume_at: f64,
+        result: Result<wp_stream::PlaybackSource, wp_core::Error>,
+    ) {
+        if seq != self.remote_seq {
+            return; // 过期请求
+        }
+        match result {
+            Ok(playback) => {
+                let display = playback.display().to_string();
+                let (source, network, token) = media_source_from_playback(playback, &drive, &path);
+                let label = if label.trim().is_empty() {
+                    display
+                } else {
+                    label
+                };
+                wp_core::log_info!(
+                    "播放器",
+                    "网盘播放源就绪：{label}（{}，{}，播放地址 {}）",
+                    network.mode,
+                    human_size(network.size),
+                    match &source {
+                        MediaSource::Network(n) => n.url.as_str(),
+                        _ => "(非网络源)",
+                    }
+                );
+                self.close_stream_session();
+                self.remote_target = Some(RemotePlayTarget {
+                    drive,
+                    path,
+                    label: label.clone(),
+                    size: network.size,
+                    resume_at,
+                });
+                self.open_player(source, label);
+                self.player.network = Some(network);
+                self.stream_token = token;
+                // 等首帧后再 seek（网盘流 open 后立即 seek 可能撞上上游链接刷新）
+                let seek_to = if resume_at > 0.0 {
+                    resume_at
+                } else {
+                    self.dev.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0)
+                };
+                self.pending_seek = if seek_to > 0.0 { Some(seek_to) } else { None };
+                if resume_at > 0.0 {
+                    self.toast(ToastKind::Success, "已重新取链并续播");
+                }
+            }
+            Err(err) => {
+                let readable = readable_playback_error(&err.to_string());
+                wp_core::log_error!("播放器", "网盘播放源解析失败 {path}：{readable}");
+                self.toast(ToastKind::Error, format!("无法播放网盘文件：{readable}"));
+            }
+        }
+    }
+
+    /// 关闭当前网盘代理流（释放代理会话；磁盘缓存保留）。
+    pub fn close_stream_session(&mut self) {
+        if let Some(token) = self.stream_token.take() {
+            self.stream_proxy.close(&token);
+            wp_core::log_info!("播放器", "已关闭代理流会话 token={token}");
+        }
+    }
+
+    /// 应用 `--seek-ms`（验收用；等首帧后再 seek）。
+    pub fn follow_dev_seek(&mut self) {
+        if let Some(ms) = self.dev.seek_ms {
+            if ms > 0 {
+                self.pending_seek = Some(ms as f64 / 1000.0);
+            }
+        }
     }
 
     /// 本地文件 → 播放器。
@@ -846,25 +1132,79 @@ impl App {
     }
 
     /// 引擎事件入口（`Event::Player` 转发到这里；错误类事件额外 toast）。
+    ///
+    /// 网盘播放中遇到可恢复错误（链接过期/热换失败）→ 自动重新取链并续播一次。
     pub fn on_player_event(&mut self, ev: PlayerEvent) {
+        let mut retry: Option<(String, String, String, f64)> = None;
         match &ev {
             PlayerEvent::Error {
                 message,
                 recoverable,
             } => {
-                let tail = if *recoverable {
-                    "（可恢复：将尝试重试/换链）"
-                } else {
-                    "（不可恢复）"
-                };
-                self.toast(ToastKind::Error, format!("播放器错误：{message}{tail}"));
+                wp_core::log_warn!(
+                    "播放器",
+                    "PlayerEvent::Error：{message}（recoverable={recoverable}）"
+                );
+                let readable = readable_playback_error(message);
+                if *recoverable && !self.remote_retried {
+                    if let Some(target) = self.remote_target.clone() {
+                        self.remote_retried = true;
+                        wp_core::log_warn!(
+                            "播放器",
+                            "网盘播放可恢复错误，重新取链：{}（{}）",
+                            target.label,
+                            human_size(target.size)
+                        );
+                        retry = Some((
+                            target.drive,
+                            target.path,
+                            target.label,
+                            self.player.position.max(target.resume_at),
+                        ));
+                        self.toast(ToastKind::Warn, "播放链接可能过期，正在重新取链并续播…");
+                    }
+                }
+                if retry.is_none() {
+                    let tail = if *recoverable {
+                        "（可恢复：已重试或无网盘源）"
+                    } else {
+                        "（不可恢复）"
+                    };
+                    self.toast(ToastKind::Error, format!("播放器错误：{readable}{tail}"));
+                }
+            }
+            PlayerEvent::FirstFrame => {
+                // 首帧就绪后再 seek：规避网盘流/代理刚建立时的竞态
+                if let Some(target) = self.pending_seek.take() {
+                    wp_core::log_info!("播放器", "首帧就绪，seek 到 {:.1}s", target);
+                    self.player.seek_absolute(target);
+                }
             }
             PlayerEvent::EndOfFile => {
+                self.close_stream_session();
                 self.toast(ToastKind::Info, "播放结束".to_string());
             }
             _ => {}
         }
+        match &ev {
+            PlayerEvent::StateChanged(state) => {
+                wp_core::log_info!(
+                    "播放器",
+                    "状态：{state:?}（position={:.2}s）",
+                    self.player.position
+                );
+            }
+            PlayerEvent::Opened { duration_secs, .. } => {
+                wp_core::log_info!("播放器", "媒体已打开：时长={duration_secs:?}s");
+            }
+            PlayerEvent::FirstFrame => wp_core::log_info!("播放器", "首帧已渲染"),
+            PlayerEvent::Buffering(pct) => wp_core::log_info!("播放器", "缓冲 {pct}%"),
+            _ => {}
+        }
         self.player.on_event(ev);
+        if let Some((drive, path, label, resume)) = retry {
+            self.start_remote_resolve(drive, path, resume, Some(label));
+        }
     }
 
     /// 应用一批播放器 UI 动作（页面/快捷键统一出口）。
@@ -899,6 +1239,8 @@ impl App {
             PlayerAction::OpenDemo => self.open_player_demo(),
             PlayerAction::CloseMedia => {
                 self.player.set_fullscreen(false, self.ctx.as_ref());
+                self.close_stream_session();
+                self.remote_target = None;
                 self.player.close();
                 self.toast(ToastKind::Info, "已关闭当前媒体");
             }
@@ -1000,6 +1342,9 @@ fn show_header(player: &PlayerUi, ui: &mut Ui, t: &Theme, actions: &mut Vec<Play
             ("演示引擎 Mock", t.warning)
         };
         pill(ui, t, badge, badge_color);
+        if let Some(network) = &player.network {
+            pill(ui, t, &network.label(), t.accent);
+        }
         if player.has_media() {
             if player.fullscreen {
                 pill(ui, t, "全屏", t.accent);
@@ -1295,6 +1640,30 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme) {
                 "软解/未知".into()
             }
         });
+        if let Some(network) = &player.network {
+            status_kv(ui, t, "链路", &network.mode);
+        }
+        if let Some(diag) = &player.proxy_diag {
+            if diag.errors > 0 || diag.restarts > 0 {
+                let text = format!(
+                    "上游错误 {} / 换链 {} / 已下载 {}",
+                    diag.errors,
+                    diag.restarts,
+                    human_size(diag.downloaded)
+                );
+                ui.label(RichText::new(format!("⚠ {text}")).size(10.5).color(
+                    if diag.is_stalled() {
+                        t.error
+                    } else {
+                        t.warning
+                    },
+                ))
+                .on_hover_text(
+                    "网盘流代理上游连续失败：常见原因 31326/CDN 限制/链接失效/无权限；\n\
+                     可换文件或重新登录后重试（详见日志 wp-stream）",
+                );
+            }
+        }
         status_kv(ui, t, "硬解", &hwdec);
         status_kv(ui, t, "丢帧", &player.snapshot.dropped_frames.to_string());
         status_kv(ui, t, "缓冲", &format!("{}%", player.buffering_pct));
@@ -1559,6 +1928,75 @@ mod tests {
     fn panel_labels_and_cyclic_switch() {
         assert_eq!(PlayerPanel::Subtitles.label(), "字幕");
         assert_eq!(PlayerPanel::Ai.icon(), "🤖");
+    }
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(727_730_541), "694.0 MB");
+    }
+
+    #[test]
+    fn playback_source_mapping_proxied() {
+        let playback = wp_stream::PlaybackSource::Proxied {
+            handle: wp_stream::StreamHandle {
+                url: "http://127.0.0.1:1234/s/tok".into(),
+                token: "tok".into(),
+                display: "电影.mkv".into(),
+                total_bytes: 727_730_541,
+                direct: false,
+                headers: Vec::new(),
+            },
+        };
+        let (source, network, token) = media_source_from_playback(playback, "guangya", "/a/b.mkv");
+        assert_eq!(token.as_deref(), Some("tok"));
+        assert_eq!(network.mode, "代理流");
+        assert_eq!(network.size, 727_730_541);
+        match source {
+            MediaSource::Network(n) => {
+                assert_eq!(n.url, "http://127.0.0.1:1234/s/tok");
+                assert_eq!(n.cache_key, "guangya:/a/b.mkv:727730541");
+                assert_eq!(n.size, 727_730_541);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playback_source_mapping_hls() {
+        let playback = wp_stream::PlaybackSource::DirectHls {
+            url: "https://cdn.example/x.m3u8".into(),
+            headers: vec![("Cookie".into(), "k=v".into())],
+            display: "视频.mp4".into(),
+            size: 173_709_677,
+        };
+        let (source, network, token) = media_source_from_playback(playback, "quark", "/v.mp4");
+        assert!(token.is_none());
+        assert_eq!(network.mode, "HLS 直连");
+        match source {
+            MediaSource::Network(n) => {
+                assert_eq!(n.url, "https://cdn.example/x.m3u8");
+                assert_eq!(n.headers.len(), 1);
+                assert_eq!(n.headers[0].0, "Cookie");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readable_errors_map_known_codes() {
+        let e = readable_playback_error(
+            "HTTP 403：{\"error_code\":31326,\"error_msg\":\"user is not authorized\"}",
+        );
+        assert!(e.contains("31326"), "{e}");
+        let q = readable_playback_error("夸克 23018 直链受限");
+        assert!(q.contains("23018"), "{q}");
+        let auth = readable_playback_error("HTTP 401 Unauthorized");
+        assert!(auth.contains("登录"), "{auth}");
+        let plain = readable_playback_error("未知错误 xyz");
+        assert_eq!(plain, "未知错误 xyz");
     }
 
     #[test]
