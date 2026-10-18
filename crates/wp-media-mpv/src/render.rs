@@ -152,9 +152,13 @@ fn framebuffer_from_id(id: i32) -> Option<glow::Framebuffer> {
 }
 
 /// GL 渲染状态快照（回调结束前恢复，避免破坏 egui 的绘制状态）。
+///
+/// 注意 `SCISSOR_BOX` 也必须保存：mpv render API 会改 scissor 状态，
+/// 只恢复 `SCISSOR_TEST` 开关而不恢复 box 会残留裁剪矩形（GUI 实测：视频右侧/上侧被裁掉）。
 struct SavedGlState {
     framebuffer: Option<glow::Framebuffer>,
     viewport: [i32; 4],
+    scissor_box: [i32; 4],
     scissor: bool,
     blend: bool,
 }
@@ -164,9 +168,12 @@ unsafe fn save_gl_state(gl: &glow::Context) -> SavedGlState {
         framebuffer_from_id(unsafe { gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING) });
     let mut viewport = [0i32; 4];
     unsafe { gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport) };
+    let mut scissor_box = [0i32; 4];
+    unsafe { gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut scissor_box) };
     SavedGlState {
         framebuffer,
         viewport,
+        scissor_box,
         scissor: unsafe { gl.is_enabled(glow::SCISSOR_TEST) },
         blend: unsafe { gl.is_enabled(glow::BLEND) },
     }
@@ -180,6 +187,12 @@ unsafe fn restore_gl_state(gl: &glow::Context, saved: &SavedGlState) {
             saved.viewport[1],
             saved.viewport[2],
             saved.viewport[3],
+        );
+        gl.scissor(
+            saved.scissor_box[0],
+            saved.scissor_box[1],
+            saved.scissor_box[2],
+            saved.scissor_box[3],
         );
         if saved.scissor {
             gl.enable(glow::SCISSOR_TEST);
@@ -398,6 +411,21 @@ impl RenderShared {
         // （framebuffer / viewport / scissor / blend 都可能被改）。合成前必须把 egui
         // 期望的状态恢复回来，否则画面会画到错误的位置/尺寸（GUI 实测过：整块偏移）。
         unsafe { restore_gl_state(gl, &saved) };
+
+        // 再显式按本回调的 clip_rect 设置 scissor（与 egui painter 的 set_clip_rect 一致）：
+        // 只恢复 SCISSOR_TEST 开关而不恢复 box 会残留 mpv 的裁剪矩形 → 视频被裁边。
+        {
+            let clip = info.clip_rect_in_pixels();
+            unsafe {
+                gl.enable(glow::SCISSOR_TEST);
+                gl.scissor(
+                    clip.left_px,
+                    clip.from_bottom_px,
+                    clip.width_px.max(0),
+                    clip.height_px.max(0),
+                );
+            }
+        }
 
         // 合成：把 FBO 纹理铺满回调矩形（viewport 已恢复为 egui 给的回调矩形）
         {

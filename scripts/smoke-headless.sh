@@ -96,6 +96,33 @@ run_case "22-工具-分类浏览"  --drive demo --page tools --tools-tab categor
 run_case "23-网盘-缩略图"    --drive demo --path /影视 --frames 60
 run_case "24-播放器"          --drive demo --page player --frames 40
 
+# ── 25：真实 libmpv 播放（可选；有 ffmpeg + libmpv 才跑，保证 smoke 在纯 CI 环境不假失败）
+if command -v ffmpeg >/dev/null 2>&1 && { ldconfig -p 2>/dev/null | grep -q libmpv || [ -e "$ROOT/播放器运行时/libmpv.so.2" ]; }; then
+  TEST_VIDEO="$(mktemp --suffix=.mp4 /tmp/wp-smoke-video-XXXXXX)"
+  if ffmpeg -hide_banner -loglevel error \
+      -f lavfi -i "testsrc2=size=1280x720:rate=30" -f lavfi -i "sine=frequency=440" \
+      -t 6 -c:v libx264 -pix_fmt yuv420p -preset ultrafast -c:a aac -shortest -y "$TEST_VIDEO" >/dev/null 2>&1; then
+    echo "==> 截图：25-真实播放（libmpv 真实帧，media=$(basename "$TEST_VIDEO")）"
+    if WP_PLAYER_HWDEC=no WP_SCREENSHOT_FRAME=40 LIBGL_ALWAYS_SOFTWARE=1 \
+        xvfb-run -a -s "-screen 0 1440x900x24 +extension GLX" \
+        "$BIN" --media "$TEST_VIDEO" --screenshot "$OUT/25-真实播放.png" \
+        --frames 160 --wait-ms 12000 > "$OUT/25-真实播放.log" 2>&1 \
+        && [ -f "$OUT/25-真实播放.png" ]; then
+      echo "    ✅ $(ls -lh "$OUT/25-真实播放.png" | awk '{print $5}')"
+      PASS=$((PASS+1))
+    else
+      echo "    ❌ 真实播放截图失败（见 $OUT/25-真实播放.log）" >&2
+      tail -5 "$OUT/25-真实播放.log" >&2 || true
+      FAIL=$((FAIL+1))
+    fi
+  else
+    echo "    ⏭ 跳过 25-真实播放：ffmpeg 生成测试片失败" >&2
+  fi
+  rm -f "$TEST_VIDEO"
+else
+  echo "==> 跳过 25-真实播放（无 ffmpeg 或 libmpv 不可用）"
+fi
+
 echo
 echo "==> 结果：通过 $PASS 项，失败 $FAIL 项（截图目录：$OUT）"
 if [ "$FAIL" -ne 0 ]; then exit 1; fi

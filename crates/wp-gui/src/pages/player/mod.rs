@@ -270,6 +270,8 @@ impl PlayerUi {
         };
         // 运行期调参（无头验收/排障用）：ao=null 避开无声卡环境；hwdec 可显式覆盖
         let mut mpv_cfg = MpvConfig::default();
+        // UI 自带控制条/时间码：关闭 mpv 自己的 OSD（否则播放页会叠一层 mpv 时间/文件名）
+        mpv_cfg.extra_options.push("osd-level=0".into());
         if std::env::var("WP_PLAYER_AO_NULL").is_ok() {
             mpv_cfg.extra_options.push("ao=null".into());
         }

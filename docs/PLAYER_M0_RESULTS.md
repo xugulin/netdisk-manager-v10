@@ -95,12 +95,19 @@ DISPLAY=:99 cargo run -p wp-media-mpv --example render_probe -- \
 
 ### E2-4 GUI 真实播放联调（合成位置 bug 修复 + 像素回归）
 
-gui-player 接入后首次真实播放发现「视频尺寸正确但整体偏移、盖住侧栏」。根因：`mpv_render_context_render()` 返回后 **GL 状态未定义**（framebuffer/viewport/scissor 被 mpv 改掉），原实现 render 后直接 composite。
-修复：render 后先 `restore_gl_state(saved)` 再 composite，最后再恢复一次。像素级回归（读**窗口默认 framebuffer**，等价 GUI 截图，检测彩色区域 bbox）：
+gui-player 接入后真实播放先后暴露两个 GL 状态问题，均已修复：
+
+1. **整体偏移**：`mpv_render_context_render()` 返回后 **GL 状态未定义**（framebuffer/viewport 被 mpv 改掉），原实现 render 后直接 composite；
+   修复：render 后先 `restore_gl_state(saved)` 再 composite，最后再恢复一次。
+2. **右侧/上侧被裁边**（整数/小数 rect 均复现，右边缘≈rect.width 值、底边正常）：`restore_gl_state` 只恢复了 `SCISSOR_TEST` 开关、**没恢复 `SCISSOR_BOX`**，mpv render 残留的裁剪矩形（其 FBO 尺寸坐标系）把合成画面裁掉；
+   修复：保存/恢复 `SCISSOR_BOX`；mpv render 前 `disable(SCISSOR_TEST)`；composite 前再显式按本回调的 `info.clip_rect_in_pixels()` 设置 `glScissor`（与 egui painter 的 `set_clip_rect` 完全一致），合成后恢复。
+
+像素级回归（读**窗口默认 framebuffer**，等价 GUI 截图，检测彩色区域 bbox；修复后两种 rect 均通过）：
 
 | 用例 | 期望 | 实测 | 结论 |
 |---|---|---|---|
-| 1280x800 窗口，视频矩形 `--rect 158,152,780,438`（模拟 GUI 16:9 inner rect） | x=[158,938] y=[152,590] | **彩色 bbox x=[160,936] y=[152,589]** | ✅ 位置/尺寸正确 |
+| 1280x800 窗口，**小数** rect `--rect 158.0,161.3,770.4,433.4` | x=[158,928] y=[161,595] | **x=[158,928] y=[161,594]** | ✅ 修复后无裁剪 |
+| 1280x800 窗口，**整数** rect `--rect 158,152,780,438`（模拟 GUI 16:9 inner rect） | x=[158,938] y=[152,590] | **x=[159,937] y=[152,590]** | ✅ ±1px 整数边界 |
 | 视频矩形外围抽点（左侧栏/右侧/下方） | egui 背景色 | `(30,30,36)` | ✅ 不再越界覆盖侧栏 |
 
 同时 `gl_error=0`、方向正确（红顶/蓝底片像素校验）、UI 覆盖层与视频同帧合成（红角标像素命中 39.9%）。
