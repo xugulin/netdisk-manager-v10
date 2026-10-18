@@ -109,6 +109,7 @@ $Steps = @(
 set -euo pipefail
 pacman -S --needed --noconfirm base-devel git curl tar xz p7zip meson ninja pkgconf nasm \
   mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-python \
   mingw-w64-ucrt-x86_64-libass \
   mingw-w64-ucrt-x86_64-libplacebo \
   mingw-w64-ucrt-x86_64-libbluray
@@ -128,13 +129,17 @@ if [ ! -d 'ffmpeg-src' ]; then
   [ -d 'ffmpeg-src' ] || mv FFmpeg-* 'ffmpeg-src'
 fi
 cd 'ffmpeg-src'
-./configure --prefix='__PREFIX__/ffmpeg' \
-  --disable-gpl --disable-nonfree --disable-version3 \
-  --disable-doc --disable-debug --disable-programs \
-  --enable-shared --disable-static \
-  --disable-autodetect
-make -j__JOBS__
-make install
+if [ -f '__PREFIX__/ffmpeg/lib/pkgconfig/libavcodec.pc' ]; then
+  echo "FFmpeg LGPL 已构建（缓存命中），跳过 configure/make"
+else
+  ./configure --prefix='__PREFIX__/ffmpeg' \
+    --disable-gpl --disable-nonfree --disable-version3 \
+    --disable-doc --disable-debug --disable-programs \
+    --enable-shared --disable-static \
+    --disable-autodetect
+  make -j__JOBS__
+  make install
+fi
 '@
   },
   [ordered]@{
@@ -151,8 +156,22 @@ if [ ! -d 'mpv-src' ]; then
   [ -d 'mpv-src' ] || mv mpv-* 'mpv-src'
 fi
 export PKG_CONFIG_PATH='__PREFIX__/ffmpeg/lib/pkgconfig:/ucrt64/lib/pkgconfig'
+# MSYS2 的 meson 由 MSYS python 驱动，在 UCRT64/MinGW 环境下会被 meson 拒绝
+# （"This python3 seems to be msys/python ... but you are in a MinGW environment"）。
+# 解法：用 mingw-w64 python 安装并运行 meson。
+export PATH="/ucrt64/bin:$PATH"
+PY=""
+for cand in /ucrt64/bin/python.exe /ucrt64/bin/python; do
+  if [ -x "$cand" ]; then PY="$cand"; break; fi
+done
+if [ -z "$PY" ]; then
+  echo "错误：未找到 UCRT64 python（请安装 mingw-w64-ucrt-x86_64-python）" >&2
+  exit 3
+fi
+"$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+"$PY" -c 'import mesonbuild' >/dev/null 2>&1 || "$PY" -m pip install --quiet meson
 rm -rf mpv-build
-meson setup mpv-build mpv-src \
+"$PY" -m mesonbuild.mesonmain setup mpv-build mpv-src \
   --buildtype=release --prefix='__PREFIX__/mpv' \
   -Dgpl=false -Dlibmpv=true -Dcplayer=false -Dbuild-date=false \
   -Dlua=disabled -Djavascript=disabled -Drubberband=disabled \

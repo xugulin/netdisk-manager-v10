@@ -78,11 +78,11 @@ jobs:
             mingw-w64-ucrt-x86_64-libplacebo
             mingw-w64-ucrt-x86_64-libbluray
 
-      - name: 缓存 media-stack 构建目录（FFmpeg/mpv 源码与中间产物）
+      - name: 恢复 media-stack 构建缓存（FFmpeg/mpv 源码与中间产物）
         uses: actions/cache@v4
         with:
           path: 出/构建缓存/windows-media-stack
-          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-${{ hashFiles('scripts/build-media-stack-windows.ps1') }}
+          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}
           restore-keys: |
             media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-
 
@@ -93,6 +93,13 @@ jobs:
           ./scripts/build-media-stack-windows.ps1 -Run -Msys2Root C:\msys64 `
             -WorkDir "${{ github.workspace }}\出\构建缓存\windows-media-stack" `
             -MpvVersion "$env:MPV_VERSION" -FfmpegVersion "$env:FFMPEG_VERSION" -Jobs 4
+
+      - name: 保存构建缓存（即使构建失败也保存，加速重试）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: 出/构建缓存/windows-media-stack
+          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}
 
       - name: 校验构建产物（sha256 / 许可证 / BUILDINFO）
         shell: pwsh
