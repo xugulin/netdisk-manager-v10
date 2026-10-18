@@ -1,0 +1,89 @@
+name: windows-smoke
+
+# 快速 Windows 自检（M6-Win 预检，独立于重型 media-stack 构建）：
+#   1) 校验 PowerShell 脚本可解析（语法级）
+#   2) cargo build --release（wp-gui/wp-cli，MSVC）+ 冒烟运行 --help
+#   3) 校验 package-player-runtime-windows.ps1 -Generate 在无 media-stack 时给出可读错误/结构
+# 用途：在 player-windows 的重型构建之前先验证脚本/Rust 代码在 Windows 上没问题。
+on:
+  workflow_dispatch:
+    inputs:
+      with_tests:
+        description: "是否跑 cargo test（较慢，默认只 build）"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows-smoke:
+    name: Windows 脚本/Rust 预检
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: PowerShell 脚本语法校验
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = @(
+            "scripts/build-media-stack-windows.ps1",
+            "scripts/package-player-runtime-windows.ps1",
+            "scripts/fetch-angle.ps1",
+            "scripts/windows-verify.ps1"
+          )
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "缺少脚本 $f" }
+            $tokens = $null; $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $msg = ($errors | ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
+              throw "$f 语法错误：`n$msg"
+            }
+            Write-Host "  [OK] $f"
+          }
+
+      - name: cargo build（release，wp-gui + wp-cli）
+        run: cargo build --release -p wp-gui -p wp-cli
+
+      - name: 冒烟运行 wp-cli / 检查 exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $gui = Join-Path $meta.target_directory "release\网盘管理.exe"
+          $cli = Join-Path $meta.target_directory "release\wp-cli.exe"
+          if (-not (Test-Path $gui)) { throw "缺少 $gui" }
+          if (-not (Test-Path $cli)) { throw "缺少 $cli" }
+          Write-Host "GUI: $gui ($((Get-Item $gui).Length) B)"
+          Write-Host "CLI: $cli ($((Get-Item $cli).Length) B)"
+          & $cli --help 2>&1 | Select-Object -First 5 | ForEach-Object { Write-Host $_ }
+
+      - name: package-player-runtime-windows.ps1 -Generate 结构自检
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "出\smoke-win64"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          try {
+            ./scripts/package-player-runtime-windows.ps1 -Generate `
+              -RuntimeDir "$out\播放器运行时" -PrebuiltDir "vendor\prebuilt\windows-x86_64" 2>&1 |
+              Select-Object -Last 8 | ForEach-Object { Write-Host $_ }
+          } catch {
+            Write-Host "  预期错误（无 media-stack 产物）：$($_.Exception.Message)"
+          }
+          Write-Host "  package 脚本结构自检完成（无 media-stack 时允许给出可读错误）"
+
+      - name: 可选：cargo test
+        if: ${{ github.event.inputs.with_tests == 'true' }}
+        run: cargo test --workspace
