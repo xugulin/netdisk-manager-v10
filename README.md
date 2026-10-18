@@ -277,14 +277,20 @@ crates/
 > 本项目是**独立重写**：源项目只读参考，未修改任何源文件；研究规格文档保留了
 > `文件:行号` 引用，便于回溯核对。
 
-## 10. 播放器规划（只读调研阶段，未实现）
+## 10. 播放器规划（设计阶段，未实现）
 
-计划新增「播放器页」：播放**网盘视频**（走直链 + 本机流代理）与**本地视频**。
+计划新增「播放器页」：播放**网盘视频**、**本地视频**与 **4K/ISO 蓝光原盘**，要求**完整字幕**、
+**4K 流畅**、后期接入 **AI** 与 **弹幕**，并保证**源码可控**。
 
-- **调研报告与方案评估**：[docs/PLAYER_RESEARCH.md](docs/PLAYER_RESEARCH.md)
-  （只读研究 tealinux-iso / VLC；评测 libVLC vmem、VLC4 GPU、libmpv render、GStreamer、纯 FFmpeg、外部播放器 6 条路线）
+- **架构设计（当前方案）**：[docs/PLAYER_ARCHITECTURE.md](docs/PLAYER_ARCHITECTURE.md)
+  （libmpv 媒体内核 LGPL 构建 + 双渲染模式 + 完整字幕 + 流缓存 + AI 子系统 + 弹幕子系统 + 源码可控构建）
 - **任务计划**：[docs/PLAYER_TASKS.md](docs/PLAYER_TASKS.md)
-  （M0 可行性实验 → M1 MVP → M2 体验 → M3 发行；约 9–13 人日，待确认后开工）
+  （M0 技术验证 → M1 播放内核 → M2 完整字幕 → M3 源接入/ISO → M4 AI 基建+翻译 → M5 弹幕 → M6 打包验收 → M7 进阶；
+  约 50–72 人日，待确认后开工）
+- **第一轮调研记录**：[docs/PLAYER_RESEARCH.md](docs/PLAYER_RESEARCH.md)
+  （只读研究 tealinux-iso / VLC；含 VLC 嵌入 API、许可证、Tea Linux 发行范式；附第二轮 mpv 补充事实）
 
-> 阶段结论：推荐 **libVLC 3.x（LGPL 动态链接）+ 自研薄 FFI + 本地流代理 + vmem 回读**，
-> 外部播放器兜底；两个必须先验证的点是「三盘直链 Range 支持」与「vmem 收帧性能/字幕限制」。
+> 阶段结论：媒体内核选 **libmpv（LGPL 动态链接，pin v0.41.0）**——完整字幕栈（libass + 位图字幕）、
+> 硬解/HDR、libbluray 蓝光、AI 挂钩点与源码自建能力都是最优；渲染按平台双模式
+> （Linux 进程内 GL render API；Windows 原生子窗口 + D3D11VA）；网盘流走本地磁盘预读缓存代理；
+> 弹幕后续以「egui 覆盖层（Mode A）/ 预生成 ASS 弹幕轨（Mode B）」双通道接入。

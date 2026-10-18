@@ -4,6 +4,12 @@
 > 调研对象：[tealinuxos/tealinux-iso](https://github.com/tealinuxos/tealinux-iso) · [videolan/vlc](https://github.com/videolan/vlc)
 > 目标：为「**播放网盘视频** + **播放本地视频**」选定可集成进本项目（Rust / eframe+egui）的播放方案。
 > 配套任务计划见 [PLAYER_TASKS.md](PLAYER_TASKS.md)。
+>
+> ⚠️ **2026-10-19 需求升级修订**：用户新增「**完整字幕** / **4K·ISO 蓝光原盘流畅** / **AI** / **源码可控** / **后续弹幕**」要求。
+> 本轮推荐的「libVLC 3.x vmem」已不满足（vmem 丢字幕、VLC4 未发布、无 GPU 嵌入路径），
+> **修订后的目标架构见 [PLAYER_ARCHITECTURE.md](PLAYER_ARCHITECTURE.md)**；
+> 本文保留为第一轮只读调研记录（VLC 许可证/嵌入 API、Tea Linux 发行范式等结论仍有参考价值），
+> 第二轮针对 mpv 的补充事实见文末「附录 A」。
 
 ---
 
@@ -339,3 +345,29 @@ API（master 头文件）：
 3. **两个必须先验证的实验**：① 三盘直链 Range（决定 seek）；② 本机装好 VLC 运行时后 vmem 收帧/性能基线。这两个实验（M0）通过后再进入实现，避免返工。
 4. **体验短板要提前对齐预期**：VLC3 vmem 无字幕/OSD、4K 可能吃 CPU；若字幕/4K 是硬需求，建议 M4 直接评估 VLC4（等正式版）或 libmpv LGPL 后端，而不是在 vmem 上硬扛。
 5. **发行策略**：Tea Linux/Arch 走 PKGBUILD `depends=('vlc')`；Windows 绿色版优先「提示安装 VLC + 外部播放器兜底」，捆绑方案需先解决 GPL 插件合规与体积问题。
+
+---
+
+## 附录 A：第二轮补充调研 —— 为什么转向 libmpv（摘要）
+
+> 完整设计与证据见 [PLAYER_ARCHITECTURE.md](PLAYER_ARCHITECTURE.md)；这里只记录第一轮之后新查到的关键事实。
+
+1. **mpv 双许可**：默认 GPLv2+，`meson -Dgpl=false` 可构建 LGPLv2.1+ 版（`LICENSE.GPL`/`LICENSE.LGPL` 并存），
+   MIT 应用可动态链接；LGPL 构建只禁用 `x11/dvdnav/dvda/cdda/dvbin/jack/oss-audio/caca/direct3d` 等无关项，
+   **保留** gpu-next/libplacebo、libmpv render API、d3d11（Windows）、字幕（libass+位图字幕）、libbluray、硬解。
+2. **完整字幕栈在线**：`sub-add`/`sub-reload`/`sub-remove` 命令、`sub-start`/`sub-text`/`track-list` 属性、
+   `--secondary-sub-*` 双字幕、`--sub-auto`/`--sub-file-paths` 同名自动加载、`--embeddedfonts`/`--sub-fonts-dir`、
+   `--sub-ass-override` 样式覆盖；位图字幕（PGS/DVD/DVB）由 `sub/sd_lavc.c`（LGPL-2.1+ 文件头）配合 FFmpeg 解码，
+   由 libplacebo/gpu-next 渲染（含 HDR 字幕峰值控制）。
+3. **4K/HDR 渲染**：mpv 0.41（2025-12）默认 gpu-next，Vulkan hwdec 优先；硬件解码 API（VAAPI/NVDEC/Vulkan Video/D3D11VA）
+   + render API 的 OpenGL 路径（v0.41 仅 OpenGL/SW）；master（0.42-dev）新增 **D3D11 render API**（`render_d3d11.h`）。
+   render API 提供 `ADVANCED_CONTROL`/`BLOCK_FOR_TARGET_TIME`/`GL_FBO`/`report_swap` 等帧同步手段。
+4. **蓝光原盘**：`--bluray-device`/`--bluray-angle`；v0.41 `stream_bluray.c` 已有 `bd://menu` 标题与 `BD_EVENT_MENU`，
+   但**交互菜单 overlay 渲染（HDMV IG + BD-J ARGB）与 `disc-menu-active` 属性在 0.42-dev**；
+   AACS 1.0/BD+ 可由 libaacs/libbdplus（均 LGPL-2.1+，需用户密钥）处理；**AACS 2.x/UHD 加密盘无开源解密方案**。
+5. **网络/字幕/AI 注入能力**：mpv 支持 `--http-header-fields`/`--referrer`/`--cookies*`（可直接给网盘链接加头，
+   但仍建议走本地流代理做预读缓存与换链）；`sub-add`/`sub-reload` + `sub-text` 观察可让 AI 翻译/ASR 结果作为外部字幕实时注入。
+6. **AI 生态**（本地优先）：whisper-rs（whisper.cpp）、candle-core、ort（ONNX Runtime）、llama-cpp-2 均可源码构建；
+   建议 AI 推理放独立 worker 进程，避免影响 4K 解码与帧同步。
+7. **弹幕**：mpv 的动态字幕注入（`sub-add`/`sub-reload`）与 `--secondary-sub-*` 双字幕轨可承载**预生成的 ASS 弹幕轨**
+   （跨 Mode A/B 可用）；交互式弹幕（悬停/搜索/发送）建议用 egui 覆盖层（仅 Mode A），见架构 §6。
