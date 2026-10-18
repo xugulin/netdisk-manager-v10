@@ -1737,17 +1737,35 @@ impl eframe::App for App {
                     errors: stats.errors as u32,
                     restarts: stats.upstream_restarts as u32,
                     weak_network: stats.weak_network,
+                    fatal: stats.fatal,
+                    fatal_reason: stats.fatal_reason.clone(),
+                    consecutive_failures: stats.consecutive_failures,
                 };
-                self.player.proxy_diag = Some(diag);
+                // 先 clone 一份给状态行，下面的 toast 还要读字段
+                self.player.proxy_diag = Some(diag.clone());
+                if diag.fatal {
+                    self.player.fatal_hint =
+                        Some((diag.fatal_reason.clone(), diag.consecutive_failures));
+                }
                 if diag.is_stalled() && !self.proxy_hint_shown {
                     self.proxy_hint_shown = true;
-                    self.toast(
-                        ToastKind::Error,
-                        format!(
-                            "网盘流上游连续失败（错误 {} 次/换链 {} 次，已下载 0 B）：文件可能无权限或链接受限（如百度 31326），请换文件或重新登录",
-                            diag.errors, diag.restarts
-                        ),
-                    );
+                    if diag.fatal {
+                        self.toast(
+                            ToastKind::Error,
+                            format!(
+                                "网盘流已熔断：{}（连续失败 {} 块）。已停止重试，请换文件或重新登录",
+                                diag.fatal_reason, diag.consecutive_failures
+                            ),
+                        );
+                    } else {
+                        self.toast(
+                            ToastKind::Error,
+                            format!(
+                                "网盘流上游连续失败（错误 {} 次/换链 {} 次，已下载 0 B）：文件可能无权限或链接受限（如百度 31326），请换文件或重新登录",
+                                diag.errors, diag.restarts
+                            ),
+                        );
+                    }
                 }
             }
         }

@@ -186,7 +186,7 @@ pub fn readable_playback_error(raw: &str) -> String {
 }
 
 /// 网盘流代理诊断（状态行展示；上游反复失败时给可读提示）。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProxyDiag {
     /// 本会话从上游真实下载字节。
     pub downloaded: u64,
@@ -196,12 +196,18 @@ pub struct ProxyDiag {
     pub restarts: u32,
     /// 弱网自适应已触发（预读窗口自动下调）。
     pub weak_network: bool,
+    /// 上游权限类 4xx 连续失败 → 会话熔断（admin 已停止预读，后续 GET 直接 502）。
+    pub fatal: bool,
+    /// 熔断可读原因（未熔断为空串）。
+    pub fatal_reason: String,
+    /// 连续失败的块数（熔断阈值由 stream 侧配置）。
+    pub consecutive_failures: u64,
 }
 
 impl ProxyDiag {
-    /// 是否处于「上游连续失败且零下载」的异常态（文件无权限/链接失效）。
+    /// 是否处于「上游连续失败且零下载」的异常态（文件无权限/链接失效/已熔断）。
     pub fn is_stalled(&self) -> bool {
-        self.errors >= 5 && self.downloaded == 0
+        self.fatal || (self.errors >= 5 && self.downloaded == 0)
     }
 }
 
@@ -308,6 +314,8 @@ pub struct PlayerUi {
     pub network: Option<PlayerNetwork>,
     /// 网盘代理流诊断（上游错误/换链计数；HLS 直连为 None）
     pub proxy_diag: Option<ProxyDiag>,
+    /// 最近一次「上游熔断」可读提示（粘性：换链重解析新会话后仍展示，直到切换媒体）
+    pub fatal_hint: Option<(String, u64)>,
     last_tick: Instant,
     pub subtitle: SubtitleUi,
     pub danmaku: DanmakuUi,
@@ -348,6 +356,7 @@ impl PlayerUi {
             error: None,
             network: None,
             proxy_diag: None,
+            fatal_hint: None,
             last_tick: Instant::now(),
             subtitle: SubtitleUi::default(),
             danmaku: DanmakuUi::default(),
@@ -559,6 +568,7 @@ impl PlayerUi {
         self.engine_note = None;
         self.network = None;
         self.proxy_diag = None;
+        self.fatal_hint = None;
         self.subtitle.reset();
     }
 
@@ -895,6 +905,7 @@ impl App {
         self.proxy_hint_shown = false;
         self.player.network = None;
         self.player.proxy_diag = None;
+        self.player.fatal_hint = None;
         self.player.open_source(source, label);
         self.page = Page::Player;
         self.player.set_fullscreen(false, self.ctx.as_ref());
@@ -1044,6 +1055,11 @@ impl App {
                     resume_at,
                 });
                 self.open_player(source, label);
+                if resume_at > 0.0 {
+                    // 这是「链接过期自动重试」的续播：保持 remote_retried=true，
+                    // 否则 open_player 会重置标记 → 可恢复错误再次触发重试 → 死循环。
+                    self.remote_retried = true;
+                }
                 self.player.network = Some(network);
                 self.stream_token = token;
                 // 等首帧后再 seek（网盘流 open 后立即 seek 可能撞上上游链接刷新）
@@ -1151,7 +1167,15 @@ impl App {
                     "PlayerEvent::Error：{message}（recoverable={recoverable}）"
                 );
                 let readable = readable_playback_error(message);
-                if *recoverable && !self.remote_retried {
+                // 上游已熔断（权限类永久错误）：不要再重试取链，直接展示熔断原因
+                if let Some((reason, fails)) = self.player.fatal_hint.clone() {
+                    self.toast(
+                        ToastKind::Error,
+                        format!(
+                            "网盘流上游熔断：{reason}（连续失败 {fails} 块），请换文件或重新登录"
+                        ),
+                    );
+                } else if *recoverable && !self.remote_retried {
                     if let Some(target) = self.remote_target.clone() {
                         self.remote_retried = true;
                         wp_core::log_warn!(
@@ -1673,7 +1697,32 @@ fn show_status_line(player: &PlayerUi, ui: &mut Ui, t: &Theme) {
             if diag.weak_network {
                 status_kv(ui, t, "弱网", "自适应预读已降窗");
             }
-            if diag.errors > 0 || diag.restarts > 0 {
+            if diag.fatal {
+                ui.label(
+                    RichText::new(format!(
+                        "⛔ 上游熔断：{}（连续失败 {} 块）",
+                        diag.fatal_reason, diag.consecutive_failures
+                    ))
+                    .size(10.5)
+                    .color(t.error),
+                )
+                .on_hover_text(
+                    "网盘流代理判定为权限类永久错误（如百度 31326/CDN 限制/登录失效）：\n\
+                     已停止后台预读与换链重试，后续请求直接返回可读错误；\n\
+                     请换文件、重新登录，或稍后重试。",
+                );
+            } else if let Some((reason, fails)) = &player.fatal_hint {
+                // 粘性熔断提示：重取链/新会话后仍展示，直到切换媒体
+                ui.label(
+                    RichText::new(format!("⛔ 上游熔断：{reason}（连续失败 {fails} 块）"))
+                        .size(10.5)
+                        .color(t.error),
+                )
+                .on_hover_text(
+                    "网盘流代理判定为权限类永久错误（如百度 31326/CDN 限制/登录失效）：\n\
+                     已停止后台预读与换链重试；请换文件、重新登录，或稍后重试。",
+                );
+            } else if diag.errors > 0 || diag.restarts > 0 {
                 let text = format!(
                     "上游错误 {} / 换链 {} / 已下载 {}",
                     diag.errors,
