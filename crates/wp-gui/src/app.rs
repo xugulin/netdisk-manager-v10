@@ -484,6 +484,16 @@ pub struct ToolsState {
     pub category: String,
 }
 
+/// 顶栏网盘实例按钮的操作（点击/右键菜单）。
+enum TopDriveAction {
+    Switch(usize),
+    Login(String),
+    Logout(String),
+    Refresh(String),
+    AddAccount(DriveKind),
+    Remove(String),
+}
+
 /// 全局应用状态。
 pub struct App {
     pub paths: Paths,
@@ -654,21 +664,14 @@ impl App {
             let slot = Self::build_slot(&paths, &dcfg);
             drives.push(slot);
         }
+        // 按实例 id 在**已加载槽位**里定位（不能用 cfg.drives 的下标：
+        // 被禁用/初始化跳过的实例会让下标错位，导致启动时选错网盘/账号）。
+        let slot_idx = |id: &str| drives.iter().position(|s| s.id() == id);
         let active = dev
             .initial_drive
-            .as_ref()
-            .and_then(|id| {
-                cfg.drives
-                    .iter()
-                    .position(|d| &d.id == id)
-                    .filter(|&i| drives.get(i).is_some())
-            })
-            .or_else(|| {
-                cfg.drives
-                    .iter()
-                    .position(|d| d.id == cfg.ui.last_drive)
-                    .filter(|&i| drives.get(i).is_some())
-            })
+            .as_deref()
+            .and_then(slot_idx)
+            .or_else(|| slot_idx(&cfg.ui.last_drive))
             .unwrap_or(0);
         let page = match dev.initial_page.as_deref() {
             Some("player") => Page::Player,
@@ -1283,6 +1286,51 @@ impl App {
             Ok(()) => {}
             Err(e) => self.toast(ToastKind::Error, format!("保存配置失败：{e}")),
         }
+    }
+
+    // ───────────── 多账号（同一网盘多实例） ─────────────
+
+    /// 新增一家网盘的同类型实例（第二个账号）：生成唯一 id（`baidu` → `baidu_2`）、
+    /// 写入配置、重建槽位，并返回新实例 id。
+    ///
+    /// 与老版 V8_3「同一家网盘挂多个账号」等价：每个实例有独立凭证目录
+    /// （`账号/<实例id>/`）与独立会话，可同时登录、在顶栏切换、分别参与传输/跨盘。
+    pub fn add_drive_instance(&mut self, kind: DriveKind) -> String {
+        let id = self.cfg.gen_drive_id(kind);
+        let suffix = id[kind.slug().len()..].trim_start_matches('_');
+        let name = if suffix.is_empty() {
+            kind.label().to_string()
+        } else {
+            format!("{}（{}）", kind.label(), suffix)
+        };
+        self.cfg
+            .drives
+            .push(DriveConfig::new(id.clone(), kind, name));
+        // 先记住当前选中，重建后再切到新实例。
+        self.rebuild_drives();
+        if let Some(i) = self.slot_idx(&id) {
+            self.active = i;
+            self.browse.clear();
+            self.load_dir_for(&id, "/");
+        }
+        self.save_config();
+        wp_core::log_info!("网盘", "已新增网盘实例：{}（{}）", id, kind.label());
+        id
+    }
+
+    /// 新增同类型账号实例并**直接打开它的登录对话框**（新账号最短路径）。
+    pub fn add_account_and_login(&mut self, kind: DriveKind) {
+        let id = self.add_drive_instance(kind);
+        self.page = Page::Browser;
+        self.open_login_dialog();
+        self.toast(
+            ToastKind::Success,
+            format!(
+                "已新增账号实例 {}（{}），请扫码/Cookie 登录",
+                id,
+                kind.label()
+            ),
+        );
     }
 
     pub fn apply_settings(&mut self) {
@@ -2053,6 +2101,59 @@ impl App {
         })
     }
 
+    /// 处理顶栏网盘实例按钮/右键菜单的操作。
+    fn handle_top_action(&mut self, act: TopDriveAction) {
+        match act {
+            TopDriveAction::Switch(i) => {
+                if i >= self.drives.len() {
+                    return;
+                }
+                self.active = i;
+                let id = self.drives[i].id().to_string();
+                self.page = Page::Browser;
+                if !self.browse.contains_key(&id) {
+                    self.load_dir_for(&id, "/");
+                }
+                self.cfg.ui.last_drive = id;
+                self.save_config();
+            }
+            TopDriveAction::Login(id) => {
+                if let Some(i) = self.slot_idx(&id) {
+                    self.active = i;
+                    self.page = Page::Browser;
+                    if !self.browse.contains_key(&id) {
+                        self.load_dir_for(&id, "/");
+                    }
+                    self.open_login_dialog();
+                } else {
+                    self.toast(ToastKind::Warn, "该实例未启用，无法登录");
+                }
+            }
+            TopDriveAction::Logout(id) => {
+                if let Some(drive) = self.slot_by_id(&id).and_then(|s| s.drive.clone()) {
+                    let did = id.clone();
+                    self.spawn(async move {
+                        Event::LoggedOut {
+                            drive: did,
+                            result: drive.logout().await,
+                        }
+                    });
+                }
+            }
+            TopDriveAction::Refresh(id) => self.refresh_account(&id),
+            TopDriveAction::AddAccount(kind) => self.add_account_and_login(kind),
+            TopDriveAction::Remove(id) => {
+                self.cfg.drives.retain(|d| d.id != id);
+                self.rebuild_drives();
+                self.save_config();
+                self.toast(
+                    ToastKind::Info,
+                    format!("已移除实例 {id}（仅配置；云端文件与凭证目录未删）"),
+                );
+            }
+        }
+    }
+
     fn topbar(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
         ui.horizontal_centered(|ui| {
@@ -2077,7 +2178,17 @@ impl App {
             ui.separator();
             ui.add_space(6.0);
 
-            let drives: Vec<(usize, String, String, DriveKind, bool, AccountStatus)> = self
+            // 网盘实例切换（同一家网盘可有多个账号实例：百度网盘 / 百度小号 …）。
+            // 每个实例独立凭证目录，可同时登录；右键菜单提供登录/退出/刷新/再加账号等快捷操作。
+            let drives: Vec<(
+                usize,
+                String,
+                String,
+                DriveKind,
+                bool,
+                AccountStatus,
+                Option<(String, String)>,
+            )> = self
                 .drives
                 .iter()
                 .enumerate()
@@ -2089,11 +2200,14 @@ impl App {
                         s.kind(),
                         s.drive.is_some(),
                         s.status.clone(),
+                        s.account
+                            .as_ref()
+                            .map(|a| (a.display_name.clone(), a.user_name.clone())),
                     )
                 })
                 .collect();
-            let mut switch_to: Option<usize> = None;
-            for (i, _id, name, kind, available, status) in drives {
+            let mut action: Option<TopDriveAction> = None;
+            for (i, id, name, kind, available, status, account) in drives {
                 let selected = i == self.active;
                 let dot_color = match &status {
                     AccountStatus::LoggedIn => t.success,
@@ -2130,20 +2244,79 @@ impl App {
                 // 状态点画在按钮左侧
                 let dot_center = resp.rect.left_top() + egui::vec2(9.0, resp.rect.height() / 2.0);
                 ui.painter().circle_filled(dot_center, 3.0, dot_color);
-                if resp.clicked() && available {
-                    switch_to = Some(i);
+                let acct_line = match &account {
+                    Some((display, user)) if !user.trim().is_empty() && display != user => {
+                        format!("账号：{user}（{display}）")
+                    }
+                    Some((display, _)) => format!("账号：{display}"),
+                    None => "账号：未登录".to_string(),
+                };
+                let tip = format!(
+                    "实例：{id}\n{acct_line}\n状态：{}\n\n左键切换 · 右键更多操作（登录/退出/刷新/再加账号）",
+                    status.label()
+                );
+                let resp = resp.on_hover_text(if available {
+                    tip
+                } else {
+                    "该网盘未初始化成功".to_string()
+                });
+                let mut ctx_action: Option<TopDriveAction> = None;
+                resp.context_menu(|ui| {
+                    ui.set_min_width(180.0);
+                    if ui.button("🔐 登录 / 更换账号…").clicked() {
+                        ctx_action = Some(TopDriveAction::Login(id.clone()));
+                        ui.close();
+                    }
+                    if ui.button("🚪 退出登录（仅清本地凭证）").clicked() {
+                        ctx_action = Some(TopDriveAction::Logout(id.clone()));
+                        ui.close();
+                    }
+                    if ui.button("🔄 刷新账号状态").clicked() {
+                        ctx_action = Some(TopDriveAction::Refresh(id.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("➕ 再加一个{}账号", kind.label()))
+                        .clicked()
+                    {
+                        ctx_action = Some(TopDriveAction::AddAccount(kind));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("🗑 移除该实例（仅配置）").clicked() {
+                        ctx_action = Some(TopDriveAction::Remove(id.clone()));
+                        ui.close();
+                    }
+                });
+                if ctx_action.is_some() {
+                    action = ctx_action;
                 }
-                if !available {
-                    resp.on_hover_text("该网盘未初始化成功");
+                if resp.clicked() && available {
+                    action = Some(TopDriveAction::Switch(i));
                 }
             }
-            if let Some(i) = switch_to {
-                self.active = i;
-                let id = self.drives[i].id().to_string();
-                self.page = Page::Browser;
-                if !self.browse.contains_key(&id) {
-                    self.load_dir_for(&id, "/");
+            // 「＋」：一键新增当前类型的账号（同一网盘多账号的最短入口）
+            if let Some(kind) = self.drives.get(self.active).map(|s| s.kind()) {
+                ui.add_space(4.0);
+                let plus = ui
+                    .add_sized(
+                        [52.0, 24.0],
+                        egui::Button::new(
+                            egui::RichText::new("＋ 账号").size(12.0).color(t.text_weak),
+                        )
+                        .fill(t.card)
+                        .corner_radius(theme::radius(14)),
+                    )
+                    .on_hover_text(format!(
+                        "新增一个{}账号（同一网盘可多账号，各自独立凭证/会话）",
+                        kind.label()
+                    ));
+                if plus.clicked() {
+                    action = Some(TopDriveAction::AddAccount(kind));
                 }
+            }
+            if let Some(act) = action {
+                self.handle_top_action(act);
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

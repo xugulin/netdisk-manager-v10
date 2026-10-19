@@ -374,25 +374,8 @@ enum Act {
 fn apply(app: &mut App, act: Act) {
     match act {
         Act::AddDrive(kind) => {
-            let id = app.cfg.gen_drive_id(kind);
-            let name = format!(
-                "{}{}",
-                kind.label(),
-                if id == kind.slug() {
-                    String::new()
-                } else {
-                    format!("（{}）", &id[kind.slug().len() + 1..])
-                }
-            );
-            app.cfg
-                .drives
-                .push(DriveConfig::new(id.clone(), kind, name));
-            app.save_config();
-            app.rebuild_drives();
-            app.toast(
-                ToastKind::Success,
-                format!("已新增网盘实例：{id}（请登录）"),
-            );
+            // 同一网盘可挂多个账号：新增实例后直接切到它并打开登录对话框
+            app.add_account_and_login(kind);
         }
         Act::RemoveDrive(id) => {
             app.cfg.drives.retain(|d| d.id != id);
