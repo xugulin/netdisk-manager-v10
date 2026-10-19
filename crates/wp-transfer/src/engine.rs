@@ -1,4 +1,7 @@
 //! 引擎内部：台账、调度、执行、进度、持久化。
+//!
+//! 目录（含多重嵌套）支持：上传/下载/跨盘复制在 `prepare_total` 递归统计总大小，
+//! 在 `execute_once` 递归建目录并逐文件传输（目标端保持相对目录结构）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1396,7 +1399,159 @@ async fn on_transfer_error(
     false
 }
 
-/// 取任务总大小：上传看本地 metadata；下载/跨盘先 stat 源。
+/// 本地目录递归扫描结果。
+struct LocalTree {
+    /// 子目录相对路径（`a/b`，按字典序）
+    dirs: Vec<String>,
+    /// 文件：(相对路径, 绝对路径, 大小)
+    files: Vec<(String, PathBuf, u64)>,
+}
+
+/// 远端目录递归扫描结果。
+struct RemoteTree {
+    dirs: Vec<String>,
+    /// 文件：(相对路径, 大小)
+    files: Vec<(String, u64)>,
+}
+
+fn rel_dir(rel: &str) -> &str {
+    rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+}
+
+fn rel_name(rel: &str) -> &str {
+    rel.rsplit_once('/').map(|(_, n)| n).unwrap_or(rel)
+}
+
+fn join_remote(base: &str, rel: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if rel.is_empty() {
+        base.to_string()
+    } else if base.is_empty() {
+        format!("/{rel}")
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+fn rel_to_path(rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(PathBuf::new(), |acc, part| acc.join(part))
+}
+
+fn tree_total(files: &[(String, u64)]) -> u64 {
+    files.iter().map(|(_, s)| *s).sum()
+}
+
+/// 递归扫描本地目录（跳过符号链接；不存在的目录返回空树）。
+fn walk_local_tree(root: &Path) -> std::result::Result<LocalTree, ExecError> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let rd = std::fs::read_dir(&dir).map_err(|e| ExecError::Failed(Error::Io(e)))?;
+        for item in rd {
+            let item = item.map_err(|e| ExecError::Failed(Error::Io(e)))?;
+            let name = item.file_name().to_string_lossy().to_string();
+            let path = item.path();
+            let child_rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let meta =
+                std::fs::symlink_metadata(&path).map_err(|e| ExecError::Failed(Error::Io(e)))?;
+            if meta.is_dir() {
+                dirs.push(child_rel.clone());
+                stack.push((path, child_rel));
+            } else if meta.is_file() {
+                files.push((child_rel, path, meta.len()));
+            }
+        }
+    }
+    dirs.sort();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(LocalTree { dirs, files })
+}
+
+/// 递归扫描远端目录（逐层 `list`；含空目录）。
+async fn walk_remote_tree(
+    drive: &Arc<dyn Drive>,
+    root: &str,
+) -> std::result::Result<RemoteTree, ExecError> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let mut stack: Vec<(String, String)> = vec![(wp_core::util::norm_path(root), String::new())];
+    let mut guard = 0usize;
+    while let Some((dir, rel)) = stack.pop() {
+        guard += 1;
+        if guard > 200_000 {
+            return Err(ExecError::Failed(Error::other(
+                "目录层级/条目过多（>20 万），无法递归",
+            )));
+        }
+        let entries = drive.list(&dir).await.map_err(ExecError::from_error)?;
+        for e in entries {
+            let child_rel = if rel.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{rel}/{}", e.name)
+            };
+            if e.is_dir {
+                dirs.push(child_rel.clone());
+                stack.push((e.path.clone(), child_rel));
+            } else {
+                files.push((child_rel, e.size));
+            }
+        }
+    }
+    dirs.sort();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(RemoteTree { dirs, files })
+}
+
+/// 把「单个文件内部进度」映射成「整个任务进度」。
+///
+/// * `base`：该文件之前已完成的字节（目录里前面文件之和）；
+/// * `file_size`：当前文件大小；
+/// * `cross`：跨盘传输时一个文件占两阶段（下载 0→50%，上传 50%→100%）；
+/// * `phase`：0=下载阶段，1=上传阶段（cross=false 时忽略）。
+#[allow(clippy::too_many_arguments)]
+fn task_file_progress(
+    inner: &Arc<Inner>,
+    id: &str,
+    generation: u64,
+    control: &Arc<TaskControl>,
+    total: u64,
+    base: u64,
+    file_size: u64,
+    cross: bool,
+    phase: u8,
+) -> ProgressFn {
+    let inner = inner.clone();
+    let id = id.to_string();
+    let control = control.clone();
+    Box::new(move |done, _reported_total| {
+        if control.is_stopped() {
+            return false;
+        }
+        let fsz = file_size.max(1) as f64;
+        let frac = ((done.min(file_size) as f64) / fsz).clamp(0.0, 1.0);
+        let add = if cross {
+            file_size as f64
+                * if phase == 0 {
+                    0.5 * frac
+                } else {
+                    0.5 + 0.5 * frac
+                }
+        } else {
+            done.min(file_size) as f64
+        };
+        let logical = (base as f64 + add).min(total as f64) as u64;
+        inner.update_progress(&id, generation, logical, total, ProgressMode::Direct)
+    })
+}
+
+/// 取任务总大小：上传看本地 metadata；下载/跨盘先 stat 源（目录则递归统计）。
 async fn prepare_total(
     inner: &Arc<Inner>,
     ctx: &RunCtx,
@@ -1406,10 +1561,21 @@ async fn prepare_total(
         TaskKind::Upload => {
             let meta =
                 std::fs::metadata(&ctx.local).map_err(|e| ExecError::Failed(Error::Io(e)))?;
-            if meta.is_dir() {
-                return Err(ExecError::Failed(Error::unsupported("暂不支持上传文件夹")));
-            }
-            let total = meta.len();
+            let total = if meta.is_dir() {
+                let tree = walk_local_tree(&ctx.local)?;
+                inner.set_note(
+                    &ctx.id,
+                    generation,
+                    format!(
+                        "目录上传：{} 个文件 / {} 个子目录",
+                        tree.files.len(),
+                        tree.dirs.len()
+                    ),
+                );
+                tree.files.iter().map(|(_, _, size)| *size).sum()
+            } else {
+                meta.len()
+            };
             inner.set_total_and_name(&ctx.id, generation, total, &ctx.file_name);
             Ok(total)
         }
@@ -1422,11 +1588,23 @@ async fn prepare_total(
                 .stat(&ctx.src_path)
                 .await
                 .map_err(ExecError::from_error)?;
-            if entry.is_dir {
-                return Err(ExecError::Failed(Error::unsupported("暂不支持下载文件夹")));
-            }
-            inner.set_total_and_name(&ctx.id, generation, entry.size, &entry.name);
-            Ok(entry.size)
+            let total = if entry.is_dir {
+                let tree = walk_remote_tree(drive, &ctx.src_path).await?;
+                inner.set_note(
+                    &ctx.id,
+                    generation,
+                    format!(
+                        "目录下载：{} 个文件 / {} 个子目录",
+                        tree.files.len(),
+                        tree.dirs.len()
+                    ),
+                );
+                tree_total(&tree.files)
+            } else {
+                entry.size
+            };
+            inner.set_total_and_name(&ctx.id, generation, total, &entry.name);
+            Ok(total)
         }
         TaskKind::CrossCopy => {
             let drive = ctx
@@ -1437,13 +1615,23 @@ async fn prepare_total(
                 .stat(&ctx.src_path)
                 .await
                 .map_err(ExecError::from_error)?;
-            if entry.is_dir {
-                return Err(ExecError::Failed(Error::unsupported(
-                    "暂不支持跨盘复制文件夹",
-                )));
-            }
-            inner.set_total_and_name(&ctx.id, generation, entry.size, &entry.name);
-            Ok(entry.size)
+            let total = if entry.is_dir {
+                let tree = walk_remote_tree(drive, &ctx.src_path).await?;
+                inner.set_note(
+                    &ctx.id,
+                    generation,
+                    format!(
+                        "跨盘目录复制：{} 个文件 / {} 个子目录",
+                        tree.files.len(),
+                        tree.dirs.len()
+                    ),
+                );
+                tree_total(&tree.files)
+            } else {
+                entry.size
+            };
+            inner.set_total_and_name(&ctx.id, generation, total, &entry.name);
+            Ok(total)
         }
     }
 }
@@ -1456,50 +1644,264 @@ async fn execute_once(
     rename_to: Option<&str>,
 ) -> std::result::Result<ExecOutcome, ExecError> {
     match ctx.kind {
-        TaskKind::Upload => {
-            let drive = ctx
-                .dst
-                .as_ref()
-                .ok_or_else(|| ExecError::Failed(Error::other("缺少目标网盘实例")))?;
-            let opts = UploadOptions {
-                rename_to: rename_to.map(|s| s.to_string()),
-                chunk_size: 0,
-                concurrency: 0,
-                skip_guard: true,
-            };
-            let progress = make_progress(
-                inner,
+        TaskKind::Upload => upload_once(inner, ctx, generation, total, rename_to).await,
+        TaskKind::Download => download_once(inner, ctx, generation, total).await,
+        TaskKind::CrossCopy => cross_copy_once(inner, ctx, generation, total, rename_to).await,
+    }
+}
+
+/// 上传：目录递归（远端保持相对目录结构，含空目录）/ 单文件。
+async fn upload_once(
+    inner: &Arc<Inner>,
+    ctx: &RunCtx,
+    generation: u64,
+    total: u64,
+    rename_to: Option<&str>,
+) -> std::result::Result<ExecOutcome, ExecError> {
+    let drive = ctx
+        .dst
+        .as_ref()
+        .ok_or_else(|| ExecError::Failed(Error::other("缺少目标网盘实例")))?;
+    let meta = std::fs::metadata(&ctx.local).map_err(|e| ExecError::Failed(Error::Io(e)))?;
+    if !meta.is_dir() {
+        let opts = UploadOptions {
+            rename_to: rename_to.map(|s| s.to_string()),
+            chunk_size: 0,
+            concurrency: 0,
+            skip_guard: true,
+        };
+        let progress = make_progress(
+            inner,
+            &ctx.id,
+            generation,
+            &ctx.control,
+            ProgressMode::Direct,
+        );
+        let entry = drive
+            .upload(&ctx.local, &ctx.dst_dir, &opts, progress)
+            .await
+            .map_err(ExecError::from_error)?;
+        return Ok(ExecOutcome {
+            remote_name: if entry.name.is_empty() {
+                None
+            } else {
+                Some(entry.name)
+            },
+            total: Some(entry.size),
+            done: entry.size,
+        });
+    }
+
+    let tree = walk_local_tree(&ctx.local)?;
+    let folder_name = rename_to
+        .map(str::to_string)
+        .unwrap_or_else(|| ctx.file_name.clone());
+    let root = join_remote(&ctx.dst_dir, &folder_name);
+    drive
+        .ensure_dir(&root)
+        .await
+        .map_err(ExecError::from_error)?;
+    for rel in &tree.dirs {
+        if ctx.control.is_stopped() {
+            return Err(ExecError::Canceled);
+        }
+        drive
+            .ensure_dir(&join_remote(&root, rel))
+            .await
+            .map_err(ExecError::from_error)?;
+    }
+    let mut base = 0u64;
+    for (rel, path, size) in &tree.files {
+        if ctx.control.is_stopped() {
+            return Err(ExecError::Canceled);
+        }
+        let parent = rel_dir(rel);
+        let target_dir = if parent.is_empty() {
+            root.clone()
+        } else {
+            join_remote(&root, parent)
+        };
+        let opts = UploadOptions {
+            rename_to: Some(rel_name(rel).to_string()),
+            chunk_size: 0,
+            concurrency: 0,
+            skip_guard: true,
+        };
+        let progress = task_file_progress(
+            inner,
+            &ctx.id,
+            generation,
+            &ctx.control,
+            total,
+            base,
+            *size,
+            false,
+            0,
+        );
+        drive
+            .upload(path, &target_dir, &opts, progress)
+            .await
+            .map_err(ExecError::from_error)?;
+        base += *size;
+    }
+    let _ = inner.update_progress(&ctx.id, generation, total, total, ProgressMode::Direct);
+    Ok(ExecOutcome {
+        remote_name: Some(folder_name),
+        total: Some(total),
+        done: total,
+    })
+}
+
+/// 下载：目录递归到本地目录（已存在且大小一致的文件跳过，支持增量重试）/ 单文件。
+async fn download_once(
+    inner: &Arc<Inner>,
+    ctx: &RunCtx,
+    generation: u64,
+    total: u64,
+) -> std::result::Result<ExecOutcome, ExecError> {
+    let drive = ctx
+        .src
+        .as_ref()
+        .ok_or_else(|| ExecError::Failed(Error::other("缺少源网盘实例")))?;
+    let entry = drive
+        .stat(&ctx.src_path)
+        .await
+        .map_err(ExecError::from_error)?;
+    if !entry.is_dir {
+        if let Some(parent) = ctx.local.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| ExecError::Failed(Error::Io(e)))?;
+            }
+        }
+        let opts = DownloadOptions {
+            save_as: Some(ctx.local.clone()),
+            segments: ctx.download.segments,
+            segment_threshold: ctx.download.segment_threshold,
+            resume: ctx.download.resume,
+            limit_bps: ctx.transfer.max_speed_bps,
+        };
+        let progress = make_progress(
+            inner,
+            &ctx.id,
+            generation,
+            &ctx.control,
+            ProgressMode::Direct,
+        );
+        let done = drive
+            .download(&ctx.src_path, &ctx.local, &opts, progress)
+            .await
+            .map_err(ExecError::from_error)?;
+        return Ok(ExecOutcome {
+            remote_name: None,
+            total: Some(total.max(done)),
+            done,
+        });
+    }
+
+    let tree = walk_remote_tree(drive, &ctx.src_path).await?;
+    let root = ctx.local.clone();
+    tokio::fs::create_dir_all(&root)
+        .await
+        .map_err(|e| ExecError::Failed(Error::Io(e)))?;
+    for rel in &tree.dirs {
+        tokio::fs::create_dir_all(root.join(rel_to_path(rel)))
+            .await
+            .map_err(|e| ExecError::Failed(Error::Io(e)))?;
+    }
+    let mut base = 0u64;
+    for (rel, size) in &tree.files {
+        if ctx.control.is_stopped() {
+            return Err(ExecError::Canceled);
+        }
+        let local = root.join(rel_to_path(rel));
+        if let Some(parent) = local.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ExecError::Failed(Error::Io(e)))?;
+        }
+        // 增量：已存在且大小一致 → 跳过（目录下载重试/同步友好）
+        if *size > 0
+            && std::fs::metadata(&local)
+                .map(|m| m.is_file() && m.len() == *size)
+                .unwrap_or(false)
+        {
+            base += *size;
+            let _ = inner.update_progress(
                 &ctx.id,
                 generation,
-                &ctx.control,
+                base.min(total),
+                total,
                 ProgressMode::Direct,
             );
-            let entry = drive
-                .upload(&ctx.local, &ctx.dst_dir, &opts, progress)
-                .await
-                .map_err(ExecError::from_error)?;
-            Ok(ExecOutcome {
-                remote_name: if entry.name.is_empty() {
-                    None
-                } else {
-                    Some(entry.name)
-                },
-                total: Some(entry.size),
-                done: entry.size,
-            })
+            continue;
         }
-        TaskKind::Download => {
-            let drive = ctx
-                .src
-                .as_ref()
-                .ok_or_else(|| ExecError::Failed(Error::other("缺少源网盘实例")))?;
-            if let Some(parent) = ctx.local.parent() {
-                if !parent.as_os_str().is_empty() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| ExecError::Failed(Error::Io(e)))?;
-                }
-            }
+        let opts = DownloadOptions {
+            save_as: Some(local.clone()),
+            segments: ctx.download.segments,
+            segment_threshold: ctx.download.segment_threshold,
+            resume: ctx.download.resume,
+            limit_bps: ctx.transfer.max_speed_bps,
+        };
+        let progress = task_file_progress(
+            inner,
+            &ctx.id,
+            generation,
+            &ctx.control,
+            total,
+            base,
+            *size,
+            false,
+            0,
+        );
+        drive
+            .download(&join_remote(&ctx.src_path, rel), &local, &opts, progress)
+            .await
+            .map_err(ExecError::from_error)?;
+        base += *size;
+    }
+    let _ = inner.update_progress(&ctx.id, generation, total, total, ProgressMode::Direct);
+    Ok(ExecOutcome {
+        remote_name: None,
+        total: Some(total),
+        done: total,
+    })
+}
+
+/// 跨盘复制：目录递归（源→本地中转→目标，保持相对目录结构）/ 单文件。
+async fn cross_copy_once(
+    inner: &Arc<Inner>,
+    ctx: &RunCtx,
+    generation: u64,
+    total: u64,
+    rename_to: Option<&str>,
+) -> std::result::Result<ExecOutcome, ExecError> {
+    let src = ctx
+        .src
+        .as_ref()
+        .ok_or_else(|| ExecError::Failed(Error::other("缺少源网盘实例")))?;
+    let dst = ctx
+        .dst
+        .as_ref()
+        .ok_or_else(|| ExecError::Failed(Error::other("缺少目标网盘实例")))?;
+    tokio::fs::create_dir_all(&ctx.cache_dir)
+        .await
+        .map_err(|e| ExecError::Failed(Error::Io(e)))?;
+    let entry = src
+        .stat(&ctx.src_path)
+        .await
+        .map_err(ExecError::from_error)?;
+
+    if !entry.is_dir {
+        // 上次失败保留了完整中转文件时，跳过重复下载。
+        let already = total > 0
+            && std::fs::metadata(&ctx.local)
+                .map(|m| m.is_file() && m.len() == total)
+                .unwrap_or(false);
+        if already {
+            inner.set_half_progress(&ctx.id, generation, total);
+        } else {
             let opts = DownloadOptions {
                 save_as: Some(ctx.local.clone()),
                 segments: ctx.download.segments,
@@ -1512,92 +1914,145 @@ async fn execute_once(
                 &ctx.id,
                 generation,
                 &ctx.control,
-                ProgressMode::Direct,
+                ProgressMode::CrossDownload { total },
             );
-            let done = drive
-                .download(&ctx.src_path, &ctx.local, &opts, progress)
+            src.download(&ctx.src_path, &ctx.local, &opts, progress)
                 .await
                 .map_err(ExecError::from_error)?;
-            Ok(ExecOutcome {
-                remote_name: None,
-                total: Some(total.max(done)),
-                done,
-            })
         }
-        TaskKind::CrossCopy => {
-            let src = ctx
-                .src
-                .as_ref()
-                .ok_or_else(|| ExecError::Failed(Error::other("缺少源网盘实例")))?;
-            let dst = ctx
-                .dst
-                .as_ref()
-                .ok_or_else(|| ExecError::Failed(Error::other("缺少目标网盘实例")))?;
-            tokio::fs::create_dir_all(&ctx.cache_dir)
+        if ctx.control.is_stopped() {
+            return Err(ExecError::Canceled);
+        }
+        let target = rename_to
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| ctx.file_name.clone());
+        let opts = UploadOptions {
+            rename_to: Some(target),
+            chunk_size: 0,
+            concurrency: 0,
+            skip_guard: true,
+        };
+        let progress = make_progress(
+            inner,
+            &ctx.id,
+            generation,
+            &ctx.control,
+            ProgressMode::CrossUpload { total },
+        );
+        let uploaded = dst
+            .upload(&ctx.local, &ctx.dst_dir, &opts, progress)
+            .await
+            .map_err(ExecError::from_error)?;
+        return Ok(ExecOutcome {
+            remote_name: if uploaded.name.is_empty() {
+                None
+            } else {
+                Some(uploaded.name)
+            },
+            total: Some(uploaded.size.max(total)),
+            done: uploaded.size,
+        });
+    }
+
+    // ── 目录：递归复制 ──
+    let tree = walk_remote_tree(src, &ctx.src_path).await?;
+    let folder_name = rename_to
+        .map(str::to_string)
+        .unwrap_or_else(|| ctx.file_name.clone());
+    let dst_root = join_remote(&ctx.dst_dir, &folder_name);
+    dst.ensure_dir(&dst_root)
+        .await
+        .map_err(ExecError::from_error)?;
+    for rel in &tree.dirs {
+        if ctx.control.is_stopped() {
+            return Err(ExecError::Canceled);
+        }
+        dst.ensure_dir(&join_remote(&dst_root, rel))
+            .await
+            .map_err(ExecError::from_error)?;
+    }
+    let temp_root = ctx.cache_dir.join(format!("{}.dir", ctx.id));
+    let _ = tokio::fs::remove_dir_all(&temp_root).await;
+    tokio::fs::create_dir_all(&temp_root)
+        .await
+        .map_err(|e| ExecError::Failed(Error::Io(e)))?;
+    let mut base = 0u64;
+    for (rel, size) in &tree.files {
+        if ctx.control.is_stopped() {
+            return Err(ExecError::Canceled);
+        }
+        let temp = temp_root.join(rel_to_path(rel));
+        if let Some(parent) = temp.parent() {
+            tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| ExecError::Failed(Error::Io(e)))?;
-
-            // 上次失败保留了完整中转文件时，跳过重复下载。
-            let already = total > 0
-                && std::fs::metadata(&ctx.local)
-                    .map(|m| m.is_file() && m.len() == total)
-                    .unwrap_or(false);
-            if already {
-                inner.set_half_progress(&ctx.id, generation, total);
-            } else {
-                let opts = DownloadOptions {
-                    save_as: Some(ctx.local.clone()),
-                    segments: ctx.download.segments,
-                    segment_threshold: ctx.download.segment_threshold,
-                    resume: ctx.download.resume,
-                    limit_bps: ctx.transfer.max_speed_bps,
-                };
-                let progress = make_progress(
-                    inner,
-                    &ctx.id,
-                    generation,
-                    &ctx.control,
-                    ProgressMode::CrossDownload { total },
-                );
-                src.download(&ctx.src_path, &ctx.local, &opts, progress)
-                    .await
-                    .map_err(ExecError::from_error)?;
-            }
-            if ctx.control.is_stopped() {
-                return Err(ExecError::Canceled);
-            }
-
-            let target = rename_to
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| ctx.file_name.clone());
-            let opts = UploadOptions {
-                rename_to: Some(target),
-                chunk_size: 0,
-                concurrency: 0,
-                skip_guard: true,
+        }
+        let need_download = !(*size > 0
+            && std::fs::metadata(&temp)
+                .map(|m| m.is_file() && m.len() == *size)
+                .unwrap_or(false));
+        if need_download {
+            let opts = DownloadOptions {
+                save_as: Some(temp.clone()),
+                segments: ctx.download.segments,
+                segment_threshold: ctx.download.segment_threshold,
+                resume: ctx.download.resume,
+                limit_bps: ctx.transfer.max_speed_bps,
             };
-            let progress = make_progress(
+            let progress = task_file_progress(
                 inner,
                 &ctx.id,
                 generation,
                 &ctx.control,
-                ProgressMode::CrossUpload { total },
+                total,
+                base,
+                *size,
+                true,
+                0,
             );
-            let entry = dst
-                .upload(&ctx.local, &ctx.dst_dir, &opts, progress)
+            src.download(&join_remote(&ctx.src_path, rel), &temp, &opts, progress)
                 .await
                 .map_err(ExecError::from_error)?;
-            Ok(ExecOutcome {
-                remote_name: if entry.name.is_empty() {
-                    None
-                } else {
-                    Some(entry.name)
-                },
-                total: Some(entry.size.max(total)),
-                done: entry.size,
-            })
         }
+        if ctx.control.is_stopped() {
+            return Err(ExecError::Canceled);
+        }
+        let parent = rel_dir(rel);
+        let target_dir = if parent.is_empty() {
+            dst_root.clone()
+        } else {
+            join_remote(&dst_root, parent)
+        };
+        let opts = UploadOptions {
+            rename_to: Some(rel_name(rel).to_string()),
+            chunk_size: 0,
+            concurrency: 0,
+            skip_guard: true,
+        };
+        let progress = task_file_progress(
+            inner,
+            &ctx.id,
+            generation,
+            &ctx.control,
+            total,
+            base,
+            *size,
+            true,
+            1,
+        );
+        dst.upload(&temp, &target_dir, &opts, progress)
+            .await
+            .map_err(ExecError::from_error)?;
+        let _ = tokio::fs::remove_file(&temp).await;
+        base += *size;
     }
+    let _ = tokio::fs::remove_dir_all(&temp_root).await;
+    let _ = inner.update_progress(&ctx.id, generation, total, total, ProgressMode::Direct);
+    Ok(ExecOutcome {
+        remote_name: Some(folder_name),
+        total: Some(total),
+        done: total,
+    })
 }
 
 fn make_progress(
@@ -1727,5 +2182,83 @@ fn with_suffix(name: &str, index: usize) -> String {
     match path.extension().and_then(|s| s.to_str()) {
         Some(ext) if !ext.is_empty() => format!("{stem} ({index}).{ext}"),
         _ => format!("{stem} ({index})"),
+    }
+}
+
+#[cfg(test)]
+mod dir_tests {
+    use super::*;
+
+    fn temp_tree(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wp-engine-dir-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub1").join("sub2")).unwrap();
+        std::fs::create_dir_all(root.join("empty_dir")).unwrap();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        std::fs::write(root.join("sub1").join("b.txt"), vec![1u8; 100]).unwrap();
+        std::fs::write(root.join("sub1").join("sub2").join("c.bin"), vec![2u8; 200]).unwrap();
+        root
+    }
+
+    #[test]
+    fn join_remote_keeps_single_slash() {
+        assert_eq!(join_remote("/", "a"), "/a");
+        assert_eq!(join_remote("/root/", "a/b"), "/root/a/b");
+        assert_eq!(join_remote("", "a/b"), "/a/b");
+        assert_eq!(join_remote("/root", ""), "/root");
+    }
+
+    #[test]
+    fn rel_helpers_split_last_segment() {
+        assert_eq!(rel_dir("a/b/c.txt"), "a/b");
+        assert_eq!(rel_name("a/b/c.txt"), "c.txt");
+        assert_eq!(rel_dir("a.txt"), "");
+        assert_eq!(rel_name("a.txt"), "a.txt");
+    }
+
+    #[test]
+    fn walk_local_tree_collects_nested_files_and_empty_dirs() {
+        let root = temp_tree("walk");
+        let tree = match walk_local_tree(&root) {
+            Ok(t) => t,
+            Err(_) => panic!("walk_local_tree 失败"),
+        };
+        let files: Vec<(String, u64)> = tree
+            .files
+            .iter()
+            .map(|(rel, _, size)| (rel.clone(), *size))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("a.txt".to_string(), 5),
+                ("sub1/b.txt".to_string(), 100),
+                ("sub1/sub2/c.bin".to_string(), 200),
+            ]
+        );
+        assert_eq!(
+            tree.dirs,
+            vec![
+                "empty_dir".to_string(),
+                "sub1".to_string(),
+                "sub1/sub2".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn walk_local_tree_missing_dir_is_error() {
+        let missing = std::env::temp_dir().join("wp-engine-dir-missing-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(walk_local_tree(&missing).is_err());
+    }
+
+    #[test]
+    fn rel_to_path_builds_nested_path() {
+        let p = rel_to_path("中文 目录/sub/file.txt");
+        assert!(p.ends_with("file.txt"));
+        assert!(p.to_string_lossy().contains("中文 目录"));
     }
 }

@@ -621,6 +621,18 @@ pub(crate) async fn account(d: &BaiduDrive) -> Result<AccountInfo> {
     if let Some(user_uk) = record.get("uk") {
         extra.insert("uk".to_string(), user_uk.clone());
     }
+    // 写会话能力：false 表示「已登录但只读」（读接口正常、写接口会 errno:-6）。
+    // GUI 用它把状态显示成「已登录（只读）」并给出重新登录指引。
+    let write_ok = d.write_ok_value();
+    extra.insert("write_ok".to_string(), Value::Bool(write_ok));
+    if !write_ok {
+        wp_core::log_warn!(
+            "百度",
+            "当前会话只读：浏览/下载可用，上传/新建/改名/删除等写操作会被拒（errno:-6）。\
+             请重新扫码登录，或在浏览器重新登录后导入最新 Cookie（BDUSS + STOKEN）；\
+             若账号空间已超限，请先清理/扩容"
+        );
+    }
 
     let quota = match d
         .api_get("/api/quota", &[], ReqOpts::authed().no_channel())

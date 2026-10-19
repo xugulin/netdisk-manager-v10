@@ -246,16 +246,19 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         .cloned()
         .collect();
     let has_selection = !selected_paths.is_empty();
-    let sel_has_file = selected_entries.iter().any(|e| !e.is_dir);
     let single = selected_paths.len() == 1;
     ui.horizontal(|ui| {
         if widgets::primary_button(ui, &t, "⬆ 上传").clicked() {
             actions.push(Action::OpenUploadPicker);
         }
+        if widgets::tool_button(ui, &t, "⬆ 上传文件夹", caps.upload).clicked() {
+            actions.push(Action::OpenUploadFolderPicker);
+        }
         if widgets::tool_button(ui, &t, "＋ 新建文件夹", caps.mkdir).clicked() {
             actions.push(Action::NewFolder);
         }
-        if widgets::tool_button(ui, &t, "⬇ 下载", caps.download && sel_has_file).clicked() {
+        // 目录也支持下载（引擎递归下载，保持嵌套结构）
+        if widgets::tool_button(ui, &t, "⬇ 下载", caps.download && has_selection).clicked() {
             actions.push(Action::Download(selected_paths.clone()));
         }
         if widgets::tool_button(ui, &t, "重命名", caps.rename && single).clicked() {
@@ -344,6 +347,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             }
             let (status_text, color) = match &status {
                 AccountStatus::LoggedIn => ("🟢 已登录", t.success),
+                AccountStatus::ReadOnly(_) => ("🟠 已登录（只读）", t.warning),
                 AccountStatus::LoggedOut => ("🟡 未登录", t.warning),
                 AccountStatus::Checking => ("⏳ 检查中", t.warning),
                 AccountStatus::Failed(e) => (e.as_str(), t.error),
@@ -655,6 +659,7 @@ pub enum Action {
     Sort(SortBy, bool),
     NewFolder,
     OpenUploadPicker,
+    OpenUploadFolderPicker,
     Download(Vec<String>),
     Delete(Vec<String>),
     Rename(String),
@@ -710,6 +715,7 @@ fn apply(app: &mut App, action: Action) {
             }));
         }
         Action::OpenUploadPicker => app.open_file_picker(false),
+        Action::OpenUploadFolderPicker => app.open_upload_folder_picker(),
         Action::Download(paths) => {
             let entries: Vec<RemoteEntry> = app
                 .browse_ref(&drive_id)

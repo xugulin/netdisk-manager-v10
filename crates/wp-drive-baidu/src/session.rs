@@ -37,6 +37,12 @@ pub struct Session {
     /// CSRF 令牌（32 位 hex），写操作需要。
     #[serde(default)]
     pub bdstoken: String,
+    /// 写会话是否可用（最近一次 `gettemplatevariable` 成功，或写操作成功）。
+    ///
+    /// 真机实测：BDUSS 还在但 STOKEN 失效/被轮换时，读接口正常、写接口一律
+    /// `errno:-6`。此标志用于把「已登录（只读）」和「已登录」区分开。
+    #[serde(default)]
+    pub write_ok: bool,
     /// 用户 id，gettemplatevariable / getinfo 回填。
     #[serde(default)]
     pub uk: Option<i64>,

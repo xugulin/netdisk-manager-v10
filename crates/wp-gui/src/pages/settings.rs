@@ -73,7 +73,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                                 })
                                 .size(12.0)
                                 .color(
-                                    if runtime.contains("已登录") {
+                                    if runtime.contains("只读") {
+                                        t.warning
+                                    } else if runtime.contains("已登录") {
                                         t.success
                                     } else if runtime.contains("未登录") {
                                         t.warning

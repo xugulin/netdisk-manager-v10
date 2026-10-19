@@ -62,6 +62,8 @@ pub enum AccountStatus {
     Unknown,
     Checking,
     LoggedIn,
+    /// 已登录但会话只读（百度 STOKEN 失效等）：浏览/下载可用，写操作会被拒。
+    ReadOnly(String),
     LoggedOut,
     Failed(String),
 }
@@ -72,9 +74,21 @@ impl AccountStatus {
             AccountStatus::Unknown => "未检查".into(),
             AccountStatus::Checking => "检查中…".into(),
             AccountStatus::LoggedIn => "已登录".into(),
+            AccountStatus::ReadOnly(_) => "已登录（只读）".into(),
             AccountStatus::LoggedOut => "未登录".into(),
             AccountStatus::Failed(e) => format!("状态失败：{e}"),
         }
+    }
+}
+
+/// 由账号信息推导槽位状态：百度 `write_ok=false` 时标记为「已登录（只读）」。
+fn account_status_of(info: &AccountInfo) -> AccountStatus {
+    match info.extra.get("write_ok").and_then(|v| v.as_bool()) {
+        Some(false) => AccountStatus::ReadOnly(
+            "会话只读：浏览/下载可用；上传/新建/改名/删除需要重新登录（扫码或导入最新 Cookie）"
+                .into(),
+        ),
+        _ => AccountStatus::LoggedIn,
     }
 }
 
@@ -350,8 +364,12 @@ pub enum ConfirmAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePickerPurpose {
     Upload,
+    /// 选择要上传的本地文件夹（递归上传）
+    UploadFolder,
     PlayMedia,
     SubtitleFile,
+    /// 选择下载目录（设置页）
+    DownloadDir,
 }
 
 /// 本地文件选择器。
@@ -1208,26 +1226,25 @@ impl App {
         let Some(drive) = self.active_drive() else {
             return;
         };
-        let mut n = 0usize;
-        let mut skipped = 0usize;
+        let mut files = 0usize;
+        let mut dirs = 0usize;
         for e in entries {
+            // 目录也支持：引擎递归下载并保持多重嵌套目录结构
             if e.is_dir {
-                skipped += 1;
-                continue;
+                dirs += 1;
+            } else {
+                files += 1;
             }
             self.transfer
                 .enqueue_download(drive.clone(), e.path.clone(), None);
-            n += 1;
         }
-        if n > 0 {
-            self.toast(ToastKind::Success, format!("已加入下载队列：{n} 个文件"));
+        if files + dirs > 0 {
+            let mut msg = format!("已加入下载队列：{files} 个文件");
+            if dirs > 0 {
+                msg.push_str(&format!(" + {dirs} 个目录（递归下载）"));
+            }
+            self.toast(ToastKind::Success, msg);
             self.page = Page::Transfers;
-        }
-        if skipped > 0 {
-            self.toast(
-                ToastKind::Warn,
-                format!("{skipped} 个目录被跳过（暂不支持整目录下载）"),
-            );
         }
     }
 
@@ -1418,10 +1435,15 @@ impl App {
                 }
             }
             Event::AccountChecked { drive, result } => {
+                let mut readonly_hint: Option<String> = None;
                 if let Some(slot) = self.drives.iter_mut().find(|s| s.id() == drive) {
                     match result {
                         Ok(info) => {
-                            slot.status = AccountStatus::LoggedIn;
+                            let status = account_status_of(&info);
+                            if let AccountStatus::ReadOnly(hint) = &status {
+                                readonly_hint = Some(format!("{}：{hint}", slot.display()));
+                            }
+                            slot.status = status;
                             slot.account = Some(info);
                         }
                         Err(e) => {
@@ -1433,6 +1455,9 @@ impl App {
                             }
                         }
                     }
+                }
+                if let Some(msg) = readonly_hint {
+                    self.toast(ToastKind::Warn, msg);
                 }
             }
             Event::QrStarted { drive, result } => {
@@ -1481,12 +1506,19 @@ impl App {
             }
             Event::LoggedIn { drive, result } => match result {
                 Ok(info) => {
-                    self.toast(
-                        ToastKind::Success,
-                        format!("登录成功：{}", info.display_name),
-                    );
+                    let status = account_status_of(&info);
+                    match &status {
+                        AccountStatus::ReadOnly(hint) => self.toast(
+                            ToastKind::Warn,
+                            format!("登录成功，但该百度会话只读：{hint}"),
+                        ),
+                        _ => self.toast(
+                            ToastKind::Success,
+                            format!("登录成功：{}", info.display_name),
+                        ),
+                    }
                     if let Some(slot) = self.drives.iter_mut().find(|s| s.id() == drive) {
-                        slot.status = AccountStatus::LoggedIn;
+                        slot.status = status;
                         slot.account = Some(info);
                     }
                     self.dialog = None;
@@ -2211,6 +2243,7 @@ impl App {
                 let selected = i == self.active;
                 let dot_color = match &status {
                     AccountStatus::LoggedIn => t.success,
+                    AccountStatus::ReadOnly(_) => t.warning,
                     AccountStatus::LoggedOut => t.warning,
                     AccountStatus::Failed(_) => t.error,
                     _ => t.text_weak,
@@ -2365,6 +2398,7 @@ impl App {
                     }
                     let (status_text, status_color) = match &status {
                         AccountStatus::LoggedIn => (name, t.success),
+                        AccountStatus::ReadOnly(_) => ("已登录（只读）".to_string(), t.warning),
                         AccountStatus::Checking => ("检查中…".to_string(), t.warning),
                         AccountStatus::LoggedOut => ("未登录".to_string(), t.warning),
                         AccountStatus::Failed(_) => ("状态异常".to_string(), t.error),
@@ -2687,12 +2721,16 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(if picker.dir_mode {
-                        "选择目录"
+                        match picker.purpose {
+                            FilePickerPurpose::UploadFolder => "选择要上传的文件夹",
+                            _ => "选择目录",
+                        }
                     } else {
                         match picker.purpose {
                             FilePickerPurpose::Upload => "选择上传文件",
                             FilePickerPurpose::PlayMedia => "选择要播放的本地媒体",
                             FilePickerPurpose::SubtitleFile => "选择外挂字幕文件",
+                            _ => "选择文件",
                         }
                     })
                     .size(16.0)
@@ -2754,7 +2792,9 @@ impl App {
                         .filter(|e| {
                             e.is_dir
                                 || match picker.purpose {
-                                    FilePickerPurpose::Upload => true,
+                                    FilePickerPurpose::Upload
+                                    | FilePickerPurpose::UploadFolder
+                                    | FilePickerPurpose::DownloadDir => true,
                                     FilePickerPurpose::PlayMedia => {
                                         crate::pages::player::is_media_file(&e.name)
                                     }
@@ -2829,12 +2869,19 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 if picker.dir_mode {
-                    if ui.button("✓ 选择此目录").clicked() {
+                    let label = if matches!(picker.purpose, FilePickerPurpose::UploadFolder) {
+                        "✓ 上传此文件夹"
+                    } else {
+                        "✓ 选择此目录"
+                    };
+                    if ui.button(label).clicked() {
                         action = Some(FilePickerAction::PickDir(picker.path.clone()));
                     }
                 } else {
                     let button_label = match picker.purpose {
-                        FilePickerPurpose::Upload => {
+                        FilePickerPurpose::Upload
+                        | FilePickerPurpose::UploadFolder
+                        | FilePickerPurpose::DownloadDir => {
                             format!("✓ 上传所选（{}）", picker.selected.len())
                         }
                         FilePickerPurpose::PlayMedia => {
@@ -2865,12 +2912,14 @@ impl App {
                 self.file_picker = Some(picker);
             }
             Some(FilePickerAction::PickDir(p)) => {
-                self.pick_dir_result(p);
+                self.pick_dir_result(p, picker.purpose);
             }
             Some(FilePickerAction::PickFiles(files)) => {
                 self.file_picker = None;
                 match picker.purpose {
-                    FilePickerPurpose::Upload => self.enqueue_upload_files(&files),
+                    FilePickerPurpose::Upload
+                    | FilePickerPurpose::UploadFolder
+                    | FilePickerPurpose::DownloadDir => self.enqueue_upload_files(&files),
                     FilePickerPurpose::PlayMedia => match files.first() {
                         Some(file) => self.open_player_local_file(file.clone()),
                         None => self.toast(ToastKind::Warn, "未选择要播放的文件"),
@@ -2890,13 +2939,41 @@ impl App {
         }
     }
 
-    fn pick_dir_result(&mut self, path: PathBuf) {
-        // 目录选择器的用途由打开时决定：目前仅用于「修改下载目录」
-        self.settings_draft.download_dir = path.to_string_lossy().to_string();
-        self.toast(
-            ToastKind::Info,
-            format!("已选择下载目录：{}", path.display()),
-        );
+    fn pick_dir_result(&mut self, path: PathBuf, purpose: FilePickerPurpose) {
+        match purpose {
+            // 上传文件夹：递归上传该目录（引擎建远端目录树 + 逐文件上传）
+            FilePickerPurpose::UploadFolder => {
+                self.file_picker = None;
+                self.enqueue_upload_files(&[path]);
+            }
+            // 其它目录选择：修改默认下载目录
+            _ => {
+                self.settings_draft.download_dir = path.to_string_lossy().to_string();
+                self.toast(
+                    ToastKind::Info,
+                    format!("已选择下载目录：{}", path.display()),
+                );
+            }
+        }
+    }
+
+    fn open_picker_with_purpose(
+        &mut self,
+        dir_mode: bool,
+        purpose: FilePickerPurpose,
+        start: PathBuf,
+    ) {
+        let mut picker = FilePicker {
+            path: start.clone(),
+            entries: Vec::new(),
+            selected: BTreeSet::new(),
+            manual: start.to_string_lossy().to_string(),
+            error: String::new(),
+            dir_mode,
+            purpose,
+        };
+        load_local_dir(&mut picker, &start);
+        self.file_picker = Some(picker);
     }
 
     pub fn open_file_picker(&mut self, dir_mode: bool) {
@@ -2905,17 +2982,18 @@ impl App {
         } else {
             dirs::home_dir().unwrap_or_else(|| self.paths.root.clone())
         };
-        let mut picker = FilePicker {
-            path: start.clone(),
-            entries: Vec::new(),
-            selected: BTreeSet::new(),
-            manual: start.to_string_lossy().to_string(),
-            error: String::new(),
-            dir_mode,
-            purpose: FilePickerPurpose::Upload,
+        let purpose = if dir_mode {
+            FilePickerPurpose::DownloadDir
+        } else {
+            FilePickerPurpose::Upload
         };
-        load_local_dir(&mut picker, &start);
-        self.file_picker = Some(picker);
+        self.open_picker_with_purpose(dir_mode, purpose, start);
+    }
+
+    /// 打开「上传文件夹」选择器（递归上传整个本地目录）。
+    pub fn open_upload_folder_picker(&mut self) {
+        let start = dirs::home_dir().unwrap_or_else(|| self.paths.root.clone());
+        self.open_picker_with_purpose(true, FilePickerPurpose::UploadFolder, start);
     }
 
     // ───────────── 工具页异步封装 ─────────────

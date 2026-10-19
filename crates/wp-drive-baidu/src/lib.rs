@@ -115,6 +115,11 @@ impl BaiduDrive {
         lock(&self.session).bdstoken.clone()
     }
 
+    /// 当前会话是否具备写能力（由 `gettemplatevariable` 成功或写操作成功置位）。
+    pub(crate) fn write_ok_value(&self) -> bool {
+        lock(&self.session).write_ok
+    }
+
     pub(crate) fn uk_value(&self) -> Option<i64> {
         lock(&self.session).uk
     }
@@ -204,14 +209,16 @@ pub(crate) fn err_text(v: &Value, fallback: &str) -> String {
 pub(crate) fn map_errno(code: i64, v: &Value) -> Error {
     let msg = err_text(v, "");
     match code {
-        // 真机实测：扫码登录的会话天然只读 —— 读接口正常、写接口恒 -6。
-        // 这里给出可执行的指引，而不是笼统的"未登录"。
+        // 真机实测（2026-10-19）：BDUSS 仍有效但 STOKEN 失效/被浏览器重新登录轮换时，
+        // 读接口（list/getinfo/loginStatus）正常，写接口（create/filemanager/upload）
+        // 一律 errno:-6。这不是"没登录"，而是「会话只读」：必须重新拿一份最新 STOKEN。
         -6 => Error::auth(if msg.is_empty() {
-            "未登录或会话只读（errno:-6）：读接口可用但写操作需要浏览器登录态；\
-             请在「登录 → Cookie」里导入 pan.baidu.com 的 Cookie"
+            "会话只读或已失效（errno:-6）：浏览/下载可用，上传/新建/改名/删除等写操作被拒。\
+             处理：①重新扫码登录；②或在浏览器重新登录 pan.baidu.com 后复制最新 \
+             Cookie（BDUSS + STOKEN）到「登录 → Cookie」导入；③若空间已超限，需先扩容/清理"
                 .to_string()
         } else {
-            format!("未登录或会话只读（errno:-6）：{msg}")
+            format!("会话只读或已失效（errno:-6）：{msg}")
         }),
         // 真机实测：filemetas/部分接口对"不存在"返回 12（无 errmsg）。
         12 => Error::not_found(if msg.is_empty() {

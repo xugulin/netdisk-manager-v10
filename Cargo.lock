@@ -5429,6 +5429,9 @@ dependencies = [
  "tokio",
  "wp-core",
  "wp-drive",
+ "wp-drive-baidu",
+ "wp-drive-guangya",
+ "wp-drive-quark",
  "wp-net",
 ]
 

@@ -245,6 +245,13 @@ impl BaiduDrive {
             match self.execute_once(&method, path, params, form, &opts).await {
                 Ok(v) => {
                     let code = v.get("errno").and_then(Value::as_i64);
+                    // 写请求（带 bdstoken 的已认证请求）成功 ⇒ 会话写能力可用。
+                    if code.is_none() || code == Some(0) {
+                        if opts.auth && opts.bdstoken && !self.write_ok_value() {
+                            self.mutate_session(|s| s.write_ok = true);
+                            wp_core::log_info!("百度", "写会话已恢复（写请求成功）");
+                        }
+                    }
                     match code {
                         None | Some(0) => return Ok(v),
                         Some(c) if opts.allow_errno.contains(&c) => return Ok(v),
@@ -459,19 +466,38 @@ impl BaiduDrive {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let had_token = !self.bdstoken_value().is_empty();
+        let write_ok = self.write_ok_value();
         self.mutate_session(|s| {
-            s.bdstoken = bdstoken;
+            // 只有原本没有 bdstoken 时才用 loginStatus 的兜底值：
+            // 真机实测该值足以读接口，但写接口仍可能 -6；覆盖已有值反而破坏
+            // 原本可用的写会话。
+            if s.bdstoken.is_empty() {
+                s.bdstoken = bdstoken;
+            }
             if let Some(u) = uk {
                 s.uk = Some(u);
             }
         });
-        wp_core::log_info!(
-            "百度",
-            "会话已通过 /api/loginStatus 刷新：bdstoken({}) uk={:?} username={}",
-            self.bdstoken_value().len(),
-            self.uk_value(),
-            username
-        );
+        if !had_token {
+            wp_core::log_warn!(
+                "百度",
+                "会话通过 /api/loginStatus 兜底（只读风险）：bdstoken={} uk={:?} username={} write_ok={}",
+                self.bdstoken_value().len(),
+                self.uk_value(),
+                username,
+                write_ok
+            );
+        } else {
+            wp_core::log_info!(
+                "百度",
+                "会话已通过 /api/loginStatus 刷新：bdstoken({}) uk={:?} username={} write_ok={}",
+                self.bdstoken_value().len(),
+                self.uk_value(),
+                username,
+                write_ok
+            );
+        }
         Ok(())
     }
 
@@ -507,7 +533,10 @@ impl BaiduDrive {
             if let Some(u) = uk {
                 s.uk = Some(u);
             }
+            // gettemplatevariable 成功 = CSRF 通道可用 = 写会话可用（真机判定依据）
+            s.write_ok = true;
         });
+        wp_core::log_info!("百度", "写会话校验通过（gettemplatevariable 成功）");
         wp_core::log_debug!(
             "百度",
             "会话已刷新：bdstoken({}) uk={:?}",

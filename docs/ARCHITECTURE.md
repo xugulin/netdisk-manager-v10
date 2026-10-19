@@ -101,6 +101,13 @@ Queued ──调度──> Running ──> Done
   返回 `Error::Canceled`，引擎按控制位把状态置为 `Paused`（保留断点）或 `Canceled`；
 * **跨盘**：源盘 `download` 到 `缓存/<task_id>.tmp` → 目标盘 `upload`，成功后删临时文件，
   进度按下载 50% + 上传 50% 加权；失败按配置决定是否保留临时文件；
+* **目录（多重嵌套）**：`prepare_total` 递归扫描（本地 `walk_local_tree` / 远端
+  `walk_remote_tree`，含空目录）求出总字节；执行时先建目录树再逐文件传输，
+  目标端保持相对路径结构；单文件进度用 `base + 当前文件内进度` 映射成整任务进度，
+  跨盘目录按「文件下载 0→50% + 上传 50%→100%」加权；
+* **百度只读会话**：写请求依赖 `gettemplatevariable` 换取的 bdstoken；若只有
+  `/api/loginStatus` 兜底成功，则标记 `session.write_ok=false`，账号状态显示
+  「已登录（只读）」，写操作返回可执行的 errno:-6 指引（重新扫码/导入最新 Cookie）。
 * **持久化**：入队/状态变化时标记脏，`save()` 节流原子写 `任务.json`；
   重启 `load()` 时把 `Running` 降级为 `Paused/Queued`，已结束任务保留展示。
 
