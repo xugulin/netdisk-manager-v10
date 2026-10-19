@@ -314,6 +314,8 @@ mpv --no-config     --http-header-fields="Cookie: …" --user-agent "…" --refe
 ## 9. 上游权限类 4xx 连续失败熔断（task-21）
 
 > 背景：百度某文件永久 403 `error_code:31326 user is not authorized` 时，旧代理对**每个分块**都重试 3 次换链、后台预读又不断发起新块 → GUI 侧观测到 **41 次换链 / 0 下载 / 一直「打开中」**（重试风暴，耗带宽和日志）。
+>
+> **2026-10-19 根因更新（重要）**：`31326 hitcode:119` 对大文件（>约 50MB）**不是文件无权限**，而是百度 CDN 的三条授权限制叠加：① 按 **User-Agent** 判定（浏览器 UA → 403，网盘客户端 UA `netdisk;...` → 206）；② 必须带**有界 Range**（无 Range / 开区间 `bytes=0-` → 403 `hitcode:104`）；③ 单次 Range 跨度 >约 5MB → 403。修复分三层：`wp-drive-baidu` 改用 `DOWNLOAD_UA` 并**手动解析 302**（reqwest 跨域跟随会丢 Cookie → CDN 403）；下载器新增 `max_range_span`（百度取 4MiB），单连接与多段下载都按跨度分块请求；播放流代理（`wp-stream`）原样注入 `DirectLink.headers` 且分块远小于 5MB，因此同步恢复。熔断逻辑保留，用于**真正**的权限类 4xx。
 
 ### 9.1 行为
 
@@ -349,6 +351,9 @@ GUI 建议：`fatal=true` 时状态行显示「熔断：{fatal_reason}」，并�
 ```text
 上游持续拒绝 HTTP 403（已熔断）：{"error_code":31326,"error_msg":"user is not authorized, hitcode:119","request_id":...}
 ```
+
+> 2026-10-19 复测：同一文件/同一账号把上游 UA 换成客户端标识后，dlink 直接 206 正常（不再进熔断）。
+> 本节数据保留为「旧 UA 下的熔断行为」基线；修复见 §9 顶部「根因更新」。
 
 > 注：GUI 侧长会话（播放器持续请求 + 预读不停）旧版观测到 41 次换链；本工具每个阶段新建会话（会话级熔断），故绝对次数更小。核心指标是 **fatal 后 `errors/restarts/hits` 冻结、GET 立即返回可读 502**（测试 `permanent_403_trips_breaker_and_stops_prefetch` 已断言冻结）。
 
@@ -437,7 +442,7 @@ GUI 重试 = `proxy.close(old_token)` + 重新 `resolve_playback`（新会话）
 |---|---|---|
 | 光鸭直链（4–8MB Range） | 6.4 / 8.1 / 12.9 Mbps | **未恢复到 ≥20Mbps 门槛** |
 | 夸克 HLS m3u8/分片 | m3u8 ~0.7s，平均 6.12 Mbps | 低于内容码率 14.07Mbps |
-| 百度直链 | 31326 权限 403（不可用文件）；可播文件测试窗口未复测 | — |
+| 百度直链 | 用 `netdisk` 客户端 UA 后 31326 已不再出现（2026-10-19 根因=UA 授权判定，见 §9）；带宽数据待网络恢复后复测 | — |
 
 因此**本轮不刷新 §3「正常网络数据表」**，沿用 §3 的相对结论与公式；§10/§11 的数据均为劣化网络下限。网络恢复后按 §2 命令复跑即可刷新：
 `stream_bench … --mode all --read-bytes 32M` / `--mode hls`（数据写入 §3 对应表）。

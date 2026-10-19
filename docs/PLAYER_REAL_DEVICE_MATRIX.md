@@ -52,10 +52,19 @@
 |---|---|---|---|---|---|---|---|---|---|---|
 | 1 | `baidu-small` | 百度 | `/来自：V2408A/DCIM/1074058976_1734538851561.mp4` | 16,306,047 | plain | false | h264 1080x1920 31.05fps / aac 2ch | 2s ✅ | head 200 / first 206 / mid 206 | ✅ PASS |
 | 2 | `baidu-large` | 百度 | `/来自：V2408A/DCIM/Camera/video_20250722_184451.mp4` | 50,603,985 | plain | false | hevc 1920x1080 30.01fps / aac 256kbps | 15s ✅ | head 200 / first 206 / mid 206 | ✅ PASS |
-| 3 | `baidu-over50-403` | 百度 | `/来自：V2408A/DCIM/Camera/video_20250714_182340.mp4` | 118,000,134 | plain | false | ❌ CDN 403（31326 hitcode:119） | ❌ | head/first/mid 均 403 | ⚠️ WARN（tolerate） |
+| 3 | `baidu-over50-403` | 百度 | `/来自：V2408A/DCIM/Camera/video_20250714_182340.mp4` | 118,000,134 | plain | false | 原 ❌ CDN 403（31326 hitcode:119） | ❌ | head/first/mid 均 403 | 🟡 原 WARN；**2026-10-19 根因=CDN 按 UA 授权，已修复（`DOWNLOAD_UA`=netdisk 客户端 UA），待矩阵复测** |
 | 4 | `quark-small` | 夸克 | `/模拟器游戏/pc端全能模拟器/29元完美版免安装，自带34T游戏库/29米一键安装整合包版本介绍.mp4` | 11,452,287 | plain | false | h264 960x540 30fps / aac 2ch | 2s ✅ | **head 403**（预签名只签 GET）/ first 206 / mid 206 | ✅ PASS |
 | 5 | `quark-large-hls` | 夸克 | `/video_20260903_171534.mp4` | 173,709,677 | **hls** | **true** | h264 810x1440 25fps / aac 2ch | 60s ✅ | m3u8 200 / 22 分片 / 首分片 **206** `bytes 0-1023/970268` | ✅ PASS |
 | 6 | `guangya-mkv` | 光鸭 | `/来自：分享/东京复仇者/东京复仇者.S01E25.2021.1080p.mkv` | 727,730,541 | plain | false | hevc 1920x1080 23.976fps / FLAC 2ch | 120s ✅ | head 200 / first 206 / mid 206 | ✅ PASS |
+
+> **2026-10-19 根因更新（针对 #3 `baidu-over50-403`）**：`31326 hitcode:119` 并非文件无权限，
+> 而是百度 CDN 对**大文件**（>约 50MB）的三条授权限制：① **User-Agent** 必须是客户端标识
+> （浏览器 UA → 403，`netdisk;P2SP;...` → 206）；② 必须带**有界 Range**（无 Range / `bytes=0-` 开区间
+> → 403 `hitcode:104`）；③ 单次 **Range 跨度 >约 5MB** → 403。
+> 修复：`wp-drive-baidu` 的 `download_headers()` 用 `DOWNLOAD_UA`、`direct_link()` 手动解析 302
+> （避免 reqwest 跨域丢 Cookie）；`wp-net` 下载器新增 `max_range_span`（百度 4MiB），单连接/多段
+> 均按跨度分块请求。真机复测：722MB 文件下载已稳定推进（~0.16MB/s，免费账号限速）。
+> 矩阵复跑命令见 §1；复跑后把 #3 结果改为 PASS 并把本注记为历史。
 
 ### 2.2 每用例证据（mpv 关键输出）
 

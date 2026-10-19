@@ -55,14 +55,27 @@ pub(crate) const PASSPORT: &str = "https://passport.baidu.com";
 pub(crate) const PCS_FILE: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/file";
 /// 网盘 Web 固定 app id。
 pub(crate) const APP_ID: &str = "250528";
-/// 浏览器 UA（与抓包环境一致，见文档 §2.3）。
+/// 浏览器 UA（与抓包环境一致，见文档 §2.3）——**仅用于网页 API**（/api/*、passport 等）。
 pub(crate) const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+/// 下载直链（`d.pcs.baidu.com` → `*.baidupcs.com`）专用 UA：**百度网盘客户端标识**。
+///
+/// 真机实测（2026-10-19）：非会员账号下载**大文件**（>约 50MB）时，CDN 会按 UA 做授权判定，
+/// 浏览器 UA 请求直链一律 403 `error_code:31326 user is not authorized, hitcode:119`；
+/// 把 UA 换成 `netdisk;...` 客户端标识后，同一 Cookie/直链立即 206 正常返回（小文件两种 UA 都行）。
+/// 因此取直链返回的 headers 与 wp-net 下载器/播放流代理的上游请求统一使用本 UA。
+pub(crate) const DOWNLOAD_UA: &str = "netdisk;P2SP;3.0.0;netdisk;11.0.0;Windows10;x64";
 /// 扫码登录总超时 / 二维码有效期（秒）。
 pub(crate) const QR_TTL_SECS: u64 = 300;
 /// 上传分片大小：4 MiB。
 pub(crate) const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// 秒传 slice-md5 / data_content 取样长度：256 KiB。
 pub(crate) const SLICE_SIZE: u64 = 256 * 1024;
+/// 下载单次 Range 最大跨度：4 MiB。
+///
+/// 真机实测（2026-10-19）：非会员账号下载大文件时，CDN 对 **无 Range** 请求、
+/// `Range: bytes=0-`（开区间）和 **跨度 >约 5MB** 的 Range 一律 403 `31326`；
+/// 只有 ≤5MB 的**有界** Range 才 206。取 4 MiB 留安全余量，下载器会按此跨度分块。
+pub(crate) const MAX_RANGE_SPAN: u64 = 4 * 1024 * 1024;
 
 /// 百度网盘驱动实例。
 pub struct BaiduDrive {

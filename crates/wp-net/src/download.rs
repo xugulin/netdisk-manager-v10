@@ -5,7 +5,10 @@
 //! * 进度回调 `(已完成字节, 总字节)`，返回 `false` = 用户取消 → 返回
 //!   [`wp_core::Error::Canceled`]，**保留** `<目标>.part` 供下次续传；
 //! * 服务器不支持 Range 时自动退回整文件下载；
-//! * 下载请求默认 `Accept-Encoding: identity`，避免 gzip 解压导致字节数错位。
+//! * 下载请求默认 `Accept-Encoding: identity`，避免 gzip 解压导致字节数错位；
+//! * 支持限制**单次 Range 跨度**（`max_range_span`）：百度非会员大文件 CDN 会拒绝
+//!   >约 5MB 跨度的 Range（403 `31326`）并拒绝无 Range 请求，此时必须拆成多个
+//!   ≤跨度的有界 Range 请求（单连接循环 / 多段内循环都支持）。
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -41,6 +44,12 @@ pub struct DownloadRequest {
     /// 限速（字节/秒，0 = 不限）
     #[serde(default)]
     pub limit_bps: u64,
+    /// 单次 HTTP Range 的最大跨度（字节；0 = 不限制，沿用原行为）。
+    ///
+    /// 用于 CDN 限制单次 Range 大小的场景（如百度非会员大文件 >约 5MB 返回 403）：
+    /// 设置后单连接下载会按跨度循环请求，多段下载会在每段内再按跨度循环。
+    #[serde(default)]
+    pub max_range_span: u64,
 }
 
 fn default_segments() -> usize {
@@ -64,6 +73,7 @@ impl DownloadRequest {
             segment_threshold: default_threshold(),
             resume: true,
             limit_bps: 0,
+            max_range_span: 0,
         }
     }
 
@@ -94,6 +104,12 @@ impl DownloadRequest {
 
     pub fn limit_bps(mut self, bps: u64) -> Self {
         self.limit_bps = bps;
+        self
+    }
+
+    /// 限制单次 Range 跨度（0 = 不限制）。见 [`DownloadRequest::max_range_span`]。
+    pub fn max_range_span(mut self, span: u64) -> Self {
+        self.max_range_span = span;
         self
     }
 }
@@ -167,6 +183,16 @@ fn io_err(e: std::io::Error) -> Error {
     Error::Io(e)
 }
 
+/// 取 URL 的 host（诊断日志用；失败返回空串）。
+fn host_of(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+}
+
 async fn download_single(
     client: &reqwest::Client,
     req: &DownloadRequest,
@@ -182,6 +208,11 @@ async fn download_single(
         tokio::fs::rename(&part, &req.dest).await.map_err(io_err)?;
         let _ = progress(existing, req.expected_size);
         return Ok(existing);
+    }
+
+    // 需要限制单次 Range 跨度（如百度非会员大文件 CDN 拒绝 >约 5MB 跨度）→ 分块循环
+    if req.max_range_span > 0 && req.expected_size > 0 {
+        return download_single_ranged(client, req, progress, existing, &part).await;
     }
 
     let mut rb = client
@@ -206,6 +237,17 @@ async fn download_single(
     }
     if !(200..300).contains(&status) {
         let body = resp.text().await.unwrap_or_default();
+        wp_core::log_debug!(
+            "下载",
+            "单连接失败：HTTP {status} host={} range={} body={}",
+            host_of(&req.url),
+            if existing > 0 {
+                format!("bytes={existing}-")
+            } else {
+                "（无 Range）".to_string()
+            },
+            body.chars().take(200).collect::<String>()
+        );
         return Err(crate::client::http_status_error(status, &body));
     }
     let is_partial = status == 206;
@@ -250,6 +292,113 @@ async fn download_single(
     Ok(done)
 }
 
+/// 分块 Range 单连接下载：每次只发 ≤`max_range_span` 的**有界** Range，追加写入 `.part`。
+///
+/// 适用：CDN 同时拒绝「无 Range 请求」和「大跨度 Range」（百度非会员大文件实测：
+/// 无 Range/`bytes=0-`/跨度 >约 5MB 均 403 `31326`；≤5MB 有界 Range 才 206）。
+async fn download_single_ranged(
+    client: &reqwest::Client,
+    req: &DownloadRequest,
+    progress: &mut ProgressFn,
+    mut existing: u64,
+    part: &Path,
+) -> Result<u64> {
+    let total = req.expected_size;
+    let span = req.max_range_span.max(64 * 1024);
+    if existing > total {
+        let _ = std::fs::remove_file(part);
+        existing = 0;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(existing > 0)
+        .truncate(existing == 0)
+        .open(part)
+        .await
+        .map_err(io_err)?;
+    let mut done = existing;
+    let started = Instant::now();
+    if done > 0 {
+        let _ = progress(done, total);
+    }
+    while done < total {
+        let start = done;
+        let end = (start + span - 1).min(total - 1);
+        let mut rb = client
+            .get(&req.url)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+        for (k, v) in &req.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        let resp = rb.send().await.map_err(crate::client::net_err)?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = resp.text().await.unwrap_or_default();
+            wp_core::log_debug!(
+                "下载",
+                "分块失败：HTTP {status} host={} range=bytes={start}-{end} body={}",
+                host_of(&req.url),
+                body.chars().take(200).collect::<String>()
+            );
+            return Err(crate::client::http_status_error(status, &body));
+        }
+        if status == 200 {
+            // 服务器忽略 Range：无法继续分块，清空重来并整文件写入
+            let _ = file.flush().await;
+            file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(part)
+                .await
+                .map_err(io_err)?;
+            done = 0;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(crate::client::net_err)?;
+                file.write_all(&chunk).await.map_err(Error::Io)?;
+                done += chunk.len() as u64;
+                if !progress(done, total.max(done)) {
+                    let _ = file.flush().await;
+                    return Err(Error::Canceled("用户取消/暂停".into()));
+                }
+                throttle(done, started, req.limit_bps).await;
+            }
+            break;
+        }
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(crate::client::net_err)?;
+            file.write_all(&chunk).await.map_err(Error::Io)?;
+            done += chunk.len() as u64;
+            if !progress(done, total.min(total.max(done))) {
+                let _ = file.flush().await;
+                return Err(Error::Canceled("用户取消/暂停".into()));
+            }
+            throttle(done, started, req.limit_bps).await;
+        }
+        if done <= start {
+            return Err(Error::network(format!(
+                "分块下载无进展：bytes={start}-{end}"
+            )));
+        }
+    }
+    file.flush().await.map_err(Error::Io)?;
+    drop(file);
+    let written = fsize(part);
+    if written != total {
+        let _ = std::fs::remove_file(part);
+        return Err(Error::network(format!(
+            "下载后大小不符：期望 {total}，实际 {written}"
+        )));
+    }
+    tokio::fs::rename(part, &req.dest).await.map_err(io_err)?;
+    let _ = progress(total, total);
+    Ok(total)
+}
+
 async fn throttle(done: u64, started: Instant, limit_bps: u64) {
     if limit_bps == 0 {
         return;
@@ -287,44 +436,62 @@ async fn download_segmented(
         let client = client.clone();
         let url = req.url.clone();
         let headers = req.headers.clone();
+        let max_span = req.max_range_span;
         let dest = seg_part_path(&req.dest, i);
         let counter = counter.clone();
         let cancel = cancel.clone();
         set.spawn(async move {
-            let mut rb = client
-                .get(&url)
-                .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                .header(reqwest::header::RANGE, format!("bytes={start}-{}", end - 1));
-            for (k, v) in &headers {
-                rb = rb.header(k.as_str(), v.as_str());
-            }
-            let resp = rb.send().await.map_err(crate::client::net_err)?;
-            let status = resp.status().as_u16();
-            if !(200..300).contains(&status) {
-                return Err(Error::network(format!("分片 {i} 下载失败：HTTP {status}")));
-            }
-            if status == 200 {
-                return Err(Error::network("服务器不支持分片 Range"));
-            }
             let mut file = tokio::fs::File::create(&dest).await.map_err(Error::Io)?;
-            let mut got = 0u64;
-            let mut stream = resp.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(Error::Canceled("用户取消/暂停".into()));
+            let mut pos = start;
+            // 每段内部按 max_span 再拆（0 = 整段一次请求，保持原行为）
+            while pos < end {
+                let req_end = if max_span > 0 {
+                    (pos + max_span - 1).min(end - 1)
+                } else {
+                    end - 1
+                };
+                let mut rb = client
+                    .get(&url)
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                    .header(reqwest::header::RANGE, format!("bytes={pos}-{req_end}"));
+                for (k, v) in &headers {
+                    rb = rb.header(k.as_str(), v.as_str());
                 }
-                let chunk = chunk.map_err(crate::client::net_err)?;
-                file.write_all(&chunk).await.map_err(Error::Io)?;
-                got += chunk.len() as u64;
-                counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                let resp = rb.send().await.map_err(crate::client::net_err)?;
+                let status = resp.status().as_u16();
+                if !(200..300).contains(&status) {
+                    let body = resp.text().await.unwrap_or_default();
+                    wp_core::log_debug!(
+                        "下载",
+                        "分片 {i} 失败：HTTP {status} host={} range=bytes={pos}-{req_end} body={}",
+                        host_of(&url),
+                        body.chars().take(200).collect::<String>()
+                    );
+                    return Err(Error::network(format!("分片 {i} 下载失败：HTTP {status}")));
+                }
+                if status == 200 {
+                    return Err(Error::network("服务器不支持分片 Range"));
+                }
+                let mut got = 0u64;
+                let mut stream = resp.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(Error::Canceled("用户取消/暂停".into()));
+                    }
+                    let chunk = chunk.map_err(crate::client::net_err)?;
+                    file.write_all(&chunk).await.map_err(Error::Io)?;
+                    got += chunk.len() as u64;
+                    counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+                if got != req_end - pos + 1 {
+                    return Err(Error::network(format!(
+                        "分片 {i} 字节数不符：期望 {}，实际 {got}",
+                        req_end - pos + 1
+                    )));
+                }
+                pos = req_end + 1;
             }
             file.flush().await.map_err(Error::Io)?;
-            let expect = end - start;
-            if got != expect {
-                return Err(Error::network(format!(
-                    "分片 {i} 字节数不符：期望 {expect}，实际 {got}"
-                )));
-            }
             Ok(())
         });
     }
@@ -472,6 +639,49 @@ mod tests {
             &client,
             DownloadRequest::new(format!("http://127.0.0.1:{port}/f"), &dest)
                 .expected_size(data.len() as u64),
+            Box::new(|_, _| true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn ranged_chunked_single_download() {
+        // CDN 限制单次 Range 跨度时：单连接也必须拆成多个有界 Range（百度大文件场景）
+        let data = body();
+        let port = spawn_server(data.clone(), true);
+        let client = crate::client::build_client_default();
+        let dest = tmpfile("ranged.bin");
+        let _ = std::fs::remove_file(&dest);
+        let n = download(
+            &client,
+            DownloadRequest::new(format!("http://127.0.0.1:{port}/f"), &dest)
+                .expected_size(data.len() as u64)
+                .max_range_span(8 * 1024),
+            Box::new(|_, _| true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn ranged_chunked_segmented_download() {
+        // 多段下载：每段内部再按 max_range_span 拆块
+        let data = body();
+        let port = spawn_server(data.clone(), true);
+        let client = crate::client::build_client_default();
+        let dest = tmpfile("ranged-seg.bin");
+        let _ = std::fs::remove_file(&dest);
+        let n = download(
+            &client,
+            DownloadRequest::new(format!("http://127.0.0.1:{port}/f"), &dest)
+                .expected_size(data.len() as u64)
+                .segments(4)
+                .max_range_span(8 * 1024),
             Box::new(|_, _| true),
         )
         .await

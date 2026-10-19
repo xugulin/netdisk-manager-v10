@@ -86,6 +86,17 @@
 | 任务查询（只读） | `GET .../?method=query_task` | HAR | 🔷 状态语义与通用表相反（百度 0=完成），已单独映射 |
 | 创建离线任务 | `POST .../?method=add_task`（form: source_url+save_path；magnet 加 od_type=4） | 真机探测 | 🔷 参数形态已通过服务端校验（账号超容 36009）；错误码 36005~36032 全中文映射；error_code 可能裹在 HTTP 403 JSON 里 |
 
+### 1.6 下载（直链 / 续传 / 分段）
+
+| 能力 | 端点 | 来源 | 状态 |
+|---|---|---|---|
+| 取下载直链 | `GET /api/filemetas?target=[{"path":...}]&dlink=1` | 文件接口.py | ✅ 服务端签好 dlink（含 fid/sign/expires，8h 有效），302 → `*.baidupcs.com` |
+| 直链下载 | `GET https://d.pcs.baidu.com/file/...`（带 Cookie；支持 Range） | 真机 | ✅ 但**大文件有三条 CDN 限制**（2026-10-19 真机，非会员账号）：① 请求 UA 必须是客户端标识（`netdisk;...`），浏览器 UA → 403 `31326`；② 必须带**有界 Range**（无 Range / `bytes=0-` 开区间均 403 `31326 hitcode:104`）；③ 单次 Range 跨度 **>约 5MB 即 403**。实现：`download_headers()` 用 `DOWNLOAD_UA`；`direct_link()` 手动解析 302（reqwest 跨域跟随会丢 Cookie）；下载器 `max_range_span=4MiB` 按块请求（单连接/多段内均生效） |
+| 目录打包下载 | — | — | ❌（`/api/getsyscfg` 等网页后台，未接；跨盘整目录复制也未实现） |
+
+> 注：`31326` 不是「链接失效/无权限」的永久错误——根因是 CDN 按 UA 做授权判定；
+> 排查时先用 `curl -r 0-255 -H "User-Agent: netdisk;P2SP;2.2.2.0" -H "Cookie: <登录Cookie>" <dlink>` 复测。
+
 ## 2. 夸克网盘
 
 ### 2.1 认证与账号

@@ -84,6 +84,12 @@ pub(crate) struct Http {
     pub api: reqwest::Client,
     /// 下载专用：不设总超时，避免大文件被 reqwest 整体超时打断。
     pub download: reqwest::Client,
+    /// 下载直链“解析跳转”专用：**不跟随重定向**（手动读 `Location`）。
+    ///
+    /// 背景：`d.pcs.baidu.com/file/...` 会 302 到 `*.baidupcs.com`，而 reqwest 在跨域
+    /// 重定向时会**丢掉 `Cookie` 头**（安全策略），CDN 侧于是返回 403 `31326/31045`。
+    /// 这里先用不跟随重定向的客户端拿到最终 CDN URL，再让下载器/播放流直连最终 URL。
+    pub download_resolve: reqwest::Client,
     /// passport 不跟随重定向，用于抓取 qrbdusslogin 的 302 Set-Cookie。
     pub passport: reqwest::Client,
     /// passport 跟随重定向（二维码图片、pan 域会话、子域种植）。
@@ -108,6 +114,7 @@ impl Http {
         Ok(Self {
             api: build_client(client_options(60, 10, true))?,
             download: build_client(client_options(0, 30, true))?,
+            download_resolve: build_client(client_options(30, 10, false))?,
             passport: build_client(client_options(60, 10, false))?,
             passport_follow: build_client(client_options(60, 10, true))?,
             dp: DpLogId::new(),
