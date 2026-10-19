@@ -243,10 +243,16 @@ mkdir -p "$OUT/lib" "$OUT/include/mpv" "$OUT/licenses"
 cp '__PREFIX__/mpv/bin/libmpv-2.dll' "$OUT/lib/"
 cp '__PREFIX__/mpv/include/mpv/'*.h "$OUT/include/mpv/" 2>/dev/null || true
 
-# 依赖 DLL：用 MSYS2 ldd 枚举，只收 /ucrt64/bin 下非系统 DLL（系统 API 集不拷）
+# 依赖 DLL：自建 FFmpeg 的 DLL 在 __PREFIX__/ffmpeg/bin（不在 /ucrt64/bin），
+# 必须显式拷贝；其余 MSYS2 UCRT64 依赖 DLL 用 ldd 枚举 /ucrt64/bin 下的。
+cp -f '__PREFIX__/ffmpeg/bin/'*.dll "$OUT/lib/" 2>/dev/null || true
 ldd '__PREFIX__/mpv/bin/libmpv-2.dll' \
-  | awk '{print $3}' | grep -E '^/ucrt64/bin/' | sort -u \
+  | awk '{print $3}' | grep -E '^/ucrt64/bin/|^__PREFIX__/' | sort -u \
   | while read -r dll; do cp -f "$dll" "$OUT/lib/"; done
+# 运行时补充（部分 gcc 配置会动态依赖 winpthread/gcc 运行库；有就带上）
+for d in libwinpthread-1.dll libgcc_s_seh-1.dll libstdc++-6.dll; do
+  if [ -f "/ucrt64/bin/$d" ]; then cp -f "/ucrt64/bin/$d" "$OUT/lib/"; fi
+done
 
 # 许可证
 cp -f '__WORK__/mpv-src/Copyright' "$OUT/licenses/mpv-Copyright" 2>/dev/null || true

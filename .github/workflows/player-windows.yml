@@ -140,6 +140,17 @@ jobs:
           foreach ($f in @("LICENSE.LGPL", "COPYING.FFmpeg-LGPLv2.1", "mpv-Copyright")) {
             if (-not (Test-Path (Join-Path "vendor\prebuilt\windows-x86_64\licenses" $f))) { throw "缺少许可证 $f" }
           }
+          # 依赖 DLL 完整性前置校验（stage 步骤必须收齐 FFmpeg 运行时 DLL，
+          # 否则打包阶段 Strict 校验会失败；这里提前失败，日志更明确）
+          $requiredDlls = @(
+            "*avcodec-*.dll", "*avformat-*.dll", "*avutil-*.dll",
+            "*avfilter-*.dll", "*swresample-*.dll", "*swscale-*.dll", "*avdevice-*.dll"
+          )
+          foreach ($pat in $requiredDlls) {
+            if (-not (Get-ChildItem "vendor\prebuilt\windows-x86_64\lib" -Filter $pat -ErrorAction SilentlyContinue)) {
+              throw "prebuilt 缺少 FFmpeg 运行时 DLL：$pat"
+            }
+          }
           Get-ChildItem "vendor\prebuilt\windows-x86_64\lib" -Filter *.dll | Measure-Object | ForEach-Object {
             Write-Host "依赖 DLL 数量：$($_.Count)"
           }

@@ -1,4 +1,4 @@
-﻿# 播放器运行时打包（Windows x86_64）—— 结构级生成 / 校验
+# 播放器运行时打包（Windows x86_64）—— 结构级生成 / 校验
 #
 # 状态：**结构级脚本**。本机开发环境为 Linux（无 Windows/pwsh 可执行验证），因此本脚本
 #       做「目录结构 + DLL 清单 + ANGLE + 许可证 + 加载顺序」的生成与校验，
@@ -20,8 +20,10 @@
 #   网盘管理.exe
 #   播放器运行时\
 #     libmpv-2.dll          # 我们 vendored 的 LGPL libmpv（Mode A OpenGL render API）
-#     libass-*.dll  libavcodec-*.dll  libavformat-*.dll  libavutil-*.dll
-#     libavfilter-*.dll  libswresample-*.dll  libswscale-*.dll  libavdevice-*.dll
+#     libass-*.dll  avcodec-*.dll  avformat-*.dll  avutil-*.dll
+#     avfilter-*.dll  swresample-*.dll  swscale-*.dll  avdevice-*.dll
+#       （注意：Windows 版 FFmpeg 的 DLL 名**没有 lib 前缀**，如 avcodec-62.dll；
+#        为兼容 Linux 命名/旧产物，校验同时接受 libavcodec-*.dll 形式）
 #     libplacebo-*.dll  libbluray-*.dll  libluajit-*.dll  libwinpthread-1.dll …
 #     libEGL.dll  libGLESv2.dll   # ANGLE（BSD-3-Clause；d3dcompiler_47.dll 可选）
 #     LICENSES\…                  # 第三方许可证（assets\licenses 同步）
@@ -84,20 +86,23 @@ $RequiredDlls = @(
   "libGLESv2.dll"
 )
 # 必需依赖（通配符；libmpv 的运行时依赖，缺一不可）——按 scripts/build-media-stack-windows.ps1 的说明
+# 通配符统一用 *av* 前缀：同时匹配 Windows FFmpeg 的 avcodec-62.dll 与 Linux 命名的 libavcodec-*.dll。
 $RequiredPatterns = @(
-  "libavcodec-*.dll",
-  "libavformat-*.dll",
-  "libavutil-*.dll",
-  "libavfilter-*.dll",
-  "libswresample-*.dll",
-  "libswscale-*.dll",
-  "libavdevice-*.dll",
+  "*avcodec-*.dll",
+  "*avformat-*.dll",
+  "*avutil-*.dll",
+  "*avfilter-*.dll",
+  "*swresample-*.dll",
+  "*swscale-*.dll",
+  "*avdevice-*.dll",
   "libass-*.dll",
-  "libplacebo-*.dll",
-  "libwinpthread-1.dll"
+  "libplacebo-*.dll"
 )
 # 可选依赖（构建配置/解码器/网络差异，缺失记录但不阻断）
 $OptionalPatterns = @(
+  "libwinpthread-1.dll",
+  "libgcc_s_*.dll",
+  "libstdc++-6.dll",
   "libbluray-*.dll",
   "libluajit-*.dll",
   "libuchardet-*.dll",
