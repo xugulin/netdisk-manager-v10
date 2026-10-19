@@ -11,6 +11,10 @@ build = "build.rs"
 name = "网盘管理"
 path = "src/main.rs"
 
+[features]
+# 验收/无头钩子（WP_DEMO_* / WP_AUTO_RETRY_ONCE）：默认 release 不带，测试用 --features acceptance
+acceptance = []
+
 [dependencies]
 wp-core.workspace = true
 wp-net.workspace = true

@@ -101,18 +101,19 @@ Queued ──调度──> Running ──> Done
   返回 `Error::Canceled`，引擎按控制位把状态置为 `Paused`（保留断点）或 `Canceled`；
 * **跨盘**：源盘 `download` 到 `缓存/<task_id>.tmp` → 目标盘 `upload`，成功后删临时文件，
   进度按下载 50% + 上传 50% 加权；失败按配置决定是否保留临时文件；
-* **目录操作的任务展开（GUI 层，对齐 V8）**：勾选目录下载/跨盘/上传文件夹时，**先异步预扫描
-  源目录**（`wp_transfer::scan_remote_dir` / `scan_local_dir`），再把目录展开成「一个文件一个任务」；
-  空目录（0 文件）**不创建任何任务**，只给出明确提示（避免"假完成 0%"）；空子目录在目标端补建。
-  引擎仍保留目录递归能力（`prepare_total`/`execute_once` 的目录分支），供 CLI / 验证工具使用；
-* **目录（多重嵌套，引擎层）**：`prepare_total` 递归扫描（本地 `walk_local_tree` / 远端
-  `walk_remote_tree`，含空目录）求出总字节；执行时先建目录树再逐文件传输，
-  目标端保持相对路径结构；单文件进度用 `base + 当前文件内进度` 映射成整任务进度，
-  跨盘目录按「文件下载 0→50% + 上传 50%→100%」加权；
-* **空目录与零字节**：源目录 0 文件时任务仍算 Done 但进度显示 100%（`TransferTask::progress`
-  对 Done 恒返回 1.0），备注写明「空目录：0 个文件…（已创建目标目录）」；目录上传/跨盘
-  重试前先 `stat` 目标文件——同名同大小跳过、不同则先删后传，保证重试幂等（避免适配器
-  冲突自动改名产生 `a(1).txt` 副本）；
+* **目录语义 = 传输计划层（唯一入口）**：`wp-transfer/src/plan.rs` 提供
+  `plan_download / plan_upload / plan_cross_copy`，把 `scan_remote_dir/scan_local_dir` 的目录扫描
+  结果规划成「一个文件一个 `FileSpec`」+ `dirs_to_ensure`（空子目录）+ `skip`（下载按本地同大小、
+  跨盘按目标端 list 同大小）；GUI 只消费 `TransferPlan` 建逐文件任务，不再自行实现目录展开；
+* **引擎只做单文件任务**：`prepare_total/upload_once/download_once/cross_copy_once` 对目录参数直接返回
+  「目录传输已迁移到传输计划层」；原先的目录递归分支/逐文件 stat 幂等补丁已删除；
+* **空目录引导**：某账号下目录为空时，GUI 异步扫描同 kind 其他实例同一路径，若有内容则弹
+  「目录为空：换账号继续」确认框（自动切换实例并用 plan 重新入队）；所有账号都为空才提示无法传输；
+* **零字节与跳过**：零字节文件（total=0）完成后显示「100%（0 B）」；计划层 skip 的文件不入队，
+  Toast 汇总「待传 N / 跳过 M」；
+* **限流自适应**：任务级闸门之外有按网盘实例的并发闸门（光鸭 2/百度 4/夸克 4/本机·演示 16，
+  `TransferConfig.instance_concurrency` 可覆盖）；识别 127/操作过于频繁后实例冷却+降并发（1 为下限）、
+  成功后回升；单文件跨盘在下载前 `dst.ensure_dir`，目标只读/空间超限快速失败不白下载；
 * **百度只读会话**：写请求依赖 `gettemplatevariable` 换取的 bdstoken；若只有
   `/api/loginStatus` 兜底成功，则标记 `session.write_ok=false`，账号状态显示
   「已登录（只读）」，写操作返回可执行的 errno:-6 指引（重新扫码/导入最新 Cookie）。

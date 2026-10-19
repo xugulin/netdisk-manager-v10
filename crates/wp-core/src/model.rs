@@ -553,11 +553,9 @@ impl TransferTask {
         let pct = self.progress() * 100.0;
         if self.total == 0 {
             if self.state == TaskState::Done {
-                return if self.note.contains("空目录") {
-                    "100%（空目录）".into()
-                } else {
-                    "100%（0 B）".into()
-                };
+                // 零字节文件（或历史遗留 0 字节任务）已完成：100%（0 B）。
+                // 目录任务已由计划层展开为文件任务，不再有「空目录任务」特判。
+                return "100%（0 B）".into();
             }
             return format!("{pct:.0}%");
         }
@@ -690,11 +688,11 @@ mod progress_tests {
 
     #[test]
     fn done_task_with_zero_total_is_100_percent() {
-        // 空目录 / 零字节文件：total=0，修复前显示「0%」，修复后必须 100%。
-        let t = task(TaskState::Done, 0, 0, "空目录：0 个文件 / 0 个子目录");
+        // 零字节文件：total=0，修复前显示「0%」，修复后必须 100%。
+        let t = task(TaskState::Done, 0, 0, "");
         assert_eq!(t.progress(), 1.0);
         assert!(t.progress_text().contains("100%"));
-        assert!(t.progress_text().contains("空目录"));
+        assert!(t.progress_text().contains("0 B"));
     }
 
     #[test]
