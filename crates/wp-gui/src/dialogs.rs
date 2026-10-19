@@ -543,7 +543,12 @@ fn confirm(app: &mut App, ctx: &egui::Context, d: crate::app::ConfirmDialog) -> 
     if close {
         return None;
     }
-    if yes {
+    // 未点「确定/取消」时必须把对话框写回，否则模态框只渲染一帧就消失
+    // （之前 Confirm 永远返回 None，空目录引导等确认窗会闪一下就没了）。
+    if !yes {
+        return Some(Dialog::Confirm(d));
+    }
+    {
         match d.action {
             ConfirmAction::Delete { drive, paths } => {
                 let Some(slot) = app.slot_by_id(&drive) else {
@@ -566,6 +571,9 @@ fn confirm(app: &mut App, ctx: &egui::Context, d: crate::app::ConfirmDialog) -> 
                     app.transfer.cancel(&id);
                 }
                 app.transfer.save();
+            }
+            ConfirmAction::RunPendingDirAction => {
+                app.apply_pending_dir_action();
             }
         }
     }

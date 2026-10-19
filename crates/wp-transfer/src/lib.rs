@@ -20,6 +20,7 @@
 
 mod control;
 mod engine;
+pub mod plan;
 mod store;
 
 use std::path::{Path, PathBuf};
