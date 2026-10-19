@@ -269,6 +269,16 @@ Windows 侧（本仓库无 Windows 机器）全部在 `windows-latest` 上实测
      `build-prefix/ffmpeg/bin/*.dll` 显式拷贝，校验通配符用 `*avcodec-*.dll`；
 * 新增 `build-media-stack-windows.ps1 -Preflight`（约 20 秒）：验证 cc / `-lavrt` /
   最小 meson 项目 `find_library('avrt')`，CI 先跑它再决定是否进入 30 分钟构建。
+* **最终产物（run 39204754721，全绿）**：
+  * artifact `windows-player-runtime`（42,752,825 B）= `网盘管理-win64.zip`（96,096,567 B / 80 文件）
+    + `windows-verify-report.json`；artifact `media-stack-windows`（38,676,182 B）
+    = `vendor/prebuilt/windows-x86_64/`（`libmpv-2.dll` sha256 `58214a9e…`、3,180,620 B + 20 个依赖 DLL）；
+  * `网盘管理-win64.zip`：`网盘管理.exe` 19,870,208 B / `wp-cli.exe` 5,718,016 B；
+    `播放器运行时/` 23 个 DLL（含 FFmpeg `avcodec-63` 等无 lib 前缀命名、ANGLE `libEGL/libGLESv2`、
+    `d3dcompiler_47`）+ LICENSES 11 份；
+  * 验收报告 `{pass:4, warn:0, fail:0, skip:6}`（W7a–d PASS，其余真机项 SKIP）；
+  * 仓库内副本：`出/网盘管理-win64.zip`（sha256 `0d82b60f…`）与
+    `出/验收日志/windows-verify-report.json`。
 
 ---
 

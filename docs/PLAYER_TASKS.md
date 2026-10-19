@@ -257,7 +257,7 @@
 | M3 源接入 | 🟡 真机三盘播放矩阵完成（[PLAYER_REAL_DEVICE_MATRIX.md](PLAYER_REAL_DEVICE_MATRIX.md)）；性能压测完成（[PLAYER_PERF.md](PLAYER_PERF.md)，代理默认 readahead 128MB/parallel 4）；GUI 网盘播放接线进行中（task-15） | `wp_stream::playback::resolve_playback` 已就绪 |
 | M4 AI 翻译 | 🟡 地基+闭环完成 | 待真实 key/本地 llama-server 真机评估与 GUI 按钮接线 |
 | M5 弹幕 | 🟡 内核完成（80+6）、GUI overlay 已接 | 待在线弹幕源/发送/搜索跳转接线与真机密度压测 |
-| M6 打包验收 | ⏳ 未开始 | 运行时打包脚本/Windows ANGLE 实测/许可合规清单 |
+| M6 打包验收 | 🟡 Windows 侧 CI 全绿（LGPL 媒体栈构建 + 运行时打包 + 结构验收 + 发行包 artifact）；Linux 运行时打包早已实测；真机 GL/HDR/硬解项待目标机器 | [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md) §4.5（run 39204754721 全绿，artifact `windows-player-runtime` 42.7MB / zip 96.1MB、`网盘管理.exe` 19.9MB、23 DLL、LICENSES 11）；[PLAYER_PACKAGING.md](PLAYER_PACKAGING.md) §3.5；本地副本 `出/网盘管理-win64.zip` + `出/验收日志/windows-verify-report.json`（PASS=4 FAIL=0 SKIP=6） |
 
 ## 10. 当前状态
 
