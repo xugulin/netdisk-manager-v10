@@ -44,7 +44,7 @@ jobs:
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-pkgconf
 
-      - name: MSYS2 工具链诊断（cc/gcc/meson/avrt）
+      - name: MSYS2 工具链诊断（cc/gcc/meson/avrt/编码路径）
         shell: msys2 {0}
         run: |
           set -x
@@ -55,14 +55,33 @@ jobs:
           cc --version 2>&1 | head -2 || true
           echo "=== toolchain files ==="
           ls -la /ucrt64/bin/cc* /ucrt64/bin/gcc* /ucrt64/bin/meson* /ucrt64/bin/pkg* 2>&1 | head -20
-          echo "=== avrt lib ==="
-          ls -la /ucrt64/x86_64-w64-mingw32/lib/libavrt.a 2>&1 || true
+          echo "=== avrt lib 实际位置 ==="
+          find /ucrt64 -name 'libavrt*' 2>/dev/null | head -5 || true
           echo "=== gcc search dirs ==="
           gcc -print-search-dirs | head -5 || true
-          echo "=== avrt link test ==="
+          echo "=== avrt link test（ASCII 路径）==="
           cd /tmp
           printf 'int main(void){return 0;}' > t.c
           gcc t.c -lavrt -o t.exe && echo AVRT_LINK_OK || echo AVRT_LINK_FAIL
+
+          # ── 验证根因假设：meson 编译器探测/链接测试在中文构建路径下失败 ──
+          # player-windows 之前用「出\构建缓存」当构建目录 → meson 所有 -W 探测 NO、
+          # find_library('avrt') 报错；这里分别用 ASCII 与中文路径跑最小 meson 项目对照。
+          probe_dir() {
+            d="$1"
+            rm -rf "$d" && mkdir -p "$d" && cd "$d"
+            printf 'int main(void){return 0;}\n' > main.c
+            printf "project('probe', 'c')\ncc = meson.get_compiler('c')\navrt = cc.find_library('avrt', required: true)\nexecutable('probe', 'main.c', dependencies: [avrt])\n" > meson.build
+            if meson setup builddir > setup.log 2>&1; then
+              if ninja -C builddir > ninja.log 2>&1; then echo "MESON_AVRT_OK $d"; else echo "MESON_NINJA_FAIL $d"; tail -20 ninja.log; fi
+            else
+              echo "MESON_SETUP_FAIL $d"; tail -20 setup.log
+            fi
+          }
+          echo "=== meson 最小项目（ASCII 路径）==="
+          probe_dir /tmp/meson-probe-ascii
+          echo "=== meson 最小项目（中文路径）==="
+          probe_dir /tmp/测试/构建缓存/meson-probe
 
       - name: PowerShell 脚本语法校验
         shell: pwsh

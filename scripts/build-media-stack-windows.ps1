@@ -1,4 +1,4 @@
-﻿# 构建 vendor media-stack（LGPL libmpv）—— Windows x86_64
+# 构建 vendor media-stack（LGPL libmpv）—— Windows x86_64
 #
 # 状态：**结构级脚本**（本机 Linux 无法执行/实测 Windows 构建）。默认只打印步骤；
 #       加 `-Run` 时在装好 MSYS2 的 Windows 机器上实际执行（CI 也用它）。
@@ -13,12 +13,21 @@
 #   3. 把 libmpv-2.dll、include/mpv/*.h、许可证、BUILDINFO.txt（含依赖 DLL 清单/hash）
 #      放进 vendor/prebuilt/windows-x86_64/
 #
-# 前置：Windows 10/11 + MSYS2（UCRT64 环境，默认装到 C:\msys64）
-#   https://www.msys2.org/  （安装后无需手动初始化，脚本会自动 pacman -Syu）
+# 前置：Windows 10/11 + MSYS2（UCRT64 环境；脚本按 -Msys2Root → MSYS2_LOCATION →
+#   %RUNNER_TEMP%\msys64 → C:\msys64 的顺序自动探测）
+#   https://www.msys2.org/  （安装后无需手动初始化，脚本会自动 pacman 装依赖）
+#
+# 重要（CI 实测踩坑）：**构建目录必须是纯 ASCII 路径**。meson 的编译器探测/链接测试
+#   使用绝对路径，构建目录含中文（例如默认的「出\构建缓存」）时 MinGW gcc 读不到测试文件，
+#   表现为「Compiler for C supports arguments ...: NO」全部失败、find_library('avrt') 报错。
+#   本脚本默认用 build\windows-media-stack；若 -WorkDir 传入非 ASCII 路径，会自动改到
+#   %TEMP%\wp-media-stack。
 #
 # 用法（Windows PowerShell 5.1+ / PowerShell 7，仓库根目录）：
 #   # 只看步骤（默认，不执行）
 #   powershell -ExecutionPolicy Bypass -File .\scripts\build-media-stack-windows.ps1
+#   # 预检（MSYS2 工具链 / -lavrt / meson find_library('avrt')，约 20 秒，CI 先跑它）
+#   powershell -ExecutionPolicy Bypass -File .\scripts\build-media-stack-windows.ps1 -Preflight
 #   # 真正构建（首次约 20–40 分钟；产物进 vendor/prebuilt/windows-x86_64）
 #   powershell -ExecutionPolicy Bypass -File .\scripts\build-media-stack-windows.ps1 -Run
 #   # 指定 MSYS2 位置 / 并行度 / 版本 / 干净重建
@@ -37,13 +46,14 @@
 #
 #Requires -Version 5.1
 param(
-  [string]$Msys2Root = "C:\msys64",
+  [string]$Msys2Root = "",
   [string]$WorkDir = "",
   [string]$OutDir = "vendor\prebuilt\windows-x86_64",
   [string]$MpvVersion = "0.41.0",
   [string]$FfmpegVersion = "n9.0.2",
   [int]$Jobs = 4,
   [switch]$Run,
+  [switch]$Preflight,
   [switch]$Clean,
   [switch]$Help
 )
@@ -51,15 +61,25 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
-if (-not $WorkDir) { $WorkDir = Join-Path $Root "出\构建缓存\windows-media-stack" }
+if (-not $WorkDir) { $WorkDir = Join-Path $Root "build\windows-media-stack" }
 
 function Write-Say($m)  { Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "  [OK]   $m" -ForegroundColor Green }
 function Write-Warn2($m){ Write-Host "  [WARN] $m" -ForegroundColor Yellow }
 function Write-Err2($m) { Write-Host "  [ERR]  $m" -ForegroundColor Red }
 
+# 构建目录必须是纯 ASCII（meson 在 Windows 上用绝对路径做编译器探测/链接测试，
+# 中文路径会让 MinGW gcc 读不到测试文件 → 所有探测返回 NO、find_library('avrt') 失败）。
+function Test-AsciiPath([string]$p) { return ($p -match '^[\x00-\x7F]+$') }
+if (-not (Test-AsciiPath $WorkDir)) {
+  $fallback = Join-Path $env:TEMP "wp-media-stack"
+  Write-Warn2 "构建目录含非 ASCII 字符：$WorkDir"
+  Write-Warn2 "meson/Windows gcc 无法处理中文构建路径，自动改用：$fallback"
+  $WorkDir = $fallback
+}
+
 if ($Help) {
-  Get-Content $PSCommandPath | Select-Object -First 56 | ForEach-Object { $_ -replace '^# ?', '' }
+  Get-Content $PSCommandPath | Select-Object -First 46 | ForEach-Object { $_ -replace '^# ?', '' }
   exit 0
 }
 
@@ -71,12 +91,23 @@ function ConvertTo-MsysPath([string]$p) {
   return "/$drive$rest"
 }
 
-$Bash = Join-Path $Msys2Root "usr\bin\bash.exe"
-if (-not (Test-Path $Bash)) {
-  Write-Err2 "未找到 MSYS2 bash：$Bash"
+# MSYS2 根目录：显式参数 → MSYS2_LOCATION → RUNNER_TEMP\msys64 → C:\msys64
+$candidates = @()
+if ($Msys2Root) { $candidates += $Msys2Root }
+if ($env:MSYS2_LOCATION) { $candidates += $env:MSYS2_LOCATION }
+if ($env:RUNNER_TEMP) { $candidates += (Join-Path $env:RUNNER_TEMP "msys64") }
+$candidates += "C:\msys64"
+$found = $null
+foreach ($c in $candidates) {
+  if (Test-Path (Join-Path $c "usr\bin\bash.exe")) { $found = $c; break }
+}
+if (-not $found) {
+  Write-Err2 "未找到 MSYS2 bash（候选：$($candidates -join ' / ')）"
   Write-Host "    安装 MSYS2：https://www.msys2.org/  然后重试（或 -Msys2Root 指定安装目录）"
   exit 2
 }
+$Msys2Root = $found
+$Bash = Join-Path $Msys2Root "usr\bin\bash.exe"
 
 $WorkM = ConvertTo-MsysPath $WorkDir
 $OutM  = ConvertTo-MsysPath (Join-Path $Root $OutDir)
@@ -270,6 +301,41 @@ function Invoke-Msys2Bash([string]$script, [string]$label) {
   } finally {
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
   }
+}
+
+# ── -Preflight：20 秒内验证工具链（cc / -lavrt / meson find_library('avrt')）──
+# CI 先跑它，避免在 30 分钟 FFmpeg 构建之后才暴露「编译器探测失败 / avrt 找不到」。
+if ($Preflight) {
+  Write-Say "预检：MSYS2 工具链 / avrt / meson（工作目录：$WorkDir）"
+  $probe = @'
+set -euo pipefail
+export PATH="/ucrt64/bin:$PATH"
+echo "MSYSTEM=${MSYSTEM:-<unset>}"
+echo "root: $(cygpath -w /)"
+command -v cc gcc meson ninja pkg-config || true
+cc --version | head -1
+meson --version
+work='__WORK__'
+mkdir -p "$work"
+cd "$work"
+rm -rf preflight && mkdir -p preflight && cd preflight
+printf 'int main(void){return 0;}\n' > t.c
+cc t.c -lavrt -o t.exe
+echo AVRT_LINK_OK
+mkdir -p meson-probe && cd meson-probe
+printf "project('probe', 'c')\ncc = meson.get_compiler('c')\navrt = cc.find_library('avrt', required: true)\nexecutable('probe', 'main.c', dependencies: [avrt])\n" > meson.build
+printf 'int main(void){return 0;}\n' > main.c
+meson setup builddir > meson-setup.log 2>&1 || { echo MESON_SETUP_FAIL; tail -50 meson-setup.log; exit 5; }
+ninja -C builddir > meson-ninja.log 2>&1 || { echo MESON_NINJA_FAIL; tail -50 meson-ninja.log; exit 6; }
+echo MESON_AVRT_OK
+'@
+  $code = Invoke-Msys2Bash $probe "preflight"
+  if ($code -ne 0) {
+    Write-Err2 "预检失败（退出码 $code）：先修工具链再跑 -Run，别浪费 30 分钟"
+    exit 1
+  }
+  Write-Ok "预检通过：cc / -lavrt / meson find_library('avrt') 全部可用"
+  exit 0
 }
 
 if (-not $Run) {

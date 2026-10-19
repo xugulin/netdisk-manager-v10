@@ -35,8 +35,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
-            libgl1-mesa-dev xvfb fonts-noto-cjk
+          # libxkbcommon-x11-0：winit 的 xkbcommon-dl 在 X11 后端下会 dlopen
+          # libxkbcommon-x11.so；只装 -dev 不够，缺它会让 GUI 冒烟全部 core dump。
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev \
+            libxi-dev libgl1-mesa-dev xvfb fonts-noto-cjk
 
       - name: 编译（release）
         run: cargo build --release -p wp-gui -p wp-cli

@@ -58,6 +58,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 安装 MSYS2（UCRT64）
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -74,32 +75,58 @@ jobs:
             pkgconf
             nasm
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-libass
             mingw-w64-ucrt-x86_64-libplacebo
             mingw-w64-ucrt-x86_64-libbluray
 
+      # runner 镜像里可能另有旧的 C:\msys64；setup-msys2 实际装到别处。
+      # 若 PowerShell 构建脚本写死 C:\msys64，就会用另一套与 action 安装不同步的工具链
+      # （CI 实测：meson 的编译器探测全部失败 → find_library('avrt') 报错）。
+      - name: 记录 MSYS2 安装位置（供 pwsh 步骤使用）
+        shell: msys2 {0}
+        run: |
+          set -e
+          root="$(cygpath -w / | sed 's|\\$||')"
+          echo "MSYS2 安装位置：$root"
+          printf '%s' "$root" > msys2-root.txt
+
       - name: 恢复 media-stack 构建缓存（FFmpeg/mpv 源码与中间产物）
         uses: actions/cache@v4
         with:
-          path: 出/构建缓存/windows-media-stack
-          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}
+          # 路径必须纯 ASCII：meson 的编译器探测/链接测试都用绝对路径，
+          # 构建目录一旦含中文（如「出/构建缓存」），MinGW gcc 读不到测试文件，
+          # 所有编译探测返回 NO、find_library('avrt') 失败（CI 实测踩坑）。
+          path: build/windows-media-stack
+          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-ascii1
           restore-keys: |
-            media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-
+            media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-ascii1-
+
+      - name: 预检 MSYS2 工具链 / avrt / meson（快速失败，避免白跑 30 分钟）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $msys2Root = (Get-Content -Raw .\msys2-root.txt).Trim()
+          Write-Host "MSYS2：$msys2Root"
+          ./scripts/build-media-stack-windows.ps1 -Preflight -Msys2Root $msys2Root `
+            -WorkDir "${{ github.workspace }}\build\windows-media-stack"
 
       - name: 构建 LGPL FFmpeg + mpv libmpv-2.dll
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          ./scripts/build-media-stack-windows.ps1 -Run -Msys2Root C:\msys64 `
-            -WorkDir "${{ github.workspace }}\出\构建缓存\windows-media-stack" `
+          $msys2Root = (Get-Content -Raw .\msys2-root.txt).Trim()
+          ./scripts/build-media-stack-windows.ps1 -Run -Msys2Root $msys2Root `
+            -WorkDir "${{ github.workspace }}\build\windows-media-stack" `
             -MpvVersion "$env:MPV_VERSION" -FfmpegVersion "$env:FFMPEG_VERSION" -Jobs 4
 
       - name: 保存构建缓存（即使构建失败也保存，加速重试）
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: 出/构建缓存/windows-media-stack
-          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}
+          path: build/windows-media-stack
+          key: media-stack-win64-${{ env.MPV_VERSION }}-${{ env.FFMPEG_VERSION }}-ascii1
 
       - name: 校验构建产物（sha256 / 许可证 / BUILDINFO）
         shell: pwsh

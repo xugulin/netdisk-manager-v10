@@ -13,3 +13,7 @@
 /出/播放器运行时/
 # vendored 构建中间产物（FFmpeg/libmpv 源码构建目录）
 /vendor/build/
+# Windows media-stack 构建目录（纯 ASCII 路径，meson 不支持中文构建路径）
+/build/
+# CI 临时文件（MSYS2 安装位置）
+/msys2-root.txt
