@@ -5,7 +5,6 @@ use crate::theme;
 use crate::widgets;
 use egui::{RichText, Ui};
 use wp_core::config::{DriveConfig, GuardAction};
-use wp_core::model::DriveKind;
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     let t = app.theme;
@@ -105,27 +104,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let mut kind = app.settings_draft_kind;
-                    egui::ComboBox::from_id_salt("new_kind")
-                        .selected_text(kind.label())
-                        .width(100.0)
-                        .show_ui(ui, |ui| {
-                            for k in DriveKind::ALL {
-                                if k.slug() == "local" {
-                                    continue;
-                                }
-                                if ui.selectable_label(kind == k, k.label()).clicked() {
-                                    kind = k;
-                                }
-                            }
-                        });
-                    if kind != app.settings_draft_kind {
-                        app.settings_draft_kind = kind;
+                    if widgets::secondary_button(ui, &t, "＋ 添加网盘 / 本机").clicked() {
+                        acts.push(Act::OpenAddDrive);
                     }
-                    if widgets::secondary_button(ui, &t, "＋ 新增网盘实例").clicked() {
-                        acts.push(Act::AddDrive(kind));
-                    }
-                    widgets::hint(ui, &t, "同一家网盘可添加多个实例（各自独立凭证）");
+                    widgets::hint(
+                        ui,
+                        &t,
+                        "弹窗选择要添加的类型；同一家网盘可加多个账号（各自独立凭证）",
+                    );
                 });
             });
 
@@ -358,7 +344,8 @@ fn guard_action_label(a: GuardAction) -> &'static str {
 }
 
 enum Act {
-    AddDrive(DriveKind),
+    /// 打开「添加网盘 / 本机」选择对话框
+    OpenAddDrive,
     RemoveDrive(String),
     RenameDrive(String, String),
     ToggleDrive(String, bool),
@@ -375,15 +362,17 @@ enum Act {
 
 fn apply(app: &mut App, act: Act) {
     match act {
-        Act::AddDrive(kind) => {
-            // 同一网盘可挂多个账号：新增实例后直接切到它并打开登录对话框
-            app.add_account_and_login(kind);
-        }
+        Act::OpenAddDrive => app.open_add_drive_dialog(),
         Act::RemoveDrive(id) => {
             app.cfg.drives.retain(|d| d.id != id);
             app.save_config();
             app.rebuild_drives();
-            app.toast(ToastKind::Info, format!("已删除网盘实例：{id}"));
+            app.toast(
+                ToastKind::Info,
+                format!(
+                    "已移除实例 {id}（凭证目录保留，重新添加可直接复用；彻底删除请删 数据/账号/{id}）"
+                ),
+            );
         }
         Act::RenameDrive(id, name) => {
             if let Some(d) = app.cfg.drives.iter_mut().find(|d| d.id == id) {

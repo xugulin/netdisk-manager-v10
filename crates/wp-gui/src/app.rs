@@ -333,6 +333,10 @@ impl LoginDialog {
     }
 }
 
+/// 「添加网盘 / 本机」选择对话框（无状态：每一帧从配置计算已有实例数）。
+#[derive(Default)]
+pub struct AddDriveDialog;
+
 /// 新建文件夹 / 重命名输入框。
 pub struct InputDialog {
     pub title: String,
@@ -431,6 +435,8 @@ pub struct CrossCopyDialog {
 
 pub enum Dialog {
     Login(LoginDialog),
+    /// 添加网盘 / 本机：先选类型，再创建实例
+    AddDrive(AddDriveDialog),
     Input(InputDialog),
     Confirm(ConfirmDialog),
     DirPicker(DirPicker),
@@ -509,6 +515,8 @@ enum TopDriveAction {
     Logout(String),
     Refresh(String),
     AddAccount(DriveKind),
+    /// 打开「添加网盘 / 本机」选择对话框（任何状态下都可用）
+    OpenAddDialog,
     Remove(String),
 }
 
@@ -535,7 +543,6 @@ pub struct App {
     pub log_auto_scroll: bool,
     /// 设置页草稿（保存后写盘）
     pub settings_draft: SettingsDraft,
-    pub settings_draft_kind: DriveKind,
     pub tools: ToolsState,
     /// 文件列表缩略图缓存（图片/视频预览）
     pub thumbs: crate::thumbs::ThumbCache,
@@ -735,7 +742,6 @@ impl App {
             log_search: String::new(),
             log_auto_scroll: true,
             settings_draft,
-            settings_draft_kind: DriveKind::Baidu,
             tools: ToolsState {
                 tab: Some(ToolsTab::Recycle),
                 ..Default::default()
@@ -1335,19 +1341,90 @@ impl App {
         id
     }
 
-    /// 新增同类型账号实例并**直接打开它的登录对话框**（新账号最短路径）。
+    /// 打开「添加网盘 / 本机」选择对话框。
+    ///
+    /// 即使当前一个实例都没有（用户把某类网盘实例全部移除）也必须能打开并创建。
+    pub fn open_add_drive_dialog(&mut self) {
+        self.dialog = Some(Dialog::AddDrive(AddDriveDialog::default()));
+    }
+
+    /// 单实例类型（本机/演示）已有配置时返回其实例 id。
+    fn single_instance_of(&self, kind: DriveKind) -> Option<String> {
+        if !matches!(kind, DriveKind::Local | DriveKind::Fake) {
+            return None;
+        }
+        self.cfg
+            .drives
+            .iter()
+            .find(|d| d.kind == kind)
+            .map(|d| d.id.clone())
+    }
+
+    /// 该实例的凭证目录是否已有文件（用于判断添加后是否需要引导登录）。
+    fn account_has_credentials(&self, id: &str) -> bool {
+        std::fs::read_dir(self.paths.account_path(id))
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false)
+    }
+
+    /// 从「添加网盘」对话框选择了一种类型：
+    /// * 本机/演示：已有则直接切换（避免重复实例），没有才新建；
+    /// * 云盘：新增实例；有历史凭证则自动恢复会话，否则打开登录对话框。
+    pub fn add_drive_from_dialog(&mut self, kind: DriveKind) {
+        if let Some(id) = self.single_instance_of(kind) {
+            if self.slot_idx(&id).is_some() {
+                if let Some(i) = self.slot_idx(&id) {
+                    self.active = i;
+                }
+                self.page = Page::Browser;
+                self.save_config();
+                self.toast(ToastKind::Info, format!("已切换到{}", kind.label()));
+                return;
+            }
+            // 配置里有但未启用：重新启用后再切换
+            if let Some(d) = self.cfg.drives.iter_mut().find(|d| d.id == id) {
+                d.enabled = true;
+            }
+            self.rebuild_drives();
+            if let Some(i) = self.slot_idx(&id) {
+                self.active = i;
+            }
+            self.page = Page::Browser;
+            self.save_config();
+            self.toast(ToastKind::Info, format!("已启用{}", kind.label()));
+            return;
+        }
+        self.add_account_and_login(kind);
+    }
+
+    /// 新增同类型账号实例。
+    ///
+    /// 新账号（凭证目录为空）直接打开登录对话框；检测到历史凭证时自动恢复登录，
+    /// 避免"加了实例却弹出二维码把旧会话盖掉"的体验问题。
     pub fn add_account_and_login(&mut self, kind: DriveKind) {
         let id = self.add_drive_instance(kind);
         self.page = Page::Browser;
-        self.open_login_dialog();
-        self.toast(
-            ToastKind::Success,
-            format!(
-                "已新增账号实例 {}（{}），请扫码/Cookie 登录",
-                id,
-                kind.label()
-            ),
-        );
+        if kind.is_cloud() && self.account_has_credentials(&id) {
+            self.refresh_account(&id);
+            self.toast(
+                ToastKind::Info,
+                format!(
+                    "已添加实例 {id}（检测到历史凭证，正在恢复登录；如需更换账号请点「登录」）"
+                ),
+            );
+        } else if kind.is_cloud() {
+            self.open_login_dialog();
+            self.toast(
+                ToastKind::Success,
+                format!(
+                    "已添加账号实例 {}（{}），请扫码/Cookie 登录",
+                    id,
+                    kind.label()
+                ),
+            );
+        } else {
+            self.toast(ToastKind::Success, format!("已添加{}实例", kind.label()));
+        }
     }
 
     pub fn apply_settings(&mut self) {
@@ -2174,6 +2251,7 @@ impl App {
             }
             TopDriveAction::Refresh(id) => self.refresh_account(&id),
             TopDriveAction::AddAccount(kind) => self.add_account_and_login(kind),
+            TopDriveAction::OpenAddDialog => self.open_add_drive_dialog(),
             TopDriveAction::Remove(id) => {
                 self.cfg.drives.retain(|d| d.id != id);
                 self.rebuild_drives();
@@ -2328,25 +2406,22 @@ impl App {
                     action = Some(TopDriveAction::Switch(i));
                 }
             }
-            // 「＋」：一键新增当前类型的账号（同一网盘多账号的最短入口）
-            if let Some(kind) = self.drives.get(self.active).map(|s| s.kind()) {
-                ui.add_space(4.0);
-                let plus = ui
-                    .add_sized(
-                        [52.0, 24.0],
-                        egui::Button::new(
-                            egui::RichText::new("＋ 账号").size(12.0).color(t.text_weak),
-                        )
-                        .fill(t.card)
-                        .corner_radius(theme::radius(14)),
+            // 「＋ 添加」：打开「添加网盘 / 本机」选择对话框。
+            // 关键：即使当前一个网盘实例都没有（例如把某类实例全部删除后）也必须可用，
+            // 否则用户会陷入"删干净后无法再添加"的死角。
+            ui.add_space(4.0);
+            let plus = ui
+                .add_sized(
+                    [64.0, 24.0],
+                    egui::Button::new(
+                        egui::RichText::new("＋ 添加").size(12.0).color(t.text_weak),
                     )
-                    .on_hover_text(format!(
-                        "新增一个{}账号（同一网盘可多账号，各自独立凭证/会话）",
-                        kind.label()
-                    ));
-                if plus.clicked() {
-                    action = Some(TopDriveAction::AddAccount(kind));
-                }
+                    .fill(t.card)
+                    .corner_radius(theme::radius(14)),
+                )
+                .on_hover_text("添加网盘 / 本机（百度 · 夸克 · 光鸭 · 本机 · 演示）");
+            if plus.clicked() {
+                action = Some(TopDriveAction::OpenAddDialog);
             }
             if let Some(act) = action {
                 self.handle_top_action(act);

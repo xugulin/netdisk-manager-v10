@@ -4,13 +4,13 @@
 //! 需要继续显示时再写回 `app.dialog`。这样不会在 UI 闭包里与 `&mut App` 冲突。
 
 use crate::app::{
-    App, ConfirmAction, CrossCopyDialog, DetailsDialog, Dialog, DirPicker, DirPickerAction,
-    InputAction, InputDialog, LoginDialog, LoginTab, ShareDialog, ToastKind,
+    AddDriveDialog, App, ConfirmAction, CrossCopyDialog, DetailsDialog, Dialog, DirPicker,
+    DirPickerAction, InputAction, InputDialog, LoginDialog, LoginTab, ShareDialog, ToastKind,
 };
 use crate::theme::Theme;
 use crate::widgets;
 use egui::{RichText, Ui};
-use wp_core::model::{QrState, TaskState};
+use wp_core::model::{DriveKind, QrState, TaskState};
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(dialog) = app.dialog.take() else {
@@ -18,6 +18,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     };
     let keep: Option<Dialog> = match dialog {
         Dialog::Login(mut d) => login(app, ctx, &mut d).then(|| Dialog::Login(d)),
+        Dialog::AddDrive(mut d) => add_drive(app, ctx, &mut d).then(|| Dialog::AddDrive(d)),
         Dialog::Input(mut d) => input(app, ctx, &mut d).then(|| Dialog::Input(d)),
         Dialog::Confirm(d) => confirm(app, ctx, d),
         Dialog::DirPicker(mut d) => dir_picker(app, ctx, &mut d).then(|| Dialog::DirPicker(d)),
@@ -40,6 +41,77 @@ fn title_row(ui: &mut Ui, t: &Theme, title: &str, close: &mut bool) {
         });
     });
     ui.separator();
+}
+
+// ═══════════════════════════ 添加网盘 / 本机 ═══════════════════════════
+
+fn drive_kind_desc(kind: DriveKind) -> &'static str {
+    match kind {
+        DriveKind::Baidu => "扫码 / Cookie 登录；同一家可加多个账号实例（凭证隔离）",
+        DriveKind::Quark => "扫码登录；可加多个账号实例",
+        DriveKind::Guangya => "扫码 / 短信 / 令牌；可加多个账号实例",
+        DriveKind::Local => "浏览与传输本机文件；单实例（已有则直接切换）",
+        DriveKind::Fake => "内存演示数据、无需登录；用于界面与传输演练",
+    }
+}
+
+fn add_drive(app: &mut App, ctx: &egui::Context, _d: &mut AddDriveDialog) -> bool {
+    let t = app.theme;
+    let mut close = false;
+    let mut chosen: Option<DriveKind> = None;
+    egui::Modal::new(crate::app::modal_id("add_drive_modal")).show(ctx, |ui| {
+        ui.set_width(470.0);
+        title_row(ui, &t, "添加网盘 / 本机", &mut close);
+        widgets::hint(
+            ui,
+            &t,
+            "先选类型再创建实例：云盘同一家可加多个账号（各自独立凭证）；本机/演示为单实例，已有则直接切换。",
+        );
+        ui.add_space(8.0);
+        for kind in DriveKind::ALL {
+            let existing = app.cfg.drives.iter().filter(|x| x.kind == kind).count();
+            let brand = egui::Color32::from_rgb(
+                kind.brand_color()[0],
+                kind.brand_color()[1],
+                kind.brand_color()[2],
+            );
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(kind.icon()).size(17.0).strong().color(brand));
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(kind.label()).size(13.5).color(t.text));
+                    ui.label(RichText::new(drive_kind_desc(kind)).size(11.0).color(t.text_weak));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let single = matches!(kind, DriveKind::Local | DriveKind::Fake);
+                    let btn_text = if single && existing > 0 { "切换" } else { "添加" };
+                    if ui.button(btn_text).clicked() {
+                        chosen = Some(kind);
+                    }
+                    if existing > 0 {
+                        ui.label(
+                            RichText::new(format!("已有 {existing} 个"))
+                                .size(11.0)
+                                .color(t.text_weak),
+                        );
+                    }
+                });
+            });
+            ui.separator();
+        }
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui.button("取消").clicked() {
+                close = true;
+            }
+            widgets::hint(ui, &t, "提示：删除某类全部实例后，仍可在这里重新添加。");
+        });
+    });
+    if let Some(kind) = chosen {
+        app.add_drive_from_dialog(kind);
+        return false;
+    }
+    !close
 }
 
 // ═══════════════════════════ 登录 ═══════════════════════════

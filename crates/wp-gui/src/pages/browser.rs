@@ -96,8 +96,13 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             ui,
             &t,
             "还没有可用的网盘",
-            "请在「设置 → 网盘账号」里启用或新增网盘实例",
+            "点下方按钮添加网盘 / 本机，或在「设置 → 网盘账号」里管理实例",
         );
+        ui.vertical_centered(|ui| {
+            if widgets::primary_button(ui, &t, "＋ 添加网盘 / 本机").clicked() {
+                app.open_add_drive_dialog();
+            }
+        });
         return;
     }
     let Some(slot_idx) = app.slot_idx(&drive_id) else {
