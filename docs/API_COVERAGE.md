@@ -94,10 +94,13 @@
 | 直链下载 | `GET https://d.pcs.baidu.com/file/...`（带 Cookie；支持 Range） | 真机 | ✅ 但**大文件有三条 CDN 限制**（2026-10-19 真机，非会员账号）：① 请求 UA 必须是客户端标识（`netdisk;...`），浏览器 UA → 403 `31326`；② 必须带**有界 Range**（无 Range / `bytes=0-` 开区间均 403 `31326 hitcode:104`）；③ 单次 Range 跨度 **>约 5MB 即 403**。实现：`download_headers()` 用 `DOWNLOAD_UA`；`direct_link()` 手动解析 302（reqwest 跨域跟随会丢 Cookie）；下载器 `max_range_span=4MiB` 按块请求（单连接/多段内均生效） |
 | 目录打包下载 | — | — | ❌（`/api/getsyscfg` 等网页后台，未接；跨盘整目录复制也未实现） |
 
-> **真机结果（2026-10-19 晚）**：修复后完整下载 `/IDA95/linux/ida-pro_95_x64linux.run`
-> 722,672,855 B 成功（耗时 5,986 s，平均 0.12 MB/s，免费账号限速），`file` 校验为 ELF 64-bit x86-64；
-> sha256 `3c4337c9…`，md5 `154690688b87753fd768184791458129`。并把同一文件上传到光鸭云盘
-> `/IDA pro9.5 加补丁/`（大小/md5 与本地一致）。
+> **真机结果（2026-10-19 晚）**：修复后完整下载两个大文件并上传光鸭云盘 `/IDA pro9.5 加补丁/`：
+> * `/IDA95/linux/ida-pro_95_x64linux.run` 722,672,855 B（5,986 s，平均 0.12 MB/s）→
+>   `file` 为 ELF 64-bit x86-64；sha256 `3c4337c9…` / md5 `154690688b87753fd768184791458129`；
+> * `/IDA95/win/ida-pro_95_x64win.exe` 752,039,466 B（6,224 s，平均 0.12 MB/s）→
+>   `file` 为 PE32+ executable (GUI) x86-64；sha256 `5996d7b6…` / md5 `6365ad4216399781cc5c66d8315d193e`；
+>
+> 两个文件在光鸭云盘的大小/md5 均与本地一致（上传器上报 md5 相同），证明上传完整。
 
 > 注：`31326` 不是「链接失效/无权限」的永久错误——根因是 CDN 按 UA 做授权判定；
 > 排查时先用 `curl -r 0-255 -H "User-Agent: netdisk;P2SP;2.2.2.0" -H "Cookie: <登录Cookie>" <dlink>` 复测。
