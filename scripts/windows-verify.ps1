@@ -1,4 +1,4 @@
-﻿# Windows 播放链路验证（W1–W7 清单自动/半自动）—— 输出 PASS/FAIL JSON
+# Windows 播放链路验证（W1–W7 清单自动/半自动）—— 输出 PASS/FAIL JSON
 #
 # 对照 docs/PLAYER_WINDOWS_ANGLE.md §5 的 W1–W7：
 #   W1 GL 上下文 = EGL/ANGLE（半自动：有 -GlRendererLog 则自动判，否则要求人工确认）
@@ -327,7 +327,12 @@ if ($SkipGl) {
 # ════════════════ W3：硬解 hwdec ════════════════
 Write-Say "[W3] 硬解 hwdec-current"
 if (-not $mpvProbe) {
-  Add-Check "W3" "硬解 hwdec-current" "FAIL" "mpv-probe.exe 不可用"
+  # CI（-SkipBuild）不构建探针，W3 属真机项 → SKIP；真机跑时探针缺失才提示
+  if ($SkipBuild) {
+    Add-Check "W3" "硬解 hwdec-current" "SKIP" "-SkipBuild 未构建 mpv-probe（CI 无桌面/样本，W3 留待真机）"
+  } else {
+    Add-Check "W3" "硬解 hwdec-current" "WARN" "mpv-probe.exe 不可用（可去掉 -SkipBuild 让脚本 cargo 构建）"
+  }
 } elseif (-not $sample1080Path) {
   Add-Check "W3" "硬解 hwdec-current" "SKIP" "未提供 -Sample1080"
 } else {
@@ -351,7 +356,11 @@ if (-not $mpvProbe) {
 # ════════════════ W4：4K HEVC 性能 ════════════════
 Write-Say "[W4] 4K HEVC 10bit 性能"
 if (-not $mpvProbe) {
-  Add-Check "W4" "4K HEVC 性能" "FAIL" "mpv-probe.exe 不可用"
+  if ($SkipBuild) {
+    Add-Check "W4" "4K HEVC 性能" "SKIP" "-SkipBuild 未构建 mpv-probe（CI 无 4K 样本，W4 留待真机）"
+  } else {
+    Add-Check "W4" "4K HEVC 性能" "WARN" "mpv-probe.exe 不可用（可去掉 -SkipBuild 让脚本 cargo 构建）"
+  }
 } elseif (-not $sample4kPath) {
   Add-Check "W4" "4K HEVC 性能" "SKIP" "未提供 -Sample4K（需 4K HEVC 10bit 样本）"
 } else {

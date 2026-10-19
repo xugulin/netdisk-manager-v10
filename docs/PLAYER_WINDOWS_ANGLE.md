@@ -94,6 +94,7 @@ egui 侧用 `egui_glow` paint callback 输出到页面视频矩形；`mpv_render
 | 39195656980（smoke） | ✅ | 加入 MSYS2 诊断/中文-ASCII meson 对照，根因锁定 |
 | 39197502500 | job1 ✅ / job2 ❌ | 修复 #4 生效：**media-stack job 全绿**（LGPL FFmpeg + libmpv-2.dll 构建、缓存保存、artifact 上传）；job2 Strict 校验发现 prebuilt 缺 FFmpeg `av*.dll` → 修复 #5 |
 | 39200091084 | job1 ✅ / job2 ❌ | 修复 #5 生效：运行时 DLL 齐全、LICENSES 10 份、**Strict Errors=0**；job2 在 windows-verify 步骤因 PowerShell 数组 splat 误用失败 → 修复 #6（改哈希表 splat） |
+| 39202348549 | job1 ✅ / job2 ❌ | 修复 #6 生效：windows-verify 真正跑起来，W7a–d 全 PASS；W3/W4 因 `-SkipBuild` 未构建 `mpv-probe` 被判 FAIL → 修复 #7（CI 语义：探针缺失时 W3/W4 SKIP，不算失败） |
 
 **修复 #4（media-stack 构建环境）**
 1. **构建目录必须纯 ASCII**：`出\构建缓存` 含中文 → meson 的编译器探测/链接测试用绝对路径，
@@ -112,6 +113,10 @@ ldd 依赖收集扩展到 `__PREFIX__` 目录；打包校验通配符改 `*avcod
 **修复 #6（PowerShell 参数传递）** workflow 里调用 `windows-verify.ps1` 的参数改用**哈希表 splat**
 （`@{ RuntimeDir = ...; SkipBuild = $true }`）；PowerShell **数组 splat 不会解析 `-Name`**，而是按位置绑定，
 导致 `-SkipBuild` 被当成位置参数绑到 `-Seconds` 并报类型转换错误。
+
+**修复 #7（CI 验收语义）** CI 传 `-SkipBuild` 时不构建 `mpv-probe.exe`，原逻辑把「探针不可用」
+判为 W3/W4 FAIL → job 失败。已改为：`-SkipBuild`（CI）下探针缺失 → W3/W4 **SKIP**（真机项留待目标机器）；
+真机省略 `-SkipBuild` 时探针缺失仍提示 WARN。CI 期望结果变为 W7a–d PASS、W1/W2/W3/W4/W5/W6 SKIP、FAIL=0。
 
 > CI 无桌面/GPU：`run_gl_verify=false` 时 W1/W3/W4/W5 走 SKIP/WARN，W2/W7 自动判定；
 > GL 上下文/硬解/HDR 等真机项仍需按 §5/§8 在目标 Windows 机器补跑。

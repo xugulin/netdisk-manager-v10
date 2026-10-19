@@ -236,6 +236,8 @@ jobs:
           $gl = "${{ github.event.inputs.run_gl_verify }}" -eq "true"
           if (-not $gl) { $verifyArgs.SkipGl = $true }
           ./scripts/windows-verify.ps1 @verifyArgs
+          # CI 语义：run_gl_verify=false 时 W1/W2/W6 因 -SkipGl 为 SKIP；W3/W4 无探针/样本为 SKIP；
+          # W5 无 HDR 屏为 SKIP；W7（结构/许可证/DLL/ANGLE/布局）应 PASS。只有 FAIL 会让 job 失败。
           # 注：CI 无 GPU/样本时 W1/W3/W4/W5/W6 为 SKIP/WARN，W2/W7 应 PASS；FAIL 时 job 失败
 
       - name: 打包 zip（含 LICENSES/源码获取说明/验收报告）
