@@ -72,17 +72,49 @@ egui 侧用 `egui_glow` paint callback 输出到页面视频矩形；`mpv_render
 
 ## 4.5 CI 实测记录（GitHub Actions Windows runner，2026-10-19）
 
-已在 **GitHub Actions `windows-latest`（MSVC）** 上跑通快速预检 workflow `windows-smoke`（run 39166099450，全部 success）：
+本仓库没有 Windows 机器，Windows 侧实测全部通过 **GitHub Actions `windows-latest`** 完成。
+
+### 4.5.1 快速预检 workflow `windows-smoke`（run 39197504582，全部 success）
 
 | 检查 | 结果 |
 |---|---|
+| MSYS2 工具链诊断（cc/gcc/meson/avrt） | ✅ `libavrt.a` 位于 **`/ucrt64/lib/`**（不在 `x86_64-w64-mingw32/lib/`）；`cc t.c -lavrt` 链接 OK |
+| **meson 中文构建路径对照实验** | ✅ 同一最小 meson 项目：ASCII 路径 → `MESON_AVRT_OK`；中文路径 → `MESON_SETUP_FAIL`，**证实 meson 在 Windows 上不能用于中文构建目录** |
 | PowerShell 4 脚本语法校验 | ✅ `build-media-stack-windows.ps1` / `package-player-runtime-windows.ps1` / `fetch-angle.ps1` / `windows-verify.ps1` |
 | `cargo build --release -p wp-gui -p wp-cli`（Windows MSVC） | ✅ `网盘管理.exe` 19,870,208 B、`wp-cli.exe` 5,718,016 B |
 | `wp-cli --help` | ✅ 版本/usage 正常（中文正常） |
 | `package-player-runtime-windows.ps1 -Generate` 结构自检 | ✅ LICENSES（10 份）/LOAD-ORDER/DEPENDENCIES/BUILDINFO/README 生成；无 media-stack 时可读错误（预期） |
 
-重型 `player-windows` workflow（MSYS2 构建 LGPL FFmpeg + libmpv-2.dll → 打包运行时 → windows-verify）在 CI 上迭代中；
-CI 已验证 Rust 代码可在 Windows 编译运行，剩余为媒体栈构建与 GL/硬解真机项（见 §5 W1–W7）。
+### 4.5.2 重型 workflow `player-windows` 迭代记录（同日）
+
+| run | 结果 | 结论 |
+|---|---|---|
+| 39170354614 | ❌ | mpv meson 报 `find_library('avrt')` 失败（初判为工具链问题） |
+| 39173284183 | ❌ | 日志定位根因：构建目录含中文 + 用了 runner 预装的 `C:\msys64` 而非 setup-msys2 安装的 MSYS2；meson 编译器探测全部返回 NO |
+| 39195656980（smoke） | ✅ | 加入 MSYS2 诊断/中文-ASCII meson 对照，根因锁定 |
+| 39197502500 | job1 ✅ / job2 ❌ | 修复 #4 生效：**media-stack job 全绿**（LGPL FFmpeg + libmpv-2.dll 构建、缓存保存、artifact 上传）；job2 Strict 校验发现 prebuilt 缺 FFmpeg `av*.dll` → 修复 #5 |
+| 39200091084 | job1 ✅ / job2 ❌ | 修复 #5 生效：运行时 DLL 齐全、LICENSES 10 份、**Strict Errors=0**；job2 在 windows-verify 步骤因 PowerShell 数组 splat 误用失败 → 修复 #6（改哈希表 splat） |
+
+**修复 #4（media-stack 构建环境）**
+1. **构建目录必须纯 ASCII**：`出\构建缓存` 含中文 → meson 的编译器探测/链接测试用绝对路径，
+   MinGW gcc 经 ANSI argv 打不开 → 所有 `-W` 探测返回 NO、`find_library('avrt')` 失败。
+   已改为 `build\windows-media-stack`；脚本对非 ASCII 路径自动回退 `%TEMP%\wp-media-stack`。
+2. **不要写死 `C:\msys64`**：`msys2/setup-msys2` 实际装到 `D:\a\_temp\msys64`。Workflow 新增
+   「记录 MSYS2 安装位置」一步（MSYS2 shell 里 `cygpath -w /` 写入 `msys2-root.txt`），pwsh 构建步骤读它。
+3. **先跑 20 秒预检**：`build-media-stack-windows.ps1 -Preflight`（cc / `-lavrt` / 最小 meson 项目
+   `find_library('avrt')`），失败即止，避免白跑约 30 分钟 FFmpeg 构建。
+
+**修复 #5（Windows DLL 收集/校验）** stage 步骤显式拷贝 `build-prefix/ffmpeg/bin/*.dll`
+（Windows 版 FFmpeg DLL 名**没有 lib 前缀**：`avcodec-62.dll` / `avformat-62.dll` / `swresample-6.dll` …），
+ldd 依赖收集扩展到 `__PREFIX__` 目录；打包校验通配符改 `*avcodec-*.dll` 形式以同时兼容两种命名；
+`libwinpthread-1.dll` 降为可选（该构建为静态链接时不产生此 DLL）。
+
+**修复 #6（PowerShell 参数传递）** workflow 里调用 `windows-verify.ps1` 的参数改用**哈希表 splat**
+（`@{ RuntimeDir = ...; SkipBuild = $true }`）；PowerShell **数组 splat 不会解析 `-Name`**，而是按位置绑定，
+导致 `-SkipBuild` 被当成位置参数绑到 `-Seconds` 并报类型转换错误。
+
+> CI 无桌面/GPU：`run_gl_verify=false` 时 W1/W3/W4/W5 走 SKIP/WARN，W2/W7 自动判定；
+> GL 上下文/硬解/HDR 等真机项仍需按 §5/§8 在目标 Windows 机器补跑。
 
 ## 5. M0-Win 验证清单（需要在 Windows 机器上跑；Mac 不可替代）
 
@@ -144,6 +176,17 @@ MSYS2 UCRT64
 > ⚠️ **不能直接用 MSYS2 的 `mingw-w64-ucrt-x86_64-ffmpeg` 包**：那是 GPL 构建
 > （见 `docs/PLAYER_PACKAGING.md` §5 的 GPL 风险分析）。随包发行必须用源码 LGPL 构建；
 > 构建脚本的 `BUILDINFO.txt` 会记录 `ffmpeg_version` 与 LGPL 配置，发布验收据此审计。
+>
+> ⚠️ **Windows 构建环境三个坑（CI 实测，2026-10-19，详见 §4.5.2）**：
+> 1. **构建目录必须纯 ASCII**：meson 的编译器探测/链接测试用绝对路径，中文目录下 MinGW gcc
+>    打不开测试文件 → 所有 `-W` 探测返回 NO、`find_library('avrt')` 失败（看起来像工具链坏了）。
+> 2. **不要写死 `C:\msys64`**：`msys2/setup-msys2` 实际安装位置需从 MSYS2 shell 的
+>    `cygpath -w /` 获取后传给 pwsh 构建脚本。
+> 3. **先跑 `-Preflight`**（cc / `-lavrt` / 最小 meson 项目 `find_library('avrt')`，约 20 秒），
+>    再做完整的 FFmpeg+mpv 构建。
+>
+> 另：`libavrt.a` 位于 `/ucrt64/lib/`（不在 `x86_64-w64-mingw32/lib/`）；mingw meson 用
+> `/ucrt64/bin/meson.exe`（自带 UCRT64 python，避免 meson 拒绝 MSYS python + MinGW 环境）。
 
 ### 7.3 产物结构（`vendor/prebuilt/windows-x86_64/` → `出/网盘管理-win64/`）
 
@@ -152,9 +195,11 @@ MSYS2 UCRT64
 ├─ 网盘管理.exe  wp-cli.exe  portable  docs/  README.md  图标/
 └─ 播放器运行时/
    ├─ libmpv-2.dll
-   ├─ libass-*.dll  libavcodec-*.dll  libavformat-*.dll  libavutil-*.dll
-   ├─ libavfilter-*.dll  libswresample-*.dll  libswscale-*.dll  libavdevice-*.dll
-   ├─ libplacebo-*.dll  libbluray-*.dll  libluajit-*.dll  libwinpthread-1.dll …
+   ├─ libass-*.dll  avcodec-*.dll  avformat-*.dll  avutil-*.dll
+   ├─ avfilter-*.dll  swresample-*.dll  swscale-*.dll  avdevice-*.dll
+   │   # ↑ Windows 版 FFmpeg 的 DLL 名没有 lib 前缀（如 avcodec-62.dll），
+   │   #   来自 build-prefix/ffmpeg/bin（stage 步骤显式拷贝）
+   ├─ libplacebo-*.dll  libbluray-*.dll  libluajit-*.dll  libwinpthread-1.dll（静态链接时可能无）…
    ├─ libEGL.dll  libGLESv2.dll  [d3dcompiler_47.dll]     # scripts/fetch-angle.ps1
    ├─ LICENSES/…            # 10 份第三方许可 + README（来源）
    ├─ BUILDINFO.txt  DEPENDENCIES.txt  LOAD-ORDER.txt  README.txt

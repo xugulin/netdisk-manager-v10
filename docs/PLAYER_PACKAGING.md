@@ -1,7 +1,10 @@
 # 播放器运行时打包与 LGPL 合规（M6）
 
-> 状态：**Linux 系统依赖模式已落地并本机实测生成**；Windows 为结构级脚本 + 文档（本机无 Windows，
-> PE/DLL 递归依赖需 Windows 构建机复核）；自包含模式已实现脚本路径、待 LGPL 依赖构建后启用。
+> 状态：**Linux 系统依赖模式已落地并本机实测生成**；**Windows 媒体栈（LGPL FFmpeg + libmpv-2.dll）
+> 已在 GitHub Actions `windows-latest` CI 上真实构建成功**（run 39197502500 / 39200091084 job1），
+> Windows 运行时打包在 CI 里通过 `-Strict` 校验（Errors=0）；PE 递归依赖/GL 真机项仍需目标 Windows 机器复核
+> （见 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md) §4.5/§5）；自包含模式已实现脚本路径、
+> Linux 侧待 LGPL 依赖构建后启用。
 >
 > 关联：任务 task-16（M6 打包合规）；构建来源 [build-media-stack-linux.sh](../scripts/build-media-stack-linux.sh)、
 > [build-media-stack-windows.ps1](../scripts/build-media-stack-windows.ps1)；
@@ -17,7 +20,7 @@
 | Linux 运行时打包 | ✅ `scripts/package-player-runtime-linux.sh` 实测通过（sha256/readelf/ldd/许可证全绿） |
 | Linux 依赖模式 | **系统依赖模式（system-deps）**：发行包只带 LGPL libmpv；FFmpeg/libass/libplacebo 等由用户系统提供，脚本输出 139 个 Arch 包名清单 |
 | 自包含模式 | 脚本已实现（拷依赖 .so + `patchelf --set-rpath '$ORIGIN'`）；当前 prebuilt 无语义依赖库 → **明确报错**，待 LGPL FFmpeg 等构建后启用 |
-| Windows 打包 | 结构级脚本 `scripts/package-player-runtime-windows.ps1`（DLL/ANGLE/许可证/加载顺序校验，不下载 DLL） |
+| Windows 打包 | ✅ CI 实测：`scripts/package-player-runtime-windows.ps1 -Generate -Check -Strict` 在 GitHub Actions `windows-latest` 通过（Errors=0；运行时 23 个 DLL、LICENSES 10 份） |
 | 许可材料 | ✅ `assets/licenses/`（10 份许可证文本 + 来源说明），打包脚本自动随包 |
 | 发布验收 | ✅ `scripts/release-verify-linux.sh` 实测 **PASS=22 FAIL=0**：随包 libmpv 真实加载 + 发布布局模拟 + 短播放断言（见 §8） |
 | LGPL 合规 | 动态链接 + 可替换 + 源码获取说明 + 许可证随包；GPL 可选构建单独说明（§6） |
@@ -42,7 +45,9 @@
 * 产物目录：`vendor/prebuilt/<平台>/`
   * Linux：`lib/libmpv.so.2.5.0`（SONAME `libmpv.so.2`）+ `include/mpv/*.h` + `lib/mpv.pc`
     + `licenses/{LICENSE.LGPL,LICENSE.GPL,Copyright}` + `BUILDINFO.txt`
-  * Windows：`lib/libmpv-2.dll`（待 Windows 构建机产出）
+  * Windows：`lib/libmpv-2.dll` + `include/mpv/*.h` + FFmpeg/MSYS2 运行时 DLL +
+    `licenses/{LICENSE.LGPL,COPYING.FFmpeg-LGPLv2.1,mpv-Copyright}` + `BUILDINFO.txt`
+    —— 由 `.github/workflows/player-windows.yml` 的 media-stack job 在 Windows runner 上真实构建产出
 * `BUILDINFO.txt` 记录：`built_at / mpv_version / builder / build_type / soname / size_bytes / sha256 /
   linked_deps（完整 ldd）/ meson summary`——打包脚本以其中的 `sha256` 作为校验基准。
 
@@ -189,9 +194,10 @@
 ├─ docs/  README.md
 └─ 播放器运行时/
    ├─ libmpv-2.dll              # 我们 vendored 的 LGPL libmpv（带 OpenGL render API）
-   ├─ libass-*.dll  libavcodec-*.dll  libavformat-*.dll  libavutil-*.dll
-   ├─ libavfilter-*.dll  libswresample-*.dll  libswscale-*.dll  libavdevice-*.dll
-   ├─ libplacebo-*.dll  libbluray-*.dll  libluajit-*.dll  libwinpthread-1.dll …
+   ├─ libass-*.dll  avcodec-*.dll  avformat-*.dll  avutil-*.dll
+   ├─ avfilter-*.dll  swresample-*.dll  swscale-*.dll  avdevice-*.dll
+   │   # ↑ Windows 版 FFmpeg 的 DLL 名没有 lib 前缀（avcodec-62.dll 等），来自自建 FFmpeg 的 bin/
+   ├─ libplacebo-*.dll  libbluray-*.dll  libluajit-*.dll  libwinpthread-1.dll（静态链接时可能无）…
    ├─ libEGL.dll  libGLESv2.dll  # ANGLE（BSD-3-Clause）；d3dcompiler_47.dll 可选
    ├─ LICENSES/…                # 同 Linux（含 ANGLE-BSD-3-Clause.txt）
    ├─ BUILDINFO.txt
@@ -244,6 +250,25 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-player-runtime-window
 W1 GL 上下文类型为 EGL/ANGLE；W2 render API 出帧；W3 `hwdec-current=d3d11va`；
 W4 4K HEVC 10bit 性能（丢帧<0.5%）；W5 HDR 行为记录；W6 无 ANGLE 可回退 WGL；W7 干净 Win10/11 可启动播放。
 详见 [PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md) §5。
+
+### 3.5 Windows CI 实测记录（GitHub Actions，2026-10-19）
+
+Windows 侧（本仓库无 Windows 机器）全部在 `windows-latest` 上实测，详细迭代见
+[PLAYER_WINDOWS_ANGLE.md](PLAYER_WINDOWS_ANGLE.md) §4.5.2。与本文件相关的打包要点：
+
+* **media-stack job 已真实构建成功**：MSYS2 UCRT64 源码构建 LGPL FFmpeg（`--disable-gpl/nonfree/version3`）
+  + mpv v0.41.0（`-Dgpl=false -Dlibmpv=true -Dcplayer=false`）→ `libmpv-2.dll`，
+  依赖 DLL 与许可证/BUILDINFO 一起进 `vendor/prebuilt/windows-x86_64/`（run 39197502500 起）；
+* **运行时打包在 CI 通过 Strict 校验**：`package-player-runtime-windows.ps1 -Generate -Check -Strict`
+  结果 `Errors=0`（23 个 DLL、LICENSES 10 份、ANGLE 就位；run 39200091084 job2 step 9）；
+* **三个 CI 专有坑（Windows 构建必看）**：
+  1. **构建目录必须纯 ASCII**（`build\windows-media-stack`）——meson 在中文构建目录下所有
+     编译器探测失败、`find_library('avrt')` 报错；
+  2. **MSYS2 安装位置**用 setup-msys2 的真实路径（MSYS2 shell `cygpath -w /` 记录），不要写死 `C:\msys64`；
+  3. **Windows 版 FFmpeg DLL 无 `lib` 前缀**（`avcodec-62.dll`），stage 必须从
+     `build-prefix/ffmpeg/bin/*.dll` 显式拷贝，校验通配符用 `*avcodec-*.dll`；
+* 新增 `build-media-stack-windows.ps1 -Preflight`（约 20 秒）：验证 cc / `-lavrt` /
+  最小 meson 项目 `find_library('avrt')`，CI 先跑它再决定是否进入 30 分钟构建。
 
 ---
 

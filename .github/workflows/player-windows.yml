@@ -225,14 +225,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $verifyArgs = @(
-            "-RuntimeDir", "出\网盘管理-win64\播放器运行时",
-            "-AppExe", "出\网盘管理-win64\网盘管理.exe",
-            "-OutJson", "出\验收日志\windows-verify-report.json",
-            "-SkipBuild"
-          )
+          # 注意：PowerShell 数组 splat（@array）是按位置传参，不会解析 -Name；
+          # 必须用哈希表 splat（@{ Name = ... }）才会绑定到命名参数。
+          $verifyArgs = @{
+            RuntimeDir = "出\网盘管理-win64\播放器运行时"
+            AppExe     = "出\网盘管理-win64\网盘管理.exe"
+            OutJson    = "出\验收日志\windows-verify-report.json"
+            SkipBuild  = $true
+          }
           $gl = "${{ github.event.inputs.run_gl_verify }}" -eq "true"
-          if (-not $gl) { $verifyArgs += "-SkipGl" }
+          if (-not $gl) { $verifyArgs.SkipGl = $true }
           ./scripts/windows-verify.ps1 @verifyArgs
           # 注：CI 无 GPU/样本时 W1/W3/W4/W5/W6 为 SKIP/WARN，W2/W7 应 PASS；FAIL 时 job 失败
 
