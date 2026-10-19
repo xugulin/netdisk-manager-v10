@@ -537,6 +537,11 @@ pub struct TransferTask {
 
 impl TransferTask {
     pub fn progress(&self) -> f32 {
+        // 已完成的任务永远显示 100%（含空目录/零字节文件：total 恒为 0 的情况，
+        // 否则会出现「进度 0% 但状态已完成」的误导性显示）。
+        if self.state == TaskState::Done {
+            return 1.0;
+        }
         if self.total == 0 {
             0.0
         } else {
@@ -547,6 +552,13 @@ impl TransferTask {
     pub fn progress_text(&self) -> String {
         let pct = self.progress() * 100.0;
         if self.total == 0 {
+            if self.state == TaskState::Done {
+                return if self.note.contains("空目录") {
+                    "100%（空目录）".into()
+                } else {
+                    "100%（0 B）".into()
+                };
+            }
             return format!("{pct:.0}%");
         }
         format!(
@@ -647,5 +659,64 @@ impl OpReport {
         } else {
             format!("成功 {} 项，失败 {} 项", self.ok, self.failed)
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn task(state: TaskState, total: u64, done: u64, note: &str) -> TransferTask {
+        TransferTask {
+            id: "t-test".into(),
+            kind: TaskKind::Download,
+            src_drive: "demo".into(),
+            dst_drive: String::new(),
+            src_path: "/空目录".into(),
+            dst_dir: String::new(),
+            local_path: String::new(),
+            file_name: "空目录".into(),
+            total,
+            done,
+            state,
+            error: String::new(),
+            retries: 0,
+            created: 0,
+            updated: 0,
+            speed: 0.0,
+            note: note.into(),
+        }
+    }
+
+    #[test]
+    fn done_task_with_zero_total_is_100_percent() {
+        // 空目录 / 零字节文件：total=0，修复前显示「0%」，修复后必须 100%。
+        let t = task(TaskState::Done, 0, 0, "空目录：0 个文件 / 0 个子目录");
+        assert_eq!(t.progress(), 1.0);
+        assert!(t.progress_text().contains("100%"));
+        assert!(t.progress_text().contains("空目录"));
+    }
+
+    #[test]
+    fn done_task_with_zero_bytes_file_is_100_percent() {
+        let t = task(TaskState::Done, 0, 0, "");
+        assert_eq!(t.progress(), 1.0);
+        assert!(t.progress_text().contains("100%"));
+        assert!(t.progress_text().contains("0 B"));
+    }
+
+    #[test]
+    fn running_task_with_zero_total_stays_zero() {
+        let t = task(TaskState::Running, 0, 0, "");
+        assert_eq!(t.progress(), 0.0);
+        assert_eq!(t.progress_text(), "0%");
+    }
+
+    #[test]
+    fn running_task_reports_fraction_and_done_is_always_full() {
+        let running = task(TaskState::Running, 100, 50, "");
+        assert!((running.progress() - 0.5).abs() < 1e-6);
+        let done = task(TaskState::Done, 100, 50, "");
+        assert_eq!(done.progress(), 1.0);
     }
 }

@@ -1566,11 +1566,15 @@ async fn prepare_total(
                 inner.set_note(
                     &ctx.id,
                     generation,
-                    format!(
-                        "目录上传：{} 个文件 / {} 个子目录",
-                        tree.files.len(),
-                        tree.dirs.len()
-                    ),
+                    if tree.files.is_empty() {
+                        format!("目录为空：0 个文件 / {} 个子目录", tree.dirs.len())
+                    } else {
+                        format!(
+                            "目录上传：{} 个文件 / {} 个子目录",
+                            tree.files.len(),
+                            tree.dirs.len()
+                        )
+                    },
                 );
                 tree.files.iter().map(|(_, _, size)| *size).sum()
             } else {
@@ -1593,11 +1597,15 @@ async fn prepare_total(
                 inner.set_note(
                     &ctx.id,
                     generation,
-                    format!(
-                        "目录下载：{} 个文件 / {} 个子目录",
-                        tree.files.len(),
-                        tree.dirs.len()
-                    ),
+                    if tree.files.is_empty() {
+                        format!("目录为空：0 个文件 / {} 个子目录", tree.dirs.len())
+                    } else {
+                        format!(
+                            "目录下载：{} 个文件 / {} 个子目录",
+                            tree.files.len(),
+                            tree.dirs.len()
+                        )
+                    },
                 );
                 tree_total(&tree.files)
             } else {
@@ -1620,11 +1628,15 @@ async fn prepare_total(
                 inner.set_note(
                     &ctx.id,
                     generation,
-                    format!(
-                        "跨盘目录复制：{} 个文件 / {} 个子目录",
-                        tree.files.len(),
-                        tree.dirs.len()
-                    ),
+                    if tree.files.is_empty() {
+                        format!("目录为空：0 个文件 / {} 个子目录", tree.dirs.len())
+                    } else {
+                        format!(
+                            "跨盘目录复制：{} 个文件 / {} 个子目录",
+                            tree.files.len(),
+                            tree.dirs.len()
+                        )
+                    },
                 );
                 tree_total(&tree.files)
             } else {
@@ -1710,6 +1722,23 @@ async fn upload_once(
             .await
             .map_err(ExecError::from_error)?;
     }
+    if tree.files.is_empty() {
+        inner.set_note(
+            &ctx.id,
+            generation,
+            format!(
+                "空目录：0 个文件 / {} 个子目录（已创建远端目录）",
+                tree.dirs.len()
+            ),
+        );
+        let _ = inner.update_progress(&ctx.id, generation, total, total, ProgressMode::Direct);
+        return Ok(ExecOutcome {
+            remote_name: Some(folder_name),
+            total: Some(total),
+            done: total,
+        });
+    }
+
     let mut base = 0u64;
     for (rel, path, size) in &tree.files {
         if ctx.control.is_stopped() {
@@ -1721,8 +1750,26 @@ async fn upload_once(
         } else {
             join_remote(&root, parent)
         };
+        let name = rel_name(rel);
+        let target_path = join_remote(&target_dir, name);
+        // 幂等：目录上传失败重试时，已存在且大小一致的远端文件直接跳过；
+        // 大小不同则先删再传（避免适配器自动改名成 a(1).txt 之类的副本）。
+        if let Ok(existing) = drive.stat(&target_path).await {
+            if !existing.is_dir && existing.size == *size {
+                base += *size;
+                let _ = inner.update_progress(
+                    &ctx.id,
+                    generation,
+                    base.min(total),
+                    total,
+                    ProgressMode::Direct,
+                );
+                continue;
+            }
+            let _ = drive.delete(&[target_path]).await;
+        }
         let opts = UploadOptions {
-            rename_to: Some(rel_name(rel).to_string()),
+            rename_to: Some(name.to_string()),
             chunk_size: 0,
             concurrency: 0,
             skip_guard: true,
@@ -1810,6 +1857,23 @@ async fn download_once(
             .await
             .map_err(|e| ExecError::Failed(Error::Io(e)))?;
     }
+    if tree.files.is_empty() {
+        inner.set_note(
+            &ctx.id,
+            generation,
+            format!(
+                "空目录：0 个文件 / {} 个子目录（已创建本地目录）",
+                tree.dirs.len()
+            ),
+        );
+        let _ = inner.update_progress(&ctx.id, generation, total, total, ProgressMode::Direct);
+        return Ok(ExecOutcome {
+            remote_name: None,
+            total: Some(total),
+            done: total,
+        });
+    }
+
     let mut base = 0u64;
     for (rel, size) in &tree.files {
         if ctx.control.is_stopped() {
@@ -1971,6 +2035,23 @@ async fn cross_copy_once(
             .await
             .map_err(ExecError::from_error)?;
     }
+    if tree.files.is_empty() {
+        inner.set_note(
+            &ctx.id,
+            generation,
+            format!(
+                "空目录：0 个文件 / {} 个子目录（已创建目标空目录）",
+                tree.dirs.len()
+            ),
+        );
+        let _ = inner.update_progress(&ctx.id, generation, total, total, ProgressMode::Direct);
+        return Ok(ExecOutcome {
+            remote_name: Some(folder_name),
+            total: Some(total),
+            done: total,
+        });
+    }
+
     let temp_root = ctx.cache_dir.join(format!("{}.dir", ctx.id));
     let _ = tokio::fs::remove_dir_all(&temp_root).await;
     tokio::fs::create_dir_all(&temp_root)
@@ -2023,8 +2104,26 @@ async fn cross_copy_once(
         } else {
             join_remote(&dst_root, parent)
         };
+        let name = rel_name(rel);
+        let target_path = join_remote(&target_dir, name);
+        // 幂等：跨盘目录重试时已存在且大小一致则跳过；大小不同先删后传。
+        if let Ok(existing) = dst.stat(&target_path).await {
+            if !existing.is_dir && existing.size == *size {
+                let _ = tokio::fs::remove_file(&temp).await;
+                base += *size;
+                let _ = inner.update_progress(
+                    &ctx.id,
+                    generation,
+                    base.min(total),
+                    total,
+                    ProgressMode::Direct,
+                );
+                continue;
+            }
+            let _ = dst.delete(&[target_path]).await;
+        }
         let opts = UploadOptions {
-            rename_to: Some(rel_name(rel).to_string()),
+            rename_to: Some(name.to_string()),
             chunk_size: 0,
             concurrency: 0,
             skip_guard: true,
@@ -2260,5 +2359,70 @@ mod dir_tests {
         let p = rel_to_path("中文 目录/sub/file.txt");
         assert!(p.ends_with("file.txt"));
         assert!(p.to_string_lossy().contains("中文 目录"));
+    }
+
+    /// 空目录上传：应标记 Done、进度 100%、备注明确「空目录」，并在远端建出目录树，
+    /// 而不是静默 Done(total=0) 让用户误以为传输丢了内容。
+    #[tokio::test]
+    async fn empty_dir_upload_is_done_with_note_and_creates_dirs() {
+        use crate::TransferEngine;
+        use wp_core::config::{DownloadConfig, TransferConfig};
+        use wp_core::model::TaskKind;
+
+        let base = std::env::temp_dir().join(format!("wp-engine-empty-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("空目录");
+        std::fs::create_dir_all(src.join("子空目录")).unwrap();
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let fake: std::sync::Arc<dyn Drive> = wp_drive::fake::create(wp_drive::DriveInit {
+            id: "demo".into(),
+            name: "演示网盘".into(),
+            data_dir: base.join("data"),
+            threads: 0,
+            verbose: false,
+        })
+        .expect("fake drive");
+        let mut engine = TransferEngine::new(EngineOptions {
+            transfer: TransferConfig::default(),
+            download: DownloadConfig::default(),
+            cache_dir: cache,
+            tasks_file: base.join("任务.json"),
+            download_dir: base.join("下载"),
+            keep_failed_temp: false,
+            guard: None,
+        });
+        engine.set_runtime(tokio::runtime::Handle::current());
+        engine.load();
+        let id = engine.enqueue_upload(fake.clone(), src.clone(), "/dst".to_string());
+        let mut finished = None;
+        for _ in 0..200 {
+            if let Some(t) = engine.tasks().into_iter().find(|t| t.id == id) {
+                if t.state.is_finished() {
+                    finished = Some(t);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let t = finished.expect("任务应在超时前结束");
+        assert_eq!(t.kind, TaskKind::Upload);
+        assert_eq!(t.state, TaskState::Done, "err={}", t.error);
+        assert_eq!(t.total, 0);
+        assert_eq!(t.progress(), 1.0);
+        assert!(t.note.contains("空目录"), "note={}", t.note);
+        // 远端目录树应真实创建（包括嵌套空目录）
+        let mut found = false;
+        for _ in 0..100 {
+            if let Ok(e) = fake.stat("/dst/空目录/子空目录").await {
+                if e.is_dir {
+                    found = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        assert!(found, "远端应创建 /dst/空目录/子空目录");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

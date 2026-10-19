@@ -197,24 +197,30 @@ fn row(
         egui::FontId::proportional(13.0),
         t.text,
     );
-    let sub = format!(
+    // 多账号场景下必须显示「源实例 → 目标实例」，否则看不出来是哪两个账号在传。
+    let route = match task.kind {
+        TaskKind::Upload => format!("本机 → {}", task.dst_drive),
+        TaskKind::Download => format!("{} → 本机", task.src_drive),
+        TaskKind::CrossCopy => format!("{} → {}", task.src_drive, task.dst_drive),
+    };
+    let mut sub = format!(
         "{} · {} · {}",
         kind_label,
-        if task.dst_drive.is_empty() {
-            &task.src_drive
-        } else {
-            &task.dst_drive
-        },
+        route,
         if task.src_path.is_empty() {
             &task.dst_dir
         } else {
             &task.src_path
         }
     );
+    // 备注（如「空目录：0 个文件…」）直接显示在副标题里，避免用户以为传输丢了内容。
+    if !task.note.is_empty() {
+        sub = format!("{sub} · {}", task.note);
+    }
     ui.painter().text(
         egui::pos2(x0 + 22.0, cy + 9.0),
         egui::Align2::LEFT_CENTER,
-        widgets::ellipsis(&sub, 60),
+        widgets::ellipsis(&sub, 76),
         egui::FontId::proportional(10.5),
         t.text_weak,
     );
@@ -241,6 +247,12 @@ fn row(
         egui::FontId::proportional(10.5),
         t.text_weak,
     );
+    if !task.note.is_empty() {
+        let note_rect =
+            egui::Rect::from_min_size(egui::pos2(x0 + 400.0, cy - 6.0), Vec2::new(220.0, 12.0));
+        ui.allocate_rect(note_rect, Sense::hover())
+            .on_hover_text(&task.note);
+    }
 
     // 速度
     ui.painter().text(
