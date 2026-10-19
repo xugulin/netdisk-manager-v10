@@ -41,6 +41,7 @@ impl TestEnv {
                 retry: 1,
                 retry_backoff_ms: 20,
                 adaptive: false,
+                instance_concurrency: std::collections::BTreeMap::new(),
                 max_speed_bps: 0,
             },
             download: DownloadConfig {

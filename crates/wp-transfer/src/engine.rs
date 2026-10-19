@@ -18,7 +18,7 @@ use wp_core::model::{
 use wp_core::Error;
 use wp_drive::Drive;
 
-use crate::control::{GateOutcome, GatePermit, GatePool, TaskControl};
+use crate::control::{GateOutcome, GatePermit, GatePool, InstancePermit, RunPermits, TaskControl};
 use crate::store;
 use crate::{EngineOptions, UploadGuardHook};
 
@@ -86,6 +86,9 @@ struct RunCtx {
     file_name: String,
     instance: String,
     dst_kind: DriveKind,
+    /// 源实例 id / 类型（下载、跨盘的源侧限流用）
+    src_instance: String,
+    src_kind: DriveKind,
     guard: Option<Arc<dyn UploadGuardHook>>,
     download: DownloadConfig,
     transfer: TransferConfig,
@@ -146,6 +149,8 @@ pub(crate) struct Inner {
     data: Mutex<Vec<TaskEntry>>,
     gates: Mutex<GatePool>,
     rt: Mutex<Option<Handle>>,
+    /// 限流冷却截止时间（实例 id → Instant）：127/频繁错误后该实例暂停新请求。
+    cooldowns: Mutex<std::collections::HashMap<String, Instant>>,
     dirty: AtomicBool,
     last_save: Mutex<Option<Instant>>,
     save_lock: Mutex<()>,
@@ -180,6 +185,7 @@ impl Inner {
             data: Mutex::new(Vec::new()),
             gates: Mutex::new(gates),
             rt: Mutex::new(None),
+            cooldowns: Mutex::new(std::collections::HashMap::new()),
             dirty: AtomicBool::new(false),
             last_save: Mutex::new(None),
             save_lock: Mutex::new(()),
@@ -484,6 +490,8 @@ impl Inner {
         let opts = lock(&self.opts);
         let dst_kind = dst.as_ref().map(|d| d.kind()).unwrap_or(DriveKind::Local);
         let instance = dst.as_ref().map(|d| d.id().to_string()).unwrap_or_default();
+        let src_kind = src.as_ref().map(|d| d.kind()).unwrap_or(DriveKind::Local);
+        let src_instance = src.as_ref().map(|d| d.id().to_string()).unwrap_or_default();
         Some(RunCtx {
             id: task.id.clone(),
             kind: task.kind,
@@ -496,6 +504,8 @@ impl Inner {
             file_name: task.file_name.clone(),
             instance,
             dst_kind,
+            src_instance,
+            src_kind,
             guard: opts.guard.clone(),
             download: opts.download.clone(),
             transfer: opts.transfer.clone(),
@@ -1013,13 +1023,55 @@ impl Inner {
         self.mark_dirty();
     }
 
+    /// 获取执行许可：先按「网盘实例」限流（防目录展开成 N 个任务打爆单盘），
+    /// 再取全局小/大文件闸门。实例按 id 排序获取，避免跨盘任务互相死锁。
     async fn acquire(
         &self,
         control: &Arc<TaskControl>,
         small: bool,
-    ) -> std::result::Result<GatePermit, AcquireError> {
+        instances: &[(String, usize)],
+    ) -> std::result::Result<RunPermits, AcquireError> {
+        let mut held: Vec<InstancePermit> = Vec::new();
+        for (key, limit) in instances {
+            loop {
+                if let Some(state) = stop_state(control) {
+                    let mut gates = lock(&self.gates);
+                    for p in held.drain(..) {
+                        gates.release_instance(&p.key, p.permit);
+                    }
+                    return Err(AcquireError::Stop(state));
+                }
+                let sem = lock(&self.gates).instance_sem(key, *limit);
+                let notified = control.notify.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    acquired = sem.acquire_owned() => {
+                        match acquired {
+                            Ok(permit) => {
+                                held.push(InstancePermit { key: key.clone(), permit });
+                                break;
+                            }
+                            Err(_) => {
+                                let mut gates = lock(&self.gates);
+                                for p in held.drain(..) {
+                                    gates.release_instance(&p.key, p.permit);
+                                }
+                                return Err(AcquireError::Closed);
+                            }
+                        }
+                    }
+                    _ = &mut notified => {
+                        continue;
+                    }
+                }
+            }
+        }
         loop {
             if let Some(state) = stop_state(control) {
+                let mut gates = lock(&self.gates);
+                for p in held.drain(..) {
+                    gates.release_instance(&p.key, p.permit);
+                }
                 return Err(AcquireError::Stop(state));
             }
             let sem = lock(&self.gates).sem(small);
@@ -1028,26 +1080,84 @@ impl Inner {
             tokio::select! {
                 acquired = sem.acquire_owned() => {
                     return match acquired {
-                        Ok(permit) => Ok(GatePermit { small, permit }),
-                        Err(_) => Err(AcquireError::Closed),
+                        Ok(permit) => Ok(RunPermits {
+                            gate: GatePermit { small, permit },
+                            instances: held,
+                        }),
+                        Err(_) => {
+                            let mut gates = lock(&self.gates);
+                            for p in held.drain(..) {
+                                gates.release_instance(&p.key, p.permit);
+                            }
+                            Err(AcquireError::Closed)
+                        }
                     };
                 }
                 _ = &mut notified => {
-                    // 暂停/取消/继续：回到循环顶部重新检查控制位。
                     continue;
                 }
             }
         }
     }
 
-    fn release_gate(&self, permit: GatePermit, outcome: GateOutcome, adaptive: bool) {
+    fn release_gate(&self, permits: RunPermits, outcome: GateOutcome, adaptive: bool) {
         let mut gates = lock(&self.gates);
         match outcome {
-            GateOutcome::Success => gates.note_success(permit.small, adaptive),
-            GateOutcome::Failure => gates.note_failure(permit.small, adaptive),
+            GateOutcome::Success => {
+                gates.note_success(permits.gate.small, adaptive);
+                for p in &permits.instances {
+                    gates.note_success_instance(&p.key, adaptive);
+                }
+            }
+            GateOutcome::Failure => {
+                gates.note_failure(permits.gate.small, adaptive);
+                for p in &permits.instances {
+                    gates.note_failure_instance(&p.key, adaptive);
+                }
+            }
             GateOutcome::Neutral => {}
         }
-        gates.release(permit.small, permit.permit);
+        gates.release(permits.gate.small, permits.gate.permit);
+        for p in permits.instances {
+            gates.release_instance(&p.key, p.permit);
+        }
+    }
+
+    /// 设置实例限流冷却（127/频繁错误后，同实例的新请求先等待）。
+    fn set_rate_limit_cooldown(&self, keys: &[String], wait_ms: u64) {
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        let mut cd = lock(&self.cooldowns);
+        for k in keys {
+            let e = cd.entry(k.clone()).or_insert(deadline);
+            if *e < deadline {
+                *e = deadline;
+            }
+        }
+    }
+
+    /// 等待本任务涉及实例的限流冷却结束（可被暂停/取消打断）。
+    async fn wait_rate_limit_cooldown(&self, ctx: &RunCtx) {
+        let keys: Vec<String> = instance_limits(ctx).into_iter().map(|(k, _)| k).collect();
+        if keys.is_empty() {
+            return;
+        }
+        loop {
+            let until = {
+                let cd = lock(&self.cooldowns);
+                keys.iter().filter_map(|k| cd.get(k).copied()).max()
+            };
+            let Some(until) = until else {
+                return;
+            };
+            let now = Instant::now();
+            if now >= until {
+                return;
+            }
+            let ms = until.duration_since(now).as_millis() as u64;
+            if sleep_with_control(&ctx.control, ms).await.is_some() {
+                return;
+            }
+        }
     }
 
     fn finish(&self, id: &str, generation: u64, outcome: Finish) -> bool {
@@ -1258,9 +1368,12 @@ async fn run_task(inner: Arc<Inner>, id: String, generation: u64) {
             return;
         }
 
-        // 2) 按大小获取并发许可（暂停/取消可打断等待）。
+        // 2) 按大小获取并发许可（全局闸门 + 网盘实例闸门；暂停/取消可打断等待）。
         let small = inner.is_small(total);
-        let permit = match inner.acquire(&ctx.control, small).await {
+        let permits = match inner
+            .acquire(&ctx.control, small, &instance_limits(&ctx))
+            .await
+        {
             Ok(permit) => permit,
             Err(AcquireError::Stop(state)) => {
                 inner.finish(&id, generation, Finish::State(state));
@@ -1275,13 +1388,15 @@ async fn run_task(inner: Arc<Inner>, id: String, generation: u64) {
                 return;
             }
         };
+        // 2.1) 若该实例刚被限流，先冷却（避免同一实例的任务一起撞墙）。
+        inner.wait_rate_limit_cooldown(&ctx).await;
         if let Some(state) = stop_state(&ctx.control) {
-            inner.release_gate(permit, GateOutcome::Neutral, adaptive);
+            inner.release_gate(permits, GateOutcome::Neutral, adaptive);
             inner.finish(&id, generation, Finish::State(state));
             return;
         }
         if !inner.begin_running(&id, generation) {
-            inner.release_gate(permit, GateOutcome::Neutral, adaptive);
+            inner.release_gate(permits, GateOutcome::Neutral, adaptive);
             return;
         }
         wp_core::log_info!(
@@ -1297,23 +1412,23 @@ async fn run_task(inner: Arc<Inner>, id: String, generation: u64) {
 
         // 执行期间可能被暂停/取消，或换代（resume/retry 重新调度）。
         if !inner.is_current(&id, generation) {
-            inner.release_gate(permit, GateOutcome::Neutral, adaptive);
+            inner.release_gate(permits, GateOutcome::Neutral, adaptive);
             return;
         }
         if let Some(state) = stop_state(&ctx.control) {
-            inner.release_gate(permit, GateOutcome::Neutral, adaptive);
+            inner.release_gate(permits, GateOutcome::Neutral, adaptive);
             inner.finish(&id, generation, Finish::State(state));
             return;
         }
 
         match result {
             Ok(outcome) => {
-                inner.release_gate(permit, GateOutcome::Success, adaptive);
+                inner.release_gate(permits, GateOutcome::Success, adaptive);
                 inner.finish(&id, generation, Finish::Done(outcome));
                 return;
             }
             Err(ExecError::Auth(e)) => {
-                inner.release_gate(permit, GateOutcome::Neutral, adaptive);
+                inner.release_gate(permits, GateOutcome::Neutral, adaptive);
                 inner.finish(
                     &id,
                     generation,
@@ -1322,12 +1437,12 @@ async fn run_task(inner: Arc<Inner>, id: String, generation: u64) {
                 return;
             }
             Err(ExecError::Canceled) => {
-                inner.release_gate(permit, GateOutcome::Neutral, adaptive);
+                inner.release_gate(permits, GateOutcome::Neutral, adaptive);
                 inner.finish(&id, generation, Finish::State(TaskState::Canceled));
                 return;
             }
             Err(ExecError::Failed(e)) => {
-                inner.release_gate(permit, GateOutcome::Failure, adaptive);
+                inner.release_gate(permits, GateOutcome::Failure, adaptive);
                 if !on_transfer_error(
                     &inner,
                     &ctx,
@@ -1373,10 +1488,31 @@ async fn on_transfer_error(
         inner.finish(&ctx.id, generation, Finish::State(TaskState::Canceled));
         return false;
     }
-    if *attempt < retry_limit {
+    let rate_limited = is_rate_limited(&error);
+    // 限流是瞬态拥塞：多给 3 次机会，并降低该实例并发+冷却，别和限流窗口硬碰。
+    let allowed_retries = retry_limit + if rate_limited { 3 } else { 0 };
+    if *attempt < allowed_retries {
         *attempt += 1;
+        let wait = if rate_limited {
+            let keys: Vec<String> = instance_limits(ctx).into_iter().map(|(k, _)| k).collect();
+            let w = backoff_ms(
+                backoff_base.saturating_mul(3).max(1_500),
+                attempt.saturating_sub(1),
+            )
+            .min(30_000);
+            inner.set_rate_limit_cooldown(&keys, w);
+            wp_core::log_warn!(
+                "传输",
+                "任务 {} 触发限流，实例冷却 {}ms 并降低并发后重试：{}",
+                ctx.id,
+                w,
+                error
+            );
+            w
+        } else {
+            backoff_ms(backoff_base, attempt.saturating_sub(1))
+        };
         inner.record_retry(&ctx.id, generation, *attempt, &error.to_string());
-        let wait = backoff_ms(backoff_base, attempt.saturating_sub(1));
         wp_core::log_warn!(
             "传输",
             "任务 {} 第 {} 次重试（等待 {}ms）：{}",
@@ -1984,6 +2120,10 @@ async fn cross_copy_once(
         .map_err(ExecError::from_error)?;
 
     if !entry.is_dir {
+        // 目标目录先行创建：目标只读/空间超限时立刻报可读错误，**避免白下载源文件**。
+        dst.ensure_dir(&ctx.dst_dir)
+            .await
+            .map_err(|e| ExecError::from_error(readable_write_error(e)))?;
         // 上次失败保留了完整中转文件时，跳过重复下载。
         let already = total > 0
             && std::fs::metadata(&ctx.local)
@@ -2032,7 +2172,7 @@ async fn cross_copy_once(
         let uploaded = dst
             .upload(&ctx.local, &ctx.dst_dir, &opts, progress)
             .await
-            .map_err(ExecError::from_error)?;
+            .map_err(|e| ExecError::from_error(readable_write_error(e)))?;
         return Ok(ExecOutcome {
             remote_name: if uploaded.name.is_empty() {
                 None
@@ -2052,7 +2192,7 @@ async fn cross_copy_once(
     let dst_root = join_remote(&ctx.dst_dir, &folder_name);
     dst.ensure_dir(&dst_root)
         .await
-        .map_err(ExecError::from_error)?;
+        .map_err(|e| ExecError::from_error(readable_write_error(e)))?;
     for rel in &tree.dirs {
         if ctx.control.is_stopped() {
             return Err(ExecError::Canceled);
@@ -2222,6 +2362,94 @@ fn can_run(entry: &TaskEntry) -> bool {
     can_run_parts(entry.task.kind, entry.src.is_some(), entry.dst.is_some())
 }
 
+/// 按网盘类型的安全默认实例并发（目录展开成 N 个任务后防止打爆单盘限流）。
+fn default_instance_concurrency(kind: DriveKind) -> usize {
+    match kind {
+        DriveKind::Guangya => 2,
+        DriveKind::Baidu => 4,
+        DriveKind::Quark => 4,
+        DriveKind::Local | DriveKind::Fake => 16,
+    }
+}
+
+/// 某实例的有效并发上限：配置覆盖 > 网盘类型默认；夹在 1..=64。
+fn effective_instance_limit(transfer: &TransferConfig, instance: &str, kind: DriveKind) -> usize {
+    transfer
+        .instance_concurrency
+        .get(instance)
+        .copied()
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| default_instance_concurrency(kind))
+        .clamp(1, 64)
+}
+
+/// 是否是「被限流/操作过于频繁」类错误（需要降并发 + 长冷却，而不是普通快速重试）。
+fn is_rate_limited(error: &Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("127")
+        || text.contains("过于频繁")
+        || text.contains("频繁")
+        || text.contains("too frequent")
+        || text.contains("limiter")
+        || text.contains("rate limit")
+}
+
+/// 该任务的实例限流键与上限（跨盘同时限源+目标，按 id 排序避免死锁）。
+fn instance_limits(ctx: &RunCtx) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    match ctx.kind {
+        TaskKind::Download => {
+            if !ctx.src_instance.is_empty() {
+                out.push((
+                    ctx.src_instance.clone(),
+                    effective_instance_limit(&ctx.transfer, &ctx.src_instance, ctx.src_kind),
+                ));
+            }
+        }
+        TaskKind::Upload => {
+            if !ctx.instance.is_empty() {
+                out.push((
+                    ctx.instance.clone(),
+                    effective_instance_limit(&ctx.transfer, &ctx.instance, ctx.dst_kind),
+                ));
+            }
+        }
+        TaskKind::CrossCopy => {
+            if !ctx.src_instance.is_empty() {
+                out.push((
+                    ctx.src_instance.clone(),
+                    effective_instance_limit(&ctx.transfer, &ctx.src_instance, ctx.src_kind),
+                ));
+            }
+            if !ctx.instance.is_empty() && ctx.instance != ctx.src_instance {
+                out.push((
+                    ctx.instance.clone(),
+                    effective_instance_limit(&ctx.transfer, &ctx.instance, ctx.dst_kind),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+/// 目标不可写（只读/空间超限）时转成可读的认证类错误：不重试并提示重新登录。
+fn readable_write_error(e: Error) -> Error {
+    let text = e.to_string();
+    if text.contains("只读")
+        || text.contains("-6")
+        || text.contains("空间")
+        || text.contains("未登录")
+    {
+        Error::Auth(format!(
+            "目标账号只读或空间超限，无法写入（{text}）；请重新登录该网盘或清理/扩容空间"
+        ))
+    } else {
+        e
+    }
+}
+
 fn backoff_ms(base: u64, retry_index: u32) -> u64 {
     let factor = 1u64 << retry_index.min(20);
     base.saturating_mul(factor).min(MAX_BACKOFF_MS)
@@ -2324,6 +2552,28 @@ mod dir_tests {
         std::fs::write(root.join("sub1").join("b.txt"), vec![1u8; 100]).unwrap();
         std::fs::write(root.join("sub1").join("sub2").join("c.bin"), vec![2u8; 200]).unwrap();
         root
+    }
+
+    #[test]
+    fn rate_limit_and_instance_limits() {
+        assert!(is_rate_limited(&Error::server(127, "操作过于频繁")));
+        assert!(is_rate_limited(&Error::server(
+            429,
+            "too frequent requests"
+        )));
+        assert!(!is_rate_limited(&Error::NotFound("文件不存在".into())));
+        assert_eq!(default_instance_concurrency(DriveKind::Guangya), 2);
+        assert_eq!(default_instance_concurrency(DriveKind::Baidu), 4);
+        assert_eq!(default_instance_concurrency(DriveKind::Quark), 4);
+        assert_eq!(default_instance_concurrency(DriveKind::Local), 16);
+        let mut cfg = TransferConfig::default();
+        cfg.instance_concurrency.insert("guangya".to_string(), 1);
+        assert_eq!(
+            effective_instance_limit(&cfg, "guangya", DriveKind::Guangya),
+            1
+        );
+        // 缺省回落到网盘类型安全默认
+        assert_eq!(effective_instance_limit(&cfg, "baidu", DriveKind::Baidu), 4);
     }
 
     #[test]

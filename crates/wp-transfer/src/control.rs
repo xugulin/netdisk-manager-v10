@@ -67,11 +67,13 @@ impl TaskControl {
     }
 }
 
-/// 并发闸门池：小文件 / 大文件各一套信号量。
+/// 并发闸门池：小文件 / 大文件各一套信号量，另有按网盘实例的信号量。
 pub(crate) struct GatePool {
     threshold: u64,
     small: Gate,
     large: Gate,
+    /// 网盘实例级闸门（实例 id → Gate）：避免目录展开成 N 个任务后打爆单盘限流。
+    instances: std::collections::HashMap<String, Gate>,
 }
 
 struct Gate {
@@ -171,6 +173,7 @@ impl GatePool {
             threshold: cfg.small_file_threshold,
             small: Gate::new(cfg.small_file_concurrency),
             large: Gate::new(cfg.large_file_concurrency),
+            instances: std::collections::HashMap::new(),
         }
     }
 
@@ -215,6 +218,94 @@ impl GatePool {
         } else {
             self.large.release(permit);
         }
+    }
+
+    // ── 网盘实例级闸门（限流根治疗）─────────────
+
+    /// 取某实例的信号量；首次出现时按 `limit` 建 Gate（≤64）。
+    pub(crate) fn instance_sem(&mut self, key: &str, limit: usize) -> Arc<Semaphore> {
+        self.instances
+            .entry(key.to_string())
+            .or_insert_with(|| Gate::new(limit))
+            .sem
+            .clone()
+    }
+
+    pub(crate) fn note_success_instance(&mut self, key: &str, adaptive: bool) {
+        if let Some(g) = self.instances.get_mut(key) {
+            g.note_success(adaptive);
+        }
+    }
+
+    pub(crate) fn note_failure_instance(&mut self, key: &str, adaptive: bool) {
+        if let Some(g) = self.instances.get_mut(key) {
+            g.note_failure(adaptive);
+        }
+    }
+
+    pub(crate) fn release_instance(&mut self, key: &str, permit: OwnedSemaphorePermit) {
+        if let Some(g) = self.instances.get_mut(key) {
+            g.release(permit);
+        } else {
+            drop(permit);
+        }
+    }
+}
+
+/// 一次已获取的实例级许可（记录 key 以便归还到正确闸门）。
+pub(crate) struct InstancePermit {
+    pub(crate) key: String,
+    pub(crate) permit: OwnedSemaphorePermit,
+}
+
+/// 一次任务执行持有的全部许可：全局小/大闸门 + 0..N 个实例闸门。
+pub(crate) struct RunPermits {
+    pub(crate) gate: GatePermit,
+    pub(crate) instances: Vec<InstancePermit>,
+}
+
+#[cfg(test)]
+mod instance_gate_tests {
+    use super::*;
+
+    #[test]
+    fn instance_gate_reduces_on_failure_and_recovers() {
+        let cfg = TransferConfig::default();
+        let mut pool = GatePool::new(&cfg);
+        let key = "guangya";
+        let sem = pool.instance_sem(key, 2);
+        assert_eq!(sem.available_permits(), 2);
+
+        // 失败降并发：释放两个许可后 pending_reduce 生效，有效上限降到 1
+        let p1 = sem.clone().try_acquire_owned().unwrap();
+        let p2 = sem.clone().try_acquire_owned().unwrap();
+        pool.note_failure_instance(key, true);
+        pool.release_instance(key, p1);
+        pool.release_instance(key, p2);
+        assert_eq!(sem.available_permits(), 1, "失败后实例上限应降到 1");
+
+        // 连续成功 4 次回升 1 个许可
+        for _ in 0..4 {
+            let p = sem.clone().try_acquire_owned().unwrap();
+            pool.note_success_instance(key, true);
+            pool.release_instance(key, p);
+        }
+        assert_eq!(sem.available_permits(), 2, "稳定成功后应回升到 2");
+    }
+
+    #[test]
+    fn instance_gate_isolated_per_instance() {
+        let cfg = TransferConfig::default();
+        let mut pool = GatePool::new(&cfg);
+        let g = pool.instance_sem("guangya", 2);
+        let q = pool.instance_sem("quark", 4);
+        assert_eq!(g.available_permits(), 2);
+        assert_eq!(q.available_permits(), 4);
+        let p = g.clone().try_acquire_owned().unwrap();
+        pool.note_failure_instance("guangya", true);
+        pool.release_instance("guangya", p);
+        assert_eq!(g.available_permits(), 1, "光鸭降并发不影响夸克");
+        assert_eq!(q.available_permits(), 4);
     }
 }
 

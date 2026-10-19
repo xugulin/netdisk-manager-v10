@@ -65,6 +65,9 @@ pub struct TransferConfig {
     pub retry_backoff_ms: u64,
     /// 自适应并发：出错时降并发、稳定时回升
     pub adaptive: bool,
+    /// 按实例覆盖并发上限（实例 id → 最大并发；缺省用网盘类型安全默认）
+    #[serde(default)]
+    pub instance_concurrency: std::collections::BTreeMap<String, usize>,
     /// 全局限速（字节/秒，0 = 不限）
     pub max_speed_bps: u64,
 }
@@ -78,6 +81,7 @@ impl Default for TransferConfig {
             retry: 3,
             retry_backoff_ms: 1500,
             adaptive: true,
+            instance_concurrency: std::collections::BTreeMap::new(),
             max_speed_bps: 0,
         }
     }
