@@ -1399,6 +1399,32 @@ async fn on_transfer_error(
     false
 }
 
+/// 供 GUI 入队前预扫描的本地目录结果（公开 API 的中间结构）。
+pub(crate) fn scan_local_for_task(
+    root: &Path,
+) -> wp_core::Result<(Vec<String>, Vec<(String, PathBuf, u64)>)> {
+    walk_local_tree(root)
+        .map(|t| (t.dirs, t.files))
+        .map_err(|e| match e {
+            ExecError::Failed(er) | ExecError::Auth(er) => er,
+            ExecError::Canceled => Error::other("扫描本地目录已取消"),
+        })
+}
+
+/// 供 GUI 入队前预扫描的远端目录结果。
+pub(crate) async fn scan_remote_for_task(
+    drive: &Arc<dyn Drive>,
+    root: &str,
+) -> wp_core::Result<(Vec<String>, Vec<(String, u64)>)> {
+    walk_remote_tree(drive, root)
+        .await
+        .map(|t| (t.dirs, t.files))
+        .map_err(|e| match e {
+            ExecError::Failed(er) | ExecError::Auth(er) => er,
+            ExecError::Canceled => Error::other("扫描远端目录已取消"),
+        })
+}
+
 /// 本地目录递归扫描结果。
 struct LocalTree {
     /// 子目录相对路径（`a/b`，按字典序）
@@ -2359,6 +2385,60 @@ mod dir_tests {
         let p = rel_to_path("中文 目录/sub/file.txt");
         assert!(p.ends_with("file.txt"));
         assert!(p.to_string_lossy().contains("中文 目录"));
+    }
+
+    #[test]
+    fn scan_local_dir_returns_relative_tree() {
+        use crate::scan_local_dir;
+        let root = temp_tree("scan-api");
+        let scan = scan_local_dir(&root).expect("扫描本地目录");
+        let files: Vec<(String, u64)> = scan
+            .files
+            .iter()
+            .map(|(rel, _, size)| (rel.clone(), *size))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("a.txt".to_string(), 5),
+                ("sub1/b.txt".to_string(), 100),
+                ("sub1/sub2/c.bin".to_string(), 200),
+            ]
+        );
+        assert!(scan.dirs.iter().any(|d| d == "empty_dir"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn scan_remote_dir_via_fake_drive() {
+        let base = std::env::temp_dir().join(format!("wp-scan-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let fake: std::sync::Arc<dyn Drive> = wp_drive::fake::create(wp_drive::DriveInit {
+            id: "demo".into(),
+            name: "演示网盘".into(),
+            data_dir: base.join("data"),
+            threads: 0,
+            verbose: false,
+        })
+        .expect("fake drive");
+        let scan = crate::scan_remote_dir(&fake, "/")
+            .await
+            .expect("扫描演示网盘");
+        assert!(!scan.files.is_empty(), "演示网盘根目录应有文件");
+        assert!(
+            scan.files.iter().any(|(rel, _)| rel.contains('/')),
+            "应有嵌套文件：{:?}",
+            scan.files
+                .iter()
+                .map(|(r, _)| r.clone())
+                .collect::<Vec<_>>()
+        );
+        // 再扫一个具体目录：/影视 下应有文件
+        let scan = crate::scan_remote_dir(&fake, "/影视")
+            .await
+            .expect("扫描 /影视");
+        assert!(!scan.files.is_empty(), "/影视 下应有文件");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 空目录上传：应标记 Done、进度 100%、备注明确「空目录」，并在远端建出目录树，

@@ -37,6 +37,37 @@ pub trait UploadGuardHook: Send + Sync {
     fn precheck(&self, instance: &str, kind: DriveKind, name: &str) -> (GuardDecision, String);
 }
 
+/// 远端目录预扫描结果（相对路径）。
+///
+/// GUI 在入队前先用它遍历源目录，按「一个文件一个任务」展开（对齐 V8 的
+/// `遍历适配器 → 逐文件建任务` 设计）；空目录不建任何任务，而是明确提示。
+#[derive(Debug, Clone, Default)]
+pub struct DirScan {
+    /// 子目录相对路径（`a/b`）。
+    pub dirs: Vec<String>,
+    /// 文件：(相对路径, 大小)
+    pub files: Vec<(String, u64)>,
+}
+
+/// 本地目录预扫描结果（相对路径 + 绝对路径）。
+#[derive(Debug, Clone, Default)]
+pub struct LocalDirScan {
+    pub dirs: Vec<String>,
+    pub files: Vec<(String, std::path::PathBuf, u64)>,
+}
+
+/// 递归扫描本地目录（GUI「上传文件夹」预扫描用）。
+pub fn scan_local_dir(root: &Path) -> wp_core::Result<LocalDirScan> {
+    let (dirs, files) = engine::scan_local_for_task(root)?;
+    Ok(LocalDirScan { dirs, files })
+}
+
+/// 递归扫描远端目录（GUI 目录下载/跨盘预扫描用）。
+pub async fn scan_remote_dir(drive: &Arc<dyn Drive>, root: &str) -> wp_core::Result<DirScan> {
+    let (dirs, files) = engine::scan_remote_for_task(drive, root).await?;
+    Ok(DirScan { dirs, files })
+}
+
 /// 引擎构造参数。
 #[derive(Clone)]
 pub struct EngineOptions {

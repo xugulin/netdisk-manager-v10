@@ -172,6 +172,48 @@ pub struct Toast {
 }
 
 /// 异步操作回传事件。
+/// 目录预扫描后的逐文件任务计划（对齐 V8：先遍历目录，再按文件建任务）。
+#[derive(Debug, Clone, Default)]
+pub struct DirPlan {
+    pub files: Vec<PlannedFile>,
+    /// 空子目录相对路径（下载时补建本地目录 / 上传时补建远端目录）
+    pub dirs: Vec<String>,
+}
+
+/// 计划里的一个文件。
+#[derive(Debug, Clone)]
+pub struct PlannedFile {
+    /// 下载/跨盘 = 远端文件路径；上传 = 本地文件绝对路径
+    pub source: String,
+    /// 下载 = 本地落点路径
+    pub local: PathBuf,
+    /// 上传/跨盘 = 目标远端目录
+    pub dst_dir: String,
+    pub size: u64,
+}
+
+/// 目录任务展开的操作类型。
+#[derive(Debug, Clone)]
+pub enum DirPlanOp {
+    Download,
+    CrossCopy { dst_drive: String },
+}
+
+fn rel_path(rel: &str) -> PathBuf {
+    rel.split('/').fold(PathBuf::new(), |p, s| p.join(s))
+}
+
+fn remote_join(base: &str, rel: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if rel.is_empty() {
+        base.to_string()
+    } else if base.is_empty() {
+        format!("/{rel}")
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
 pub enum Event {
     Listed {
         drive: String,
@@ -194,6 +236,19 @@ pub enum Event {
     LoggedIn {
         drive: String,
         result: Result<AccountInfo, wp_core::Error>,
+    },
+    /// 目录预扫描完成：把目录展开成逐文件任务；空目录不建任务，只提示。
+    DirPlanReady {
+        op: DirPlanOp,
+        drive: String,
+        folder: String,
+        result: Result<DirPlan, wp_core::Error>,
+    },
+    /// 后台补建空目录完成（仅记日志，不打扰用户）。
+    DirsEnsured {
+        drive: String,
+        count: usize,
+        error: Option<String>,
     },
     LoggedOut {
         drive: String,
@@ -814,6 +869,48 @@ impl App {
             app.player.force_hls_bandwidth_hint_for_demo();
             wp_core::log_info!("播放器", "验收：注入 HLS 带宽不足提示（WP_DEMO_HLS_HINT）");
         }
+        // 验收钩子：WP_DEMO_DOWNLOAD_DIR=<0|1>:<远端目录路径> → 模拟「勾选目录→下载」，
+        // 用于无头验证「目录预扫描 → 逐文件任务 / 空目录不建任务」。
+        if let Ok(spec) = std::env::var("WP_DEMO_DOWNLOAD_DIR") {
+            if let Some((isdir, path)) = spec.split_once(':') {
+                let name = path
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("目录")
+                    .to_string();
+                let entry = if isdir.trim() == "1" {
+                    RemoteEntry::dir(&name, path)
+                } else {
+                    RemoteEntry::file(&name, path, 0)
+                };
+                wp_core::log_info!(
+                    "界面",
+                    "验收：模拟下载选择 {}（is_dir={}）",
+                    path,
+                    entry.is_dir
+                );
+                app.enqueue_download_entries(&[entry]);
+            }
+        }
+        // 验收钩子：WP_DEMO_UPLOAD_FOLDER=<本地目录> → 模拟「上传文件夹」选择。
+        if let Ok(folder) = std::env::var("WP_DEMO_UPLOAD_FOLDER") {
+            wp_core::log_info!("界面", "验收：模拟上传文件夹选择 {folder}");
+            app.enqueue_upload_folder(PathBuf::from(folder));
+        }
+        // 验收钩子：WP_DEMO_CROSSCOPY_DIR=<源路径>|<目标实例id>|<目标目录>
+        if let Ok(spec) = std::env::var("WP_DEMO_CROSSCOPY_DIR") {
+            let parts: Vec<&str> = spec.split('|').collect();
+            if parts.len() == 3 {
+                wp_core::log_info!("界面", "验收：模拟跨盘目录选择 {}", parts[0]);
+                app.enqueue_cross_copy_split(
+                    Vec::new(),
+                    vec![parts[0].to_string()],
+                    parts[1],
+                    parts[2],
+                );
+            }
+        }
         if std::env::var("WP_DEMO_HLS_TIMEOUT").is_ok() && app.page == Page::Player {
             app.player.force_hls_timeout_hint_for_demo();
             wp_core::log_info!(
@@ -1228,36 +1325,186 @@ impl App {
         self.page = Page::Transfers;
     }
 
+    /// 上传本地文件夹：本地同步遍历（快），按文件展开成独立上传任务；
+    /// 空目录不建任务并明确提示，空子目录异步补建到远端。
+    pub fn enqueue_upload_folder(&mut self, path: PathBuf) {
+        let Some(drive) = self.active_drive() else {
+            self.toast(ToastKind::Error, "当前网盘不可用");
+            return;
+        };
+        let drive_id = self.active_drive_id();
+        let dst_root = self
+            .active_browse()
+            .map(|s| s.path.clone())
+            .unwrap_or_else(|| "/".into());
+        let folder = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "文件夹".into());
+        match wp_transfer::scan_local_dir(&path) {
+            Err(e) => self.toast(ToastKind::Error, format!("扫描本地文件夹失败：{e}")),
+            Ok(scan) if scan.files.is_empty() => {
+                let inst = self
+                    .slot_by_id(&drive_id)
+                    .map(|s| s.display().to_string())
+                    .unwrap_or_else(|| drive_id.clone());
+                self.toast(
+                    ToastKind::Warn,
+                    format!(
+                        "本地文件夹「{folder}」为空：0 个文件 / {} 个子目录，未创建任务（目标实例：{inst}）",
+                        scan.dirs.len()
+                    ),
+                );
+            }
+            Ok(scan) => {
+                let target_root = remote_join(&dst_root, &folder);
+                let mut n = 0usize;
+                for (rel, local, _size) in &scan.files {
+                    let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                    let dst_dir = if parent.is_empty() {
+                        target_root.clone()
+                    } else {
+                        remote_join(&target_root, parent)
+                    };
+                    self.transfer
+                        .enqueue_upload(drive.clone(), local.clone(), dst_dir);
+                    n += 1;
+                }
+                // 空子目录：后台补建（含目标根），保留目录结构。
+                let mut dirs_to_make = vec![target_root.clone()];
+                for d in &scan.dirs {
+                    dirs_to_make.push(remote_join(&target_root, d));
+                }
+                let count = dirs_to_make.len();
+                let drive2 = drive.clone();
+                let did = drive_id.clone();
+                self.spawn(async move {
+                    let mut error: Option<String> = None;
+                    for d in dirs_to_make {
+                        if let Err(e) = drive2.ensure_dir(&d).await {
+                            error = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    Event::DirsEnsured {
+                        drive: did,
+                        count,
+                        error,
+                    }
+                });
+                self.toast(
+                    ToastKind::Success,
+                    format!("已加入上传队列：{n} 个文件（文件夹「{folder}」）"),
+                );
+                self.page = Page::Transfers;
+            }
+        }
+    }
+
     pub fn enqueue_download_entries(&mut self, entries: &[RemoteEntry]) {
         let Some(drive) = self.active_drive() else {
             return;
         };
+        let drive_id = self.active_drive_id();
+        let download_dir = self.download_dir();
         let mut files = 0usize;
-        let mut dirs = 0usize;
-        for e in entries {
-            // 目录也支持：引擎递归下载并保持多重嵌套目录结构
-            if e.is_dir {
-                dirs += 1;
-            } else {
-                files += 1;
-            }
+        for e in entries.iter().filter(|e| !e.is_dir) {
             self.transfer
                 .enqueue_download(drive.clone(), e.path.clone(), None);
+            files += 1;
         }
-        if files + dirs > 0 {
-            let mut msg = format!("已加入下载队列：{files} 个文件");
-            if dirs > 0 {
-                msg.push_str(&format!(" + {dirs} 个目录（递归下载）"));
+        // 目录：先异步遍历源目录（像 V8 那样），再按文件展开成独立任务；
+        // 空目录不建任务，明确提示（避免「假完成 0%」）。
+        let dirs: Vec<RemoteEntry> = entries.iter().filter(|e| e.is_dir).cloned().collect();
+        if !dirs.is_empty() {
+            self.toast(
+                ToastKind::Info,
+                format!("正在扫描 {} 个目录（预扫描后按文件建任务）…", dirs.len()),
+            );
+            for e in dirs {
+                let drive = drive.clone();
+                let did = drive_id.clone();
+                let folder = e.name.clone();
+                let root = e.path.clone();
+                let base = download_dir.join(&e.name);
+                self.spawn(async move {
+                    let result = wp_transfer::scan_remote_dir(&drive, &root)
+                        .await
+                        .map(|scan| {
+                            if !scan.files.is_empty() {
+                                let _ = std::fs::create_dir_all(&base);
+                                for d in &scan.dirs {
+                                    let _ = std::fs::create_dir_all(base.join(rel_path(d)));
+                                }
+                            }
+                            DirPlan {
+                                dirs: scan.dirs,
+                                files: scan
+                                    .files
+                                    .iter()
+                                    .map(|(rel, size)| PlannedFile {
+                                        source: remote_join(&root, rel),
+                                        local: base.join(rel_path(rel)),
+                                        dst_dir: String::new(),
+                                        size: *size,
+                                    })
+                                    .collect(),
+                            }
+                        });
+                    Event::DirPlanReady {
+                        op: DirPlanOp::Download,
+                        drive: did,
+                        folder,
+                        result,
+                    }
+                });
             }
-            self.toast(ToastKind::Success, msg);
+        }
+        if files > 0 {
+            self.toast(
+                ToastKind::Success,
+                format!("已加入下载队列：{files} 个文件"),
+            );
             self.page = Page::Transfers;
         }
     }
 
     pub fn enqueue_cross_copy(&mut self, src_paths: &[String], dst_drive_id: &str, dst_dir: &str) {
+        let src_id = self.active_drive_id();
+        // 从当前浏览列表判断选中项是文件还是目录（选中项都来自当前目录）。
+        let entries: Vec<RemoteEntry> = self
+            .browse_ref(&src_id)
+            .map(|b| b.entries.to_vec())
+            .unwrap_or_default();
+        let mut files: Vec<String> = Vec::new();
+        let mut dirs: Vec<String> = Vec::new();
+        for p in src_paths {
+            match entries.iter().find(|e| &e.path == p).map(|e| e.is_dir) {
+                Some(true) => dirs.push(p.clone()),
+                Some(false) => files.push(p.clone()),
+                None => {
+                    self.toast(
+                        ToastKind::Warn,
+                        format!("条目「{p}」不在当前列表中，已跳过（请刷新后重试）"),
+                    );
+                }
+            }
+        }
+        self.enqueue_cross_copy_split(files, dirs, dst_drive_id, dst_dir);
+    }
+
+    /// 跨盘复制：已区分好的文件 / 目录清单（GUI 选择与验收钩子共用）。
+    fn enqueue_cross_copy_split(
+        &mut self,
+        files: Vec<String>,
+        dirs: Vec<String>,
+        dst_drive_id: &str,
+        dst_dir: &str,
+    ) {
         let Some(src) = self.active_drive() else {
             return;
         };
+        let src_id = self.active_drive_id();
         let Some(dst_slot) = self.slot_by_id(dst_drive_id) else {
             self.toast(ToastKind::Error, "目标网盘不存在");
             return;
@@ -1266,8 +1513,8 @@ impl App {
             self.toast(ToastKind::Error, "目标网盘不可用");
             return;
         };
-        let mut n = 0;
-        for p in src_paths {
+        let mut n = 0usize;
+        for p in &files {
             self.transfer.enqueue_cross_copy(
                 src.clone(),
                 p.clone(),
@@ -1276,11 +1523,90 @@ impl App {
             );
             n += 1;
         }
-        self.toast(
-            ToastKind::Success,
-            format!("已加入跨盘传输队列：{n} 项 → {dst_dir}"),
-        );
-        self.page = Page::Transfers;
+        if !files.is_empty() {
+            self.toast(
+                ToastKind::Success,
+                format!("已加入跨盘传输队列：{n} 个文件 → {dst_dir}"),
+            );
+            self.page = Page::Transfers;
+        }
+        if !dirs.is_empty() {
+            self.toast(
+                ToastKind::Info,
+                format!("正在扫描 {} 个目录（预扫描后按文件建任务）…", dirs.len()),
+            );
+            for p in dirs {
+                let src = src.clone();
+                let dst = dst.clone();
+                let did = src_id.clone();
+                let dst_id = dst_drive_id.to_string();
+                let dst_root = dst_dir.to_string();
+                let folder = p.rsplit('/').next().unwrap_or(&p).to_string();
+                self.spawn(async move {
+                    let result = match wp_transfer::scan_remote_dir(&src, &p).await {
+                        Err(e) => Err(e),
+                        Ok(scan) => {
+                            if scan.files.is_empty() {
+                                // 空目录：不建文件任务、目标端也不做多余创建。
+                                Ok(DirPlan {
+                                    dirs: scan.dirs,
+                                    files: Vec::new(),
+                                })
+                            } else {
+                                let target_root = remote_join(&dst_root, &folder);
+                                let mut dirs_to_make = vec![target_root.clone()];
+                                for d in &scan.dirs {
+                                    dirs_to_make.push(remote_join(&target_root, d));
+                                }
+                                // 先在目标端建目录树（含空子目录）；失败则整个目录任务报错
+                                let mut ensure_err = None;
+                                for d in &dirs_to_make {
+                                    if let Err(e) = dst.ensure_dir(d).await {
+                                        ensure_err = Some(e);
+                                        break;
+                                    }
+                                }
+                                match ensure_err {
+                                    Some(e) => Err(e),
+                                    None => {
+                                        let plan_files: Vec<PlannedFile> = scan
+                                            .files
+                                            .iter()
+                                            .map(|(rel, size)| {
+                                                let parent = rel
+                                                    .rsplit_once('/')
+                                                    .map(|(p, _)| p)
+                                                    .unwrap_or("");
+                                                PlannedFile {
+                                                    source: remote_join(&p, rel),
+                                                    local: PathBuf::new(),
+                                                    dst_dir: if parent.is_empty() {
+                                                        target_root.clone()
+                                                    } else {
+                                                        remote_join(&target_root, parent)
+                                                    },
+                                                    size: *size,
+                                                }
+                                            })
+                                            .collect();
+                                        Ok(DirPlan {
+                                            dirs: dirs_to_make,
+                                            files: plan_files,
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    Event::DirPlanReady {
+                        op: DirPlanOp::CrossCopy { dst_drive: dst_id },
+                        drive: did,
+                        folder,
+                        result,
+                    }
+                });
+            }
+        }
     }
 
     pub fn tick_transfers(&mut self, force: bool) {
@@ -1509,6 +1835,90 @@ impl App {
                         st.error = Some(msg.clone());
                         log_error!("网盘", "列目录失败 {path}：{msg}");
                     }
+                }
+            }
+            Event::DirPlanReady {
+                op,
+                drive,
+                folder,
+                result,
+            } => match result {
+                Ok(plan) if plan.files.is_empty() => {
+                    let inst = self
+                        .slot_by_id(&drive)
+                        .map(|s| s.display().to_string())
+                        .unwrap_or_else(|| drive.clone());
+                    // 根治点：空目录不创建"假完成任务"，明确告诉用户没有内容可传。
+                    self.toast(
+                        ToastKind::Warn,
+                        format!(
+                            "目录「{folder}」为空：0 个文件 / {} 个子目录，未创建任务。\
+                             当前实例：{inst} —— 请确认所选账号/路径是否正确（同一家网盘不同账号内容不同）",
+                            plan.dirs.len()
+                        ),
+                    );
+                }
+                Ok(plan) => {
+                    let mut n = 0usize;
+                    let mut bytes = 0u64;
+                    match &op {
+                        DirPlanOp::Download => {
+                            if let Some(d) = self.slot_by_id(&drive).and_then(|s| s.drive.clone()) {
+                                for f in &plan.files {
+                                    self.transfer.enqueue_download(
+                                        d.clone(),
+                                        f.source.clone(),
+                                        Some(f.local.clone()),
+                                    );
+                                    n += 1;
+                                    bytes += f.size;
+                                }
+                            }
+                        }
+                        DirPlanOp::CrossCopy { dst_drive } => {
+                            let src = self.slot_by_id(&drive).and_then(|s| s.drive.clone());
+                            let dst = self.slot_by_id(dst_drive).and_then(|s| s.drive.clone());
+                            if let (Some(src), Some(dst)) = (src, dst) {
+                                for f in &plan.files {
+                                    self.transfer.enqueue_cross_copy(
+                                        src.clone(),
+                                        f.source.clone(),
+                                        dst.clone(),
+                                        f.dst_dir.clone(),
+                                    );
+                                    n += 1;
+                                    bytes += f.size;
+                                }
+                            }
+                        }
+                    }
+                    if n > 0 {
+                        self.toast(
+                            ToastKind::Success,
+                            format!(
+                                "目录「{folder}」已展开为 {n} 个文件任务（{}）",
+                                wp_core::util::format_size(bytes)
+                            ),
+                        );
+                        self.page = Page::Transfers;
+                    } else {
+                        self.toast(
+                            ToastKind::Error,
+                            format!("目录「{folder}」展开失败：网盘实例不可用"),
+                        );
+                    }
+                }
+                Err(e) => self.toast(ToastKind::Error, format!("扫描目录「{folder}」失败：{e}")),
+            },
+            Event::DirsEnsured {
+                drive,
+                count,
+                error,
+            } => {
+                if let Some(e) = error {
+                    wp_core::log_warn!("网盘", "补建空目录失败（{drive}，{count} 个）：{e}");
+                } else {
+                    wp_core::log_debug!("网盘", "已补建 {count} 个空目录（{drive}）");
                 }
             }
             Event::AccountChecked { drive, result } => {
@@ -3016,10 +3426,10 @@ impl App {
 
     fn pick_dir_result(&mut self, path: PathBuf, purpose: FilePickerPurpose) {
         match purpose {
-            // 上传文件夹：递归上传该目录（引擎建远端目录树 + 逐文件上传）
+            // 上传文件夹：先本地遍历，再按文件展开成独立上传任务（空目录不建任务）
             FilePickerPurpose::UploadFolder => {
                 self.file_picker = None;
-                self.enqueue_upload_files(&[path]);
+                self.enqueue_upload_folder(path);
             }
             // 其它目录选择：修改默认下载目录
             _ => {

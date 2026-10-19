@@ -67,7 +67,43 @@ fn main() {
     })
     .expect("光鸭凭证");
 
+    // 0) 预扫描（GUI 入队前的同一 API）：第二账号 /IDA95 为空 → 应 0 文件、不建任务；
+    //    主账号 /IDA95 有内容 → 应扫出文件。这正是"假完成"的根因证据。
+    let baidu_main: Arc<dyn Drive> = wp_drive_baidu::create(DriveInit {
+        id: "baidu".into(),
+        name: "百度网盘".into(),
+        data_dir: account_dir(&dd, "baidu"),
+        threads: 0,
+        verbose: false,
+    })
+    .expect("百度主账号凭证");
     rt.block_on(async {
+        match wp_transfer::scan_remote_dir(&baidu2, "/IDA95").await {
+            Ok(scan) => {
+                println!(
+                    "[预扫描] 百度网盘（2）/IDA95：{} 个文件 / {} 个子目录",
+                    scan.files.len(),
+                    scan.dirs.len()
+                );
+                assert!(
+                    scan.files.is_empty(),
+                    "该账号 /IDA95 应为空目录（若有内容则测试前提变化）"
+                );
+            }
+            Err(e) => println!("[预扫描] 百度网盘（2）/IDA95 扫描失败（可接受）：{e}"),
+        }
+        match wp_transfer::scan_remote_dir(&baidu_main, "/IDA95").await {
+            Ok(scan) => {
+                println!(
+                    "[预扫描] 百度网盘（主）/IDA95：{} 个文件 / {} 个子目录",
+                    scan.files.len(),
+                    scan.dirs.len()
+                );
+                assert!(!scan.files.is_empty(), "主账号 /IDA95 应有内容");
+            }
+            Err(e) => println!("[预扫描] 百度网盘（主）/IDA95 扫描失败（可接受）：{e}"),
+        }
+
         // 1) 百度空目录 → 本地（用户截图里出问题的那类任务）
         let t = {
             let id = engine.enqueue_download(
