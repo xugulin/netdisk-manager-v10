@@ -32,6 +32,38 @@ jobs:
       - name: 缓存 cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: 安装 MSYS2（诊断用，快速）
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            base-devel
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: MSYS2 工具链诊断（cc/gcc/meson/avrt）
+        shell: msys2 {0}
+        run: |
+          set -x
+          echo "MSYSTEM=$MSYSTEM"
+          echo "PATH=$PATH"
+          command -v cc gcc meson pkg-config python python3 || true
+          echo "=== cc version ==="
+          cc --version 2>&1 | head -2 || true
+          echo "=== toolchain files ==="
+          ls -la /ucrt64/bin/cc* /ucrt64/bin/gcc* /ucrt64/bin/meson* /ucrt64/bin/pkg* 2>&1 | head -20
+          echo "=== avrt lib ==="
+          ls -la /ucrt64/x86_64-w64-mingw32/lib/libavrt.a 2>&1 || true
+          echo "=== gcc search dirs ==="
+          gcc -print-search-dirs | head -5 || true
+          echo "=== avrt link test ==="
+          cd /tmp
+          printf 'int main(void){return 0;}' > t.c
+          gcc t.c -lavrt -o t.exe && echo AVRT_LINK_OK || echo AVRT_LINK_FAIL
+
       - name: PowerShell 脚本语法校验
         shell: pwsh
         run: |
