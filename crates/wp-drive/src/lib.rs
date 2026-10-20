@@ -110,6 +110,8 @@ impl DriveCaps {
                 sms: false,
                 password: false,
                 token: false,
+                // 云盘通用能力：浏览器登录（内置/外部浏览器完成登录后取回 Cookie）
+                browser: true,
             },
             mkdir: true,
             rename: true,

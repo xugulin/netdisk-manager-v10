@@ -166,7 +166,18 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
             {
                 tab = LoginTab::Token;
             }
+            if d.caps.browser
+                && ui
+                    .selectable_label(tab == LoginTab::Browser, "🌐 浏览器")
+                    .clicked()
+            {
+                tab = LoginTab::Browser;
+            }
             if tab != d.tab {
+                // 离开浏览器标签时取消正在等待的浏览器登录，避免后台残留
+                if d.tab == LoginTab::Browser && d.browser_busy && tab != LoginTab::Browser {
+                    outcome = Some(LoginOutcome::CancelBrowser);
+                }
                 d.tab = tab;
                 d.error.clear();
                 if tab == LoginTab::Qr && d.qr.is_none() {
@@ -175,6 +186,17 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
             }
         });
         ui.add_space(10.0);
+
+        // 验收钩子：无头环境下自动点「打开浏览器登录」，验证 GUI→后台线程→事件链路
+        #[cfg(feature = "acceptance")]
+        if cfg!(feature = "acceptance")
+            && std::env::var("WP_DEMO_BROWSER_LOGIN").is_ok()
+            && d.tab == LoginTab::Browser
+            && !d.browser_busy
+            && d.browser_status.is_empty()
+        {
+            outcome = Some(LoginOutcome::StartBrowser);
+        }
 
         match d.tab {
             LoginTab::Qr => {
@@ -447,6 +469,34 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                     widgets::error_banner(ui, &t, "验证码应为 4~8 位数字");
                 }
             }
+            LoginTab::Browser => {
+                widgets::hint(
+                    ui,
+                    &t,
+                    "百度/夸克的「短信登录」在网页登录框的风控组件里，纯接口走不通（老项目实测）。                     程序会打开本机 Chrome/Edge/Chromium：在网页里点「短信登录」填手机号+验证码                     （也可扫码/密码），登录成功后自动读取会话并导入，无需手工复制 Cookie。",
+                );
+                ui.add_space(6.0);
+                if d.browser_busy {
+                    widgets::loading(ui, &t, "浏览器已打开，等待你在网页里完成登录…");
+                    ui.add_space(4.0);
+                    if widgets::secondary_button(ui, &t, "取消浏览器登录").clicked() {
+                        outcome = Some(LoginOutcome::CancelBrowser);
+                    }
+                } else if widgets::primary_button(ui, &t, "🌐 打开浏览器登录").clicked() {
+                    outcome = Some(LoginOutcome::StartBrowser);
+                }
+                if !d.browser_status.is_empty() {
+                    ui.add_space(6.0);
+                    widgets::hint(ui, &t, &d.browser_status);
+                }
+                ui.add_space(6.0);
+                widgets::hint(
+                    ui,
+                    &t,
+                    "找不到浏览器？可设置环境变量 WP_LOGIN_BROWSER 指向 chrome/msedge 可执行文件；\
+                     或用「Cookie」标签手动导入。浏览器使用独立临时配置，关闭后自动清理。",
+                );
+            }
             LoginTab::Token => {
                 widgets::hint(
                     ui,
@@ -551,6 +601,17 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                     app.login_token_async(&d.drive, token);
                 }
             }
+            LoginOutcome::StartBrowser => {
+                d.browser_busy = true;
+                d.browser_status = "正在启动浏览器…".into();
+                d.error.clear();
+                app.start_browser_login(&d.drive);
+            }
+            LoginOutcome::CancelBrowser => {
+                app.cancel_browser_login();
+                d.browser_busy = false;
+                d.browser_status = "已取消浏览器登录".into();
+            }
             LoginOutcome::SaveQr => {
                 if let Some(png) = d.qr.as_ref().and_then(|q| q.image_png.clone()) {
                     let dir = app.paths.root.join("登录");
@@ -575,6 +636,9 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
         app.login_tabs.insert(key, d.tab);
     }
     if close {
+        if d.browser_busy {
+            app.cancel_browser_login();
+        }
         return false;
     }
     true
@@ -587,6 +651,8 @@ enum LoginOutcome {
     SmsVerify,
     Token,
     SaveQr,
+    StartBrowser,
+    CancelBrowser,
 }
 
 // ───────────── 登录方式差异化的纯逻辑（可单测） ─────────────

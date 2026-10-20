@@ -259,6 +259,7 @@ impl Drive for FakeDrive {
                 sms: false,
                 password: false,
                 token: false,
+                browser: false,
             },
             mkdir: true,
             rename: true,

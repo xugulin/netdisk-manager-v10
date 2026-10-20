@@ -233,6 +233,10 @@ pub struct AuthCaps {
     pub password: bool,
     /// Token 登录
     pub token: bool,
+    /// 浏览器登录（打开本机 Chrome/Edge/Chromium 完成短信/扫码/密码登录后自动取回会话；
+    /// 参考 V8.3 老项目「内置浏览器短信登录」）
+    #[serde(default)]
+    pub browser: bool,
 }
 
 impl AuthCaps {
@@ -243,7 +247,7 @@ impl AuthCaps {
         }
     }
     pub fn any(&self) -> bool {
-        self.qr || self.cookie || self.sms || self.password || self.token
+        self.qr || self.cookie || self.sms || self.password || self.token || self.browser
     }
     pub fn summary(&self) -> String {
         let mut v = Vec::new();
@@ -261,6 +265,9 @@ impl AuthCaps {
         }
         if self.token {
             v.push("Token");
+        }
+        if self.browser {
+            v.push("浏览器");
         }
         if v.is_empty() {
             "无".into()

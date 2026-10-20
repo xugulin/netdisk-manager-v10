@@ -329,6 +329,8 @@ impl Drive for GuangyaDrive {
                 sms: true,
                 password: false,
                 token: true,
+                // 光鸭有原生短信登录接口，无需浏览器通道
+                browser: false,
             },
             mkdir: true,
             // 源码与抓包都没有 rename/move/copy/search 接口。

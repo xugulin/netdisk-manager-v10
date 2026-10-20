@@ -279,6 +279,8 @@ impl Drive for BaiduDrive {
             auth: AuthCaps {
                 qr: true,
                 cookie: true,
+                // 浏览器登录（短信/扫码/密码）：打开本机浏览器完成百度登录框后自动取回 Cookie
+                browser: true,
                 ..Default::default()
             },
             mkdir: true,

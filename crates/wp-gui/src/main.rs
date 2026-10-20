@@ -20,6 +20,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod browser_login;
 mod dialogs;
 mod fonts;
 mod pages;

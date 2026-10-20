@@ -431,6 +431,8 @@ impl Drive for QuarkDrive {
                 sms: false,
                 password: false,
                 token: false,
+                // 夸克短信登录没有稳定公开接口，走浏览器登录（用户在网页里短信/扫码/密码登录）
+                browser: true,
             },
             mkdir: true,
             rename: true,

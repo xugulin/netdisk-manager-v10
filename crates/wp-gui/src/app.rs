@@ -230,6 +230,11 @@ pub enum Event {
         drive: String,
         result: Result<wp_drive::QrChallenge, wp_core::Error>,
     },
+    /// 浏览器登录通道状态（启动/取到 Cookie/失败）
+    BrowserLogin {
+        drive: String,
+        event: crate::browser_login::BrowserLoginEvent,
+    },
     QrPolled {
         drive: String,
         result: Result<wp_drive::QrPoll, wp_core::Error>,
@@ -375,6 +380,10 @@ pub struct LoginDialog {
     pub tab: LoginTab,
     /// 短信验证码重发倒计时（60s）；None=可立即发送
     pub sms_resend_at: Option<Instant>,
+    /// 浏览器登录状态提示
+    pub browser_status: String,
+    /// 浏览器是否已打开、正在等待用户登录
+    pub browser_busy: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +392,8 @@ pub enum LoginTab {
     Cookie,
     Sms,
     Token,
+    /// 浏览器登录（百度/夸克短信登录走网页风控组件，参考 V8.3 老项目「内置浏览器」）
+    Browser,
 }
 
 impl LoginDialog {
@@ -405,6 +416,8 @@ impl LoginDialog {
             token_text: String::new(),
             tab: LoginTab::Qr,
             sms_resend_at: None,
+            browser_status: String::new(),
+            browser_busy: false,
         }
     }
 }
@@ -693,6 +706,10 @@ pub struct App {
     pub accounts_refresh_at: Option<Instant>,
     /// 按网盘类型记忆上次使用的登录方式（同一网盘多实例共用）
     pub login_tabs: std::collections::HashMap<String, LoginTab>,
+    /// 浏览器登录取消标志（线程侧检查；App 不持有浏览器进程）
+    pub browser_login_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 正在浏览器登录的实例 id（用于关闭对话框时提示/取消）
+    pub browser_login_drive: Option<String>,
     pub event_tx: Sender<Event>,
     pub event_rx: Receiver<Event>,
     pub rt: Option<tokio::runtime::Handle>,
@@ -906,6 +923,8 @@ impl App {
             loading_accounts: false,
             accounts_refresh_at: None,
             login_tabs: std::collections::HashMap::new(),
+            browser_login_cancel: None,
+            browser_login_drive: None,
             event_tx,
             event_rx,
             rt: Some(rt),
@@ -1065,6 +1084,7 @@ impl App {
                                 "cookie" => LoginTab::Cookie,
                                 "sms" => LoginTab::Sms,
                                 "token" => LoginTab::Token,
+                                "browser" => LoginTab::Browser,
                                 _ => d.tab,
                             };
                         }
@@ -2358,6 +2378,49 @@ impl App {
                     }
                 }
             }
+            Event::BrowserLogin { drive, event } => {
+                use crate::browser_login::BrowserLoginEvent as BE;
+                match event {
+                    BE::Started(msg) => {
+                        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+                            if login.drive == drive {
+                                login.browser_busy = true;
+                                login.browser_status = msg;
+                                login.error.clear();
+                            }
+                        }
+                        self.toast(
+                            ToastKind::Info,
+                            "已打开浏览器：请在网页里完成登录（短信/扫码/密码均可），完成后自动导入",
+                        );
+                    }
+                    BE::Cookies(cookies) => {
+                        self.browser_login_cancel = None;
+                        self.browser_login_drive = None;
+                        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+                            if login.drive == drive {
+                                login.browser_busy = false;
+                                login.browser_status =
+                                    "已读取登录会话，正在导入并校验…".to_string();
+                            }
+                        }
+                        wp_core::log_info!("界面", "浏览器登录：取到 {drive} 的会话，正在导入");
+                        self.login_cookie_async(&drive, cookies);
+                    }
+                    BE::Failed(err) => {
+                        self.browser_login_cancel = None;
+                        self.browser_login_drive = None;
+                        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+                            if login.drive == drive {
+                                login.browser_busy = false;
+                                login.browser_status = err.clone();
+                                login.error = err.clone();
+                            }
+                        }
+                        self.toast(ToastKind::Error, format!("浏览器登录失败：{err}"));
+                    }
+                }
+            }
             Event::QrPolled { drive, result } => {
                 if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
                     if login.drive != drive {
@@ -3339,6 +3402,8 @@ impl App {
                 LoginTab::Cookie
             } else if caps.sms {
                 LoginTab::Sms
+            } else if caps.browser {
+                LoginTab::Browser
             } else {
                 LoginTab::Token
             };
@@ -3349,6 +3414,7 @@ impl App {
                     LoginTab::Cookie => caps.cookie,
                     LoginTab::Sms => caps.sms,
                     LoginTab::Token => caps.token,
+                    LoginTab::Browser => caps.browser,
                 })
                 .unwrap_or(fallback);
             self.dialog = Some(Dialog::Login(dlg));
@@ -3368,6 +3434,61 @@ impl App {
                         result: drive.begin_qr().await,
                     }
                 });
+            }
+        }
+    }
+
+    /// 打开本机浏览器完成登录（百度/夸克的短信登录在网页风控组件里，参考 V8.3 老项目内置浏览器）。
+    /// 用户在浏览器里完成短信/扫码/密码登录后，后台线程通过 CDP 读取 Cookie 并交给 `login_cookie`。
+    pub fn start_browser_login(&mut self, drive_id: &str) {
+        let Some(slot) = self.slot_by_id(drive_id) else {
+            return;
+        };
+        if slot.drive.is_none() {
+            self.toast(ToastKind::Error, "该实例未初始化成功，无法打开浏览器登录");
+            return;
+        }
+        let kind = slot.cfg.kind;
+        if self.browser_login_cancel.is_some() {
+            self.cancel_browser_login();
+        }
+        let id = drive_id.to_string();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.browser_login_cancel = Some(cancel.clone());
+        self.browser_login_drive = Some(id.clone());
+        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+            login.browser_busy = true;
+            login.browser_status = "正在启动浏览器…".to_string();
+            login.error.clear();
+        }
+        let tx = self.event_tx.clone();
+        let root = self.paths.root.clone();
+        std::thread::spawn(move || {
+            let id2 = id.clone();
+            crate::browser_login::run(
+                kind,
+                &id,
+                &root,
+                cancel,
+                Box::new(move |ev| {
+                    let _ = tx.send(Event::BrowserLogin {
+                        drive: id2.clone(),
+                        event: ev,
+                    });
+                }),
+            );
+        });
+    }
+
+    /// 取消正在等待的浏览器登录（关闭浏览器并清理临时配置）。
+    pub fn cancel_browser_login(&mut self) {
+        if let Some(c) = self.browser_login_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.browser_login_drive = None;
+        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+            if login.browser_busy {
+                login.browser_status = "正在取消浏览器登录…".to_string();
             }
         }
     }
