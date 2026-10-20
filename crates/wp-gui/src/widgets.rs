@@ -146,6 +146,27 @@ pub fn success_banner(ui: &mut Ui, theme: &Theme, text: &str) {
         });
 }
 
+/// 警告横幅（非阻塞提示）。
+pub fn warn_banner(ui: &mut Ui, theme: &Theme, text: &str) {
+    egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(
+            theme.warning.r(),
+            theme.warning.g(),
+            theme.warning.b(),
+            24,
+        ))
+        .stroke(Stroke::new(1.0, theme.warning))
+        .corner_radius(radius(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("⚠ {text}"))
+                    .size(13.0)
+                    .color(theme.warning),
+            );
+        });
+}
+
 /// 把文本截断到 n 个字符（表格列用）。
 pub fn ellipsis(text: &str, n: usize) -> String {
     let count = text.chars().count();

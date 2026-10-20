@@ -126,6 +126,10 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
         .slot_by_id(&d.drive)
         .map(|s| s.display().to_string())
         .unwrap_or_else(|| d.drive.clone());
+    let kind = app
+        .slot_by_id(&d.drive)
+        .map(|s| s.cfg.kind)
+        .unwrap_or(DriveKind::Baidu);
 
     egui::Modal::new(crate::app::modal_id("login_modal")).show(ctx, |ui| {
         ui.set_width(430.0);
@@ -236,7 +240,7 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                                 if let Some(url) = &q.url {
                                     ui.add_space(4.0);
                                     ui.label(
-                                        RichText::new("若二维码不显示，可打开：")
+                                        RichText::new("若二维码不显示，可复制链接/打开登录页：")
                                             .size(11.0)
                                             .color(t.text_weak),
                                     );
@@ -246,6 +250,27 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                                             .color(t.accent),
                                     );
                                 }
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(url) = &q.url {
+                                        if ui.small_button("📋 复制链接").clicked() {
+                                            ui.ctx().copy_text(url.clone());
+                                        }
+                                    }
+                                    if let Some(code) = &q.code {
+                                        if ui.small_button("📋 复制设备码").clicked() {
+                                            ui.ctx().copy_text(code.clone());
+                                        }
+                                    }
+                                    if q.image_png.is_some()
+                                        && ui.small_button("💾 保存二维码").clicked()
+                                    {
+                                        outcome = Some(LoginOutcome::SaveQr);
+                                    }
+                                    if ui.small_button("⟳ 刷新二维码").clicked() {
+                                        outcome = Some(LoginOutcome::StartQr);
+                                    }
+                                });
                                 if q.expires_in_secs > 0 && d.qr_state != QrState::Expired {
                                     ui.add_space(4.0);
                                     ui.label(
@@ -279,35 +304,121 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                 }
             }
             LoginTab::Cookie => {
+                let (required, download_extra) = cookie_required(kind);
+                let howto = cookie_howto(kind);
                 widgets::hint(
                     ui,
                     &t,
-                    "把浏览器里的 Cookie（或 BDUSS+STOKEN）粘贴到下面，程序会先校验再保存。",
+                    &format!(
+                        "粘贴浏览器 Cookie（需含 {}）。{howto}",
+                        required.join(" + ")
+                    ),
                 );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.small_button("🌐 打开登录页").clicked() {
+                        let url = login_url(kind);
+                        let _ = wp_core::paths::open_path(std::path::Path::new(url));
+                    }
+                    if ui.small_button("清空").clicked() {
+                        d.cookie_text.clear();
+                    }
+                });
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut d.cookie_text)
                         .desired_width(f32::INFINITY)
-                        .desired_rows(6)
-                        .hint_text("BDUSS=...; STOKEN=...  或完整 Cookie 串"),
+                        .desired_rows(5)
+                        .hint_text(cookie_placeholder(kind)),
                 );
+                let chk = cookie_check(kind, &d.cookie_text);
                 ui.add_space(6.0);
-                if widgets::primary_button(ui, &t, "导入并校验").clicked() {
-                    outcome = Some(LoginOutcome::Cookie);
+                if !d.cookie_text.trim().is_empty() {
+                    if chk.missing.is_empty() {
+                        widgets::success_banner(
+                            ui,
+                            &t,
+                            &format!(
+                                "已识别 {} 个字段，必填字段齐全（{}）",
+                                chk.count,
+                                required.join("、")
+                            ),
+                        );
+                        if !download_extra.is_empty()
+                            && !download_extra.iter().any(|k| chk.present.iter().any(|p| p == k))
+                        {
+                            ui.add_space(4.0);
+                            widgets::warn_banner(
+                                ui,
+                                &t,
+                                &format!(
+                                    "未发现 {}：下载直链可能被 CDN 拒绝（V9 老项目实测）；建议从浏览器复制完整 Cookie，或先尝试登录。",
+                                    download_extra.join("/")
+                                ),
+                            );
+                        }
+                    } else {
+                        widgets::error_banner(
+                            ui,
+                            &t,
+                            &format!(
+                                "缺少必填字段：{}（当前识别 {} 个字段）",
+                                chk.missing.join("、"),
+                                chk.count
+                            ),
+                        );
+                    }
                 }
+                ui.add_space(6.0);
+                ui.add_enabled_ui(chk.missing.is_empty(), |ui| {
+                    if widgets::primary_button(ui, &t, "导入并校验").clicked() {
+                        outcome = Some(LoginOutcome::Cookie);
+                    }
+                });
             }
             LoginTab::Sms => {
+                let resend_left = d
+                    .sms_resend_at
+                    .map(|at| {
+                        at.saturating_duration_since(std::time::Instant::now())
+                            .as_secs()
+                    })
+                    .unwrap_or(0);
+                widgets::hint(
+                    ui,
+                    &t,
+                    "光鸭短信登录：手机号需与账号绑定（含国家码），验证码 5 分钟内有效，60 秒后可重发。",
+                );
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("手机号").size(12.5).color(t.text));
                     ui.add(
                         egui::TextEdit::singleline(&mut d.phone)
-                            .desired_width(200.0)
-                            .hint_text("含国家码，如 +8613800000000"),
+                            .desired_width(210.0)
+                            .hint_text("+8613800000000"),
                     );
-                    if widgets::secondary_button(ui, &t, "发送验证码").clicked() {
+                    let phone_ok = phone_valid(&d.phone);
+                    let btn_text = if resend_left > 0 {
+                        format!("⏱ {resend_left}s")
+                    } else if d.sms_hint.is_empty() {
+                        "发送验证码".to_string()
+                    } else {
+                        "重新发送".to_string()
+                    };
+                    if ui
+                        .add_enabled(
+                            phone_ok && resend_left == 0,
+                            egui::Button::new(RichText::new(btn_text).size(12.0)),
+                        )
+                        .clicked()
+                    {
                         outcome = Some(LoginOutcome::SmsSend);
                     }
                 });
+                if !phone_valid(&d.phone) && !d.phone.trim().is_empty() {
+                    ui.add_space(2.0);
+                    widgets::error_banner(ui, &t, "手机号格式不对：只需数字加可选国家码 +，如 +8613800000000");
+                }
                 ui.add_space(6.0);
                 if !d.sms_hint.is_empty() {
                     widgets::success_banner(ui, &t, &d.sms_hint);
@@ -320,34 +431,48 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                             .desired_width(120.0)
                             .hint_text("6 位数字"),
                     );
-                    if widgets::primary_button(ui, &t, "登录").clicked() {
+                    let code_ok = code_valid(&d.sms_code);
+                    if ui
+                        .add_enabled(
+                            code_ok && phone_valid(&d.phone),
+                            egui::Button::new(RichText::new("登录").size(12.0)),
+                        )
+                        .clicked()
+                    {
                         outcome = Some(LoginOutcome::SmsVerify);
                     }
                 });
-                widgets::hint(
-                    ui,
-                    &t,
-                    "提示：部分网盘的短信登录仅在其官方客户端支持，失败时请改用扫码/Cookie。",
-                );
+                if !code_valid(&d.sms_code) && !d.sms_code.trim().is_empty() {
+                    ui.add_space(2.0);
+                    widgets::error_banner(ui, &t, "验证码应为 4~8 位数字");
+                }
             }
             LoginTab::Token => {
                 widgets::hint(
                     ui,
                     &t,
-                    "粘贴 access token（光鸭云盘支持 access/refresh token）。",
+                    "光鸭令牌登录：可粘贴 access token，也可粘贴登录接口返回的 JSON（含 access_token/refresh_token）。",
                 );
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut d.token_text)
                         .desired_width(f32::INFINITY)
                         .desired_rows(4)
-                        .hint_text("access_token"),
+                        .hint_text("access_token 或 {\"access_token\":\"...\",\"refresh_token\":\"...\"}"),
                 );
                 ui.add_space(6.0);
-                if widgets::primary_button(ui, &t, "令牌登录").clicked() {
-                    outcome = Some(LoginOutcome::Token);
+                let token_ok = !d.token_text.trim().is_empty();
+                ui.add_enabled_ui(token_ok, |ui| {
+                    if widgets::primary_button(ui, &t, "令牌登录").clicked() {
+                        outcome = Some(LoginOutcome::Token);
+                    }
+                });
+                if !token_ok && !d.token_text.trim().is_empty() {
+                    ui.add_space(2.0);
+                    widgets::error_banner(ui, &t, "令牌为空或只有空白字符");
                 }
             }
+
         }
 
         if !d.error.is_empty() {
@@ -395,11 +520,15 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
             }
             LoginOutcome::SmsSend => {
                 let phone = d.phone.trim().to_string();
-                if phone.is_empty() {
-                    d.error = "请先填写手机号".into();
+                if !phone_valid(&phone) {
+                    d.error = "手机号格式不对：只需数字加可选国家码 +，如 +8613800000000".into();
                 } else {
                     d.busy = true;
                     d.error.clear();
+                    d.sms_code.clear();
+                    // 老项目同款 60s 重发倒计时；事件返回前先置位，避免连点
+                    d.sms_resend_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
                     app.login_sms_send_async(&d.drive, phone);
                 }
             }
@@ -422,7 +551,28 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                     app.login_token_async(&d.drive, token);
                 }
             }
+            LoginOutcome::SaveQr => {
+                if let Some(png) = d.qr.as_ref().and_then(|q| q.image_png.clone()) {
+                    let dir = app.paths.root.join("登录");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let file = dir.join(format!("{}-二维码.png", d.drive));
+                    match std::fs::write(&file, &png) {
+                        Ok(()) => app.toast(
+                            crate::app::ToastKind::Success,
+                            format!("二维码已保存：{}", file.display()),
+                        ),
+                        Err(e) => d.error = format!("保存二维码失败：{e}"),
+                    }
+                } else {
+                    d.error = "当前没有可保存的二维码（可能使用链接扫码）".into();
+                }
+            }
         }
+    }
+    // 记住该网盘类型上次使用的登录方式（同一网盘多实例共用）
+    if let Some(slot) = app.slot_by_id(&d.drive) {
+        let key = slot.cfg.kind.slug().to_string();
+        app.login_tabs.insert(key, d.tab);
     }
     if close {
         return false;
@@ -436,6 +586,140 @@ enum LoginOutcome {
     SmsSend,
     SmsVerify,
     Token,
+    SaveQr,
+}
+
+// ───────────── 登录方式差异化的纯逻辑（可单测） ─────────────
+
+/// 各网盘 Cookie 必需字段 / 下载额外字段。
+fn cookie_required(kind: DriveKind) -> (&'static [&'static str], &'static [&'static str]) {
+    match kind {
+        // 第二组是「下载直链额外必需字段」：百度无额外必需字段，夸克实测要求 __puus
+        DriveKind::Baidu => (&["BDUSS", "STOKEN"], &[]),
+        DriveKind::Quark => (&["__kps", "__uid"], &["__puus"]),
+        _ => (&[], &[]),
+    }
+}
+
+fn cookie_howto(kind: DriveKind) -> &'static str {
+    match kind {
+        DriveKind::Baidu => {
+            "获取：浏览器登录 pan.baidu.com → F12 → Network → 任一请求 → 复制 Request Headers 里 Cookie 整行。"
+        }
+        DriveKind::Quark => {
+            "获取：浏览器登录 pan.quark.cn → F12 → Network → 任一请求 → 复制 Cookie 整行（含 __pus/__puus 下载更稳）。"
+        }
+        _ => "该网盘暂不支持 Cookie 登录。",
+    }
+}
+
+fn login_url(kind: DriveKind) -> &'static str {
+    match kind {
+        DriveKind::Baidu => "https://pan.baidu.com/",
+        DriveKind::Quark => "https://pan.quark.cn/",
+        DriveKind::Guangya => "https://www.guangya.com/",
+        _ => "https://pan.baidu.com/",
+    }
+}
+
+fn cookie_placeholder(kind: DriveKind) -> &'static str {
+    match kind {
+        DriveKind::Baidu => "BDUSS=...; STOKEN=...; （可整行粘贴 Cookie: ...）",
+        DriveKind::Quark => "__pus=...; __kps=...; __uid=...; __puus=...",
+        _ => "Cookie",
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct CookieCheck {
+    count: usize,
+    present: Vec<String>,
+    missing: Vec<&'static str>,
+}
+
+/// 解析 Cookie 字符串（容忍 `Cookie:` 前缀、换行、多余空格）。
+fn parse_cookie_pairs(text: &str) -> Vec<(String, String)> {
+    let t = text.trim();
+    let t = t
+        .strip_prefix("Cookie:")
+        .or_else(|| t.strip_prefix("cookie:"))
+        .unwrap_or(t);
+    t.split(';')
+        .filter_map(|part| {
+            let mut kv = part.splitn(2, '=');
+            let k = kv.next()?.trim();
+            let v = kv.next()?.trim();
+            if k.is_empty() || v.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn cookie_check(kind: DriveKind, text: &str) -> CookieCheck {
+    let pairs = parse_cookie_pairs(text);
+    let present: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
+    let (required, _) = cookie_required(kind);
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|r| !present.iter().any(|k| k == r))
+        .collect();
+    CookieCheck {
+        count: pairs.len(),
+        present,
+        missing,
+    }
+}
+
+fn phone_valid(phone: &str) -> bool {
+    let d = phone.trim().trim_start_matches('+');
+    d.len() >= 6 && d.chars().all(|c| c.is_ascii_digit())
+}
+
+fn code_valid(code: &str) -> bool {
+    let c = code.trim();
+    (4..=8).contains(&c.len()) && c.chars().all(|x| x.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    #[test]
+    fn cookie_parse_tolerates_prefix_and_spaces() {
+        let pairs = parse_cookie_pairs("Cookie: BDUSS=abc; STOKEN= def ; ;; x");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("BDUSS".into(), "abc".into()));
+        assert_eq!(pairs[1], ("STOKEN".into(), "def".into()));
+    }
+
+    #[test]
+    fn cookie_check_per_drive_required_keys() {
+        let c = cookie_check(DriveKind::Baidu, "BDUSS=a; STOKEN=b");
+        assert!(c.missing.is_empty());
+        assert_eq!(c.count, 2);
+        let c = cookie_check(DriveKind::Baidu, "BDUSS=a");
+        assert_eq!(c.missing, vec!["STOKEN"]);
+        let c = cookie_check(DriveKind::Quark, "__pus=1; __uid=3");
+        assert_eq!(c.missing, vec!["__kps"]); // __kps 缺失（__pus/uid 有）
+        let c = cookie_check(DriveKind::Quark, "__kps=2; __uid=3");
+        assert!(c.missing.is_empty());
+    }
+
+    #[test]
+    fn phone_and_code_validation() {
+        assert!(phone_valid("+8613800000000"));
+        assert!(phone_valid("13800000000"));
+        assert!(!phone_valid("+86abc"));
+        assert!(!phone_valid("123"));
+        assert!(code_valid("123456"));
+        assert!(code_valid("1234"));
+        assert!(!code_valid("12a4"));
+        assert!(!code_valid("12"));
+    }
 }
 
 // ═══════════════════════════ 输入框 ═══════════════════════════

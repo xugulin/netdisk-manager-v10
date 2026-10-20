@@ -373,6 +373,8 @@ pub struct LoginDialog {
     pub sms_hint: String,
     pub token_text: String,
     pub tab: LoginTab,
+    /// 短信验证码重发倒计时（60s）；None=可立即发送
+    pub sms_resend_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +404,7 @@ impl LoginDialog {
             sms_hint: String::new(),
             token_text: String::new(),
             tab: LoginTab::Qr,
+            sms_resend_at: None,
         }
     }
 }
@@ -688,6 +691,8 @@ pub struct App {
     pub loading_accounts: bool,
     /// 账号页上次刷新时间（进入页面 30s 节流自动刷新）
     pub accounts_refresh_at: Option<Instant>,
+    /// 按网盘类型记忆上次使用的登录方式（同一网盘多实例共用）
+    pub login_tabs: std::collections::HashMap<String, LoginTab>,
     pub event_tx: Sender<Event>,
     pub event_rx: Receiver<Event>,
     pub rt: Option<tokio::runtime::Handle>,
@@ -900,6 +905,7 @@ impl App {
             guard_sel_kind,
             loading_accounts: false,
             accounts_refresh_at: None,
+            login_tabs: std::collections::HashMap::new(),
             event_tx,
             event_rx,
             rt: Some(rt),
@@ -1045,7 +1051,33 @@ impl App {
             // 验收截图：详情弹窗里展示缩略图预览（演示盘支持）
             .with_thumbnail(Some("demo-thumb://影视/示例影片-4K.mp4".into()));
         match name {
-            "login" => self.open_login_dialog(),
+            "login" => {
+                self.open_login_dialog();
+                #[cfg(feature = "acceptance")]
+                if cfg!(feature = "acceptance") {
+                    let tab = std::env::var("WP_DEMO_LOGIN_TAB").ok();
+                    let cookie = std::env::var("WP_DEMO_LOGIN_COOKIE").ok();
+                    let phone = std::env::var("WP_DEMO_LOGIN_PHONE").ok();
+                    if let Some(Dialog::Login(d)) = self.dialog.as_mut() {
+                        if let Some(tab) = tab.as_deref() {
+                            d.tab = match tab {
+                                "qr" => LoginTab::Qr,
+                                "cookie" => LoginTab::Cookie,
+                                "sms" => LoginTab::Sms,
+                                "token" => LoginTab::Token,
+                                _ => d.tab,
+                            };
+                        }
+                        if let Some(text) = cookie {
+                            d.cookie_text = text;
+                        }
+                        if let Some(phone) = phone {
+                            d.phone = phone;
+                        }
+                        d.busy = false;
+                    }
+                }
+            }
             "newfolder" => {
                 self.dialog = Some(Dialog::Input(InputDialog {
                     title: "新建文件夹".into(),
@@ -3297,9 +3329,11 @@ impl App {
         let id = self.active_drive_id();
         if let Some(slot) = self.slot_by_id(&id) {
             let caps = slot.caps().map(|c| c.auth).unwrap_or_default();
+            let kind_key = slot.cfg.kind.slug().to_string();
+            let preferred = self.login_tabs.get(&kind_key).copied();
             let mut dlg = LoginDialog::new(id.clone());
             dlg.caps = caps;
-            dlg.tab = if caps.qr {
+            let fallback = if caps.qr {
                 LoginTab::Qr
             } else if caps.cookie {
                 LoginTab::Cookie
@@ -3308,6 +3342,15 @@ impl App {
             } else {
                 LoginTab::Token
             };
+            // 记忆的登录方式若当前网盘仍支持，则优先；否则回退默认
+            dlg.tab = preferred
+                .filter(|t| match t {
+                    LoginTab::Qr => caps.qr,
+                    LoginTab::Cookie => caps.cookie,
+                    LoginTab::Sms => caps.sms,
+                    LoginTab::Token => caps.token,
+                })
+                .unwrap_or(fallback);
             self.dialog = Some(Dialog::Login(dlg));
             if caps.qr {
                 self.start_qr_login(&id);
