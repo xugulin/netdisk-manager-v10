@@ -147,7 +147,7 @@ impl Drive for LocalDrive {
             user_name: user,
             user_id: self.root.to_string_lossy().to_string(),
             vip: String::new(),
-            quota: None,
+            quota: disk_quota(&self.root),
             extra: serde_json::Map::new(),
         })
     }
@@ -522,5 +522,63 @@ mod tests {
             .unwrap();
         assert_eq!(n, 100_000);
         assert_eq!(std::fs::read(&dst).unwrap().len(), 100_000);
+    }
+}
+
+/// 本机根目录所在磁盘的容量（unix statvfs；其它平台返回 None）。
+#[cfg(unix)]
+fn disk_quota(root: &Path) -> Option<wp_core::model::Quota> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(root.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs 只写传入的结构体；c 是合法的 C 字符串。
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let total = (st.f_blocks as u64).saturating_mul(st.f_frsize as u64);
+    let free = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(free);
+    Some(wp_core::model::Quota { total, used, free })
+}
+
+#[cfg(not(unix))]
+fn disk_quota(_root: &Path) -> Option<wp_core::model::Quota> {
+    None
+}
+
+#[cfg(test)]
+mod disk_quota_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn disk_quota_reports_root_capacity() {
+        let q = disk_quota(Path::new("/")).expect("unix 根目录应有容量信息");
+        assert!(q.total > 0, "总量应大于 0：{q:?}");
+        assert!(q.used <= q.total);
+        assert_eq!(q.free, q.total.saturating_sub(q.used));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_account_has_quota() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let drive = create_with_root(
+            DriveInit {
+                id: "local".into(),
+                name: "本机".into(),
+                data_dir: std::env::temp_dir(),
+                threads: 0,
+                verbose: false,
+            },
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        let acc = rt.block_on(drive.account()).unwrap();
+        let q = acc.quota.expect("本机账号应带磁盘容量");
+        assert!(q.total > 0);
     }
 }

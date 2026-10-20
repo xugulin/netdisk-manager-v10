@@ -20,6 +20,8 @@ use wp_transfer::{EngineOptions, TransferEngine, UploadGuardHook};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Browser,
+    /// 账号与容量总览（每个实例的容量/账号详情）
+    Accounts,
     Player,
     Transfers,
     Tools,
@@ -33,6 +35,7 @@ impl Page {
     pub fn label(self) -> &'static str {
         match self {
             Page::Browser => "网盘",
+            Page::Accounts => "账号",
             Page::Player => "播放",
             Page::Transfers => "传输",
             Page::Tools => "工具",
@@ -45,6 +48,7 @@ impl Page {
     pub fn icon(self) -> &'static str {
         match self {
             Page::Browser => "☁",
+            Page::Accounts => "👤",
             Page::Player => "▶",
             Page::Transfers => "⇅",
             Page::Tools => "🛠",
@@ -531,6 +535,14 @@ pub struct CrossCopyDialog {
     pub dst_dir: String,
 }
 
+/// 账号详情弹窗（实例、类型、状态 + 账号信息原始字段）。
+pub struct AccountDetailsDialog {
+    pub instance: String,
+    pub kind: DriveKind,
+    pub status: AccountStatus,
+    pub account: AccountInfo,
+}
+
 pub enum Dialog {
     Login(LoginDialog),
     /// 添加网盘 / 本机：先选类型，再创建实例
@@ -541,6 +553,7 @@ pub enum Dialog {
     Share(ShareDialog),
     Details(DetailsDialog),
     CrossCopy(CrossCopyDialog),
+    AccountDetails(AccountDetailsDialog),
 }
 
 /// 工具页标签。
@@ -673,6 +686,8 @@ pub struct App {
     /// 敏感词页当前选择的网盘类型 slug（同网盘多实例共用词库）
     pub guard_sel_kind: String,
     pub loading_accounts: bool,
+    /// 账号页上次刷新时间（进入页面 30s 节流自动刷新）
+    pub accounts_refresh_at: Option<Instant>,
     pub event_tx: Sender<Event>,
     pub event_rx: Receiver<Event>,
     pub rt: Option<tokio::runtime::Handle>,
@@ -819,6 +834,7 @@ impl App {
             Some("transfers") => Page::Transfers,
             Some("tools") => Page::Tools,
             Some("settings") => Page::Settings,
+            Some("accounts") => Page::Accounts,
             Some("logs") => Page::Logs,
             Some("guard") => Page::Guard,
             Some("about") => Page::About,
@@ -883,6 +899,7 @@ impl App {
             guard_new_instance_word: String::new(),
             guard_sel_kind,
             loading_accounts: false,
+            accounts_refresh_at: None,
             event_tx,
             event_rx,
             rt: Some(rt),
@@ -2804,6 +2821,7 @@ impl eframe::App for App {
             )
             .show(ui, |ui| match self.page {
                 Page::Browser => pages::browser::show(self, ui),
+                Page::Accounts => pages::accounts::show(self, ui),
                 Page::Player => pages::player::show(self, ui),
                 Page::Transfers => pages::transfers::show(self, ui),
                 Page::Tools => pages::tools::show(self, ui),
@@ -3316,6 +3334,7 @@ impl App {
         ui.add_space(2.0);
         for page in [
             Page::Browser,
+            Page::Accounts,
             Page::Player,
             Page::Transfers,
             Page::Tools,

@@ -25,6 +25,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         Dialog::Share(mut d) => share(app, ctx, &mut d).then(|| Dialog::Share(d)),
         Dialog::Details(d) => details(app, ctx, d),
         Dialog::CrossCopy(mut d) => cross_copy(app, ctx, &mut d).then(|| Dialog::CrossCopy(d)),
+        Dialog::AccountDetails(d) => account_details(app, ctx, d),
     };
     if let Some(d) = keep {
         app.dialog = Some(d);
@@ -1086,5 +1087,113 @@ impl App {
             error: String::new(),
             action,
         }));
+    }
+}
+
+// ═══════════════════════════ 账号详情 ═══════════════════════════
+
+/// 账号详情：实例/类型/状态 + 账号名、UID、会员/到期、容量（总/已用/剩余/百分比）
+/// + 只读原因 + 接口返回的原始字段（各网盘字段不同，原样展示便于核对）。
+fn account_details(
+    app: &mut App,
+    ctx: &egui::Context,
+    d: crate::app::AccountDetailsDialog,
+) -> Option<Dialog> {
+    let t = app.theme;
+    let mut close = false;
+    let acc = &d.account;
+    let name = if acc.user_name.trim().is_empty() {
+        acc.display_name.clone()
+    } else {
+        acc.user_name.clone()
+    };
+    let uid = if acc.user_id.trim().is_empty() {
+        "—".to_string()
+    } else {
+        acc.user_id.clone()
+    };
+    let vip = if acc.vip.trim().is_empty() {
+        "—".to_string()
+    } else {
+        acc.vip.clone()
+    };
+    egui::Modal::new(crate::app::modal_id("account_details_modal")).show(ctx, |ui| {
+        ui.set_width(620.0);
+        title_row(ui, &t, &format!("账号详情 · {}", d.instance), &mut close);
+
+        widgets::kv_row(ui, &t, "实例标识", &d.instance);
+        widgets::kv_row(ui, &t, "网盘类型", d.kind.label());
+        widgets::kv_row(ui, &t, "登录状态", &d.status.label());
+        widgets::kv_row(ui, &t, "账号名", &name);
+        widgets::kv_row(ui, &t, "显示名", &acc.display_name);
+        widgets::kv_row(ui, &t, "用户 ID", &uid);
+        widgets::kv_row(ui, &t, "会员", &vip);
+        if let Some(exp) = crate::pages::accounts::vip_expire_text(acc) {
+            widgets::kv_row(ui, &t, "会员到期", &exp);
+        }
+        if let Some(avatar) = crate::pages::accounts::avatar_url(acc) {
+            widgets::kv_row(ui, &t, "头像地址", &avatar);
+        }
+        match acc.quota.filter(|q| q.total > 0) {
+            Some(q) => {
+                widgets::kv_row(ui, &t, "容量总量", &wp_core::util::format_size(q.total));
+                widgets::kv_row(ui, &t, "已用", &wp_core::util::format_size(q.used));
+                widgets::kv_row(
+                    ui,
+                    &t,
+                    "剩余",
+                    &wp_core::util::format_size(q.total.saturating_sub(q.used)),
+                );
+                widgets::kv_row(
+                    ui,
+                    &t,
+                    "已用占比",
+                    &format!("{:.1}%", q.used_ratio() * 100.0),
+                );
+            }
+            None => widgets::kv_row(ui, &t, "容量", "未获取（未登录/只读会话/接口不可用）"),
+        }
+        if let crate::app::AccountStatus::ReadOnly(reason) = &d.status {
+            widgets::kv_row(ui, &t, "只读原因", reason);
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("接口返回的原始字段")
+                .size(12.5)
+                .strong()
+                .color(t.text),
+        );
+        let raw = serde_json::to_string_pretty(&serde_json::Value::Object(acc.extra.clone()))
+            .unwrap_or_default();
+        egui::ScrollArea::vertical()
+            .id_salt("account_extra")
+            .max_height(220.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&raw)
+                            .size(10.5)
+                            .monospace()
+                            .color(t.text_weak),
+                    )
+                    .wrap(),
+                );
+            });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("关闭").clicked() {
+                close = true;
+            }
+            widgets::hint(
+                ui,
+                &t,
+                "字段是各网盘接口原样返回；只读/空间超限会在状态与容量处标出。",
+            );
+        });
+    });
+    if close {
+        None
+    } else {
+        Some(Dialog::AccountDetails(d))
     }
 }

@@ -621,6 +621,8 @@ pub(crate) async fn account(d: &BaiduDrive) -> Result<AccountInfo> {
     if let Some(user_uk) = record.get("uk") {
         extra.insert("uk".to_string(), user_uk.clone());
     }
+    // 完整原始记录（字段不多）：账号详情弹窗展示用
+    extra.insert("record".to_string(), record.clone());
     // 写会话能力：false 表示「已登录但只读」（读接口正常、写接口会 errno:-6）。
     // GUI 用它把状态显示成「已登录（只读）」并给出重新登录指引。
     let write_ok = d.write_ok_value();
@@ -659,18 +661,19 @@ pub(crate) async fn account(d: &BaiduDrive) -> Result<AccountInfo> {
     })
 }
 
+/// 会员文本：按百度 `vip_type` 映射（V9 老项目 `VIP类型映射 = {0:普通用户,1:会员,2:超级会员}`）。
+/// 注意 `priority_name` 在实测响应里是「打码用户名」而不是会员名，不能当会员展示。
 fn vip_text(record: &Value) -> String {
-    if let Some(name) = record
-        .get("priority_name")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-    {
-        return name.trim().to_string();
-    }
     let vip_type = record.get("vip_type").and_then(Value::as_i64).unwrap_or(0);
     let level = record.get("vip_level").and_then(Value::as_i64).unwrap_or(0);
     match vip_type {
-        2 => "超级会员 SVIP".to_string(),
+        2 => {
+            if level > 0 {
+                format!("超级会员 SVIP{level}")
+            } else {
+                "超级会员 SVIP".to_string()
+            }
+        }
         1 => {
             if level > 0 {
                 format!("会员 VIP{level}")
@@ -678,7 +681,7 @@ fn vip_text(record: &Value) -> String {
                 "会员 VIP".to_string()
             }
         }
-        _ => String::new(),
+        _ => "普通用户".to_string(),
     }
 }
 
@@ -717,6 +720,30 @@ pub(crate) async fn write_probe(d: &BaiduDrive) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn vip_text_uses_vip_type_mapping() {
+        // V9 老项目映射：0=普通用户，1=会员，2=超级会员
+        assert_eq!(
+            vip_text(&serde_json::json!({"vip_type": 0, "vip_level": 1})),
+            "普通用户"
+        );
+        assert_eq!(
+            vip_text(&serde_json::json!({"vip_type": 1, "vip_level": 3})),
+            "会员 VIP3"
+        );
+        assert_eq!(
+            vip_text(&serde_json::json!({"vip_type": 2, "vip_level": 6})),
+            "超级会员 SVIP6"
+        );
+        // priority_name 是打码用户名，不能当会员名
+        assert_eq!(
+            vip_text(&serde_json::json!({"vip_type": 0, "priority_name": "x89****841"})),
+            "普通用户"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -789,8 +816,12 @@ mod tests {
             vip_text(&json!({"vip_type": 1, "vip_level": 3})),
             "会员 VIP3"
         );
-        assert_eq!(vip_text(&json!({"priority_name": "超级会员"})), "超级会员");
-        assert_eq!(vip_text(&json!({})), "");
+        // priority_name 是打码用户名，不能当会员名
+        assert_eq!(
+            vip_text(&json!({"vip_type": 0, "priority_name": "超级会员"})),
+            "普通用户"
+        );
+        assert_eq!(vip_text(&json!({})), "普通用户");
     }
 
     #[test]

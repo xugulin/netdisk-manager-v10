@@ -5246,6 +5246,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dirs",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
