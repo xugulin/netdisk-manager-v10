@@ -4,7 +4,7 @@ use crate::pages;
 use crate::theme::{self, Theme};
 use crate::{dialogs, fonts};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -461,6 +461,8 @@ pub enum FilePickerPurpose {
     SubtitleFile,
     /// 选择下载目录（设置页）
     DownloadDir,
+    /// 下载前选择本次下载位置（下载按钮弹窗）
+    DownloadTo,
 }
 
 /// 本地文件选择器。
@@ -495,8 +497,17 @@ pub struct DirPicker {
 
 #[derive(Debug, Clone)]
 pub enum DirPickerAction {
-    Move { paths: Vec<String> },
-    Copy { paths: Vec<String> },
+    Move {
+        paths: Vec<String>,
+    },
+    Copy {
+        paths: Vec<String>,
+    },
+    /// 跨盘弹窗里点「浏览目标目录」：选完回填跨盘弹窗（不直接执行）
+    PickCrossCopy {
+        src_drive: String,
+        paths: Vec<String>,
+    },
 }
 
 pub struct ShareDialog {
@@ -622,6 +633,10 @@ pub struct App {
     pub applied_theme: String,
     pub dialog: Option<Dialog>,
     pub file_picker: Option<FilePicker>,
+    /// 已选待下载条目（等用户选完下载位置后入队）
+    pub pending_download: Option<Vec<RemoteEntry>>,
+    /// 跨盘目标目录选择：暂存 (源实例, 待传路径)，目录选完回填跨盘弹窗
+    pub pending_cross: Option<(String, Vec<String>)>,
     pub toasts: Vec<Toast>,
     pub log_last_seq: u64,
     pub log_lines: Vec<wp_core::logging::LogLine>,
@@ -655,6 +670,8 @@ pub struct App {
     pub logo: Option<egui::TextureHandle>,
     pub guard_new_word: String,
     pub guard_new_instance_word: String,
+    /// 敏感词页当前选择的网盘类型 slug（同网盘多实例共用词库）
+    pub guard_sel_kind: String,
     pub loading_accounts: bool,
     pub event_tx: Sender<Event>,
     pub event_rx: Receiver<Event>,
@@ -778,6 +795,16 @@ impl App {
             let slot = Self::build_slot(&paths, &dcfg);
             drives.push(slot);
         }
+        // 敏感词守卫：旧版本按「实例 id」存词，现统一按「网盘类型」共享（同一网盘多账号通用），
+        // 并清除本机/演示网盘的词库（本机上传不需要敏感词守卫）。
+        let kind_pairs: Vec<(String, String)> = cfg
+            .drives
+            .iter()
+            .map(|d| (d.id.clone(), d.kind.slug().to_string()))
+            .collect();
+        if let Ok(mut g) = guard.lock() {
+            g.migrate(&kind_pairs);
+        }
         // 按实例 id 在**已加载槽位**里定位（不能用 cfg.drives 的下标：
         // 被禁用/初始化跳过的实例会让下标错位，导致启动时选错网盘/账号）。
         let slot_idx = |id: &str| drives.iter().position(|s| s.id() == id);
@@ -810,6 +837,10 @@ impl App {
             ..Default::default()
         }));
         let settings_draft = settings_from_config(&cfg);
+        let guard_sel_kind = drives
+            .get(active)
+            .map(|s| s.cfg.kind.slug().to_string())
+            .unwrap_or_else(|| "baidu".into());
         let mut app = Self {
             paths,
             cfg,
@@ -824,6 +855,8 @@ impl App {
             applied_theme: String::new(),
             dialog: None,
             file_picker: None,
+            pending_download: None,
+            pending_cross: None,
             toasts: Vec::new(),
             log_last_seq: 0,
             log_lines: Vec::new(),
@@ -848,6 +881,7 @@ impl App {
             logo: None,
             guard_new_word: String::new(),
             guard_new_instance_word: String::new(),
+            guard_sel_kind,
             loading_accounts: false,
             event_tx,
             event_rx,
@@ -930,6 +964,23 @@ impl App {
                         entry.is_dir
                     );
                     app.enqueue_download_entries(&[entry]);
+                }
+            }
+        }
+        // 验收钩子：WP_DEMO_DOWNLOAD_TO=<远端文件路径>|<本地目录> → 打开下载位置弹窗并确认，
+        // 验证「选位置→记住→按位置入队」全链路（不污染默认目录）。
+        #[cfg(feature = "acceptance")]
+        if let Ok(spec) = std::env::var("WP_DEMO_DOWNLOAD_TO") {
+            if cfg!(feature = "acceptance") {
+                if let Some((path, dest)) = spec.split_once('|') {
+                    let name = path
+                        .rsplit('/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("下载文件")
+                        .to_string();
+                    app.open_download_destination_picker(vec![RemoteEntry::file(name, path, 0)]);
+                    app.pick_dir_result(PathBuf::from(dest), FilePickerPurpose::DownloadTo);
                 }
             }
         }
@@ -1046,6 +1097,38 @@ impl App {
                 self.dialog = Some(Dialog::Details(DetailsDialog { entry: sample }));
             }
             "filepicker" => self.open_file_picker(false),
+            "crosspick" => {
+                let drive = self.active_drive_id();
+                let dst = self
+                    .drives
+                    .iter()
+                    .find(|s| {
+                        s.id() != drive
+                            && s.drive.is_some()
+                            && s.cfg.kind == wp_core::model::DriveKind::Guangya
+                    })
+                    .or_else(|| {
+                        self.drives
+                            .iter()
+                            .find(|s| s.id() != drive && s.drive.is_some())
+                    })
+                    .map(|s| s.id().to_string())
+                    .unwrap_or_else(|| drive.clone());
+                self.pending_cross = Some((drive.clone(), vec!["/影视".into()]));
+                self.open_dir_picker_at(
+                    &dst,
+                    "/",
+                    DirPickerAction::PickCrossCopy {
+                        src_drive: drive,
+                        paths: vec!["/影视".into()],
+                    },
+                );
+            }
+            "download_to" => self.open_download_destination_picker(vec![
+                RemoteEntry::file("示例影片-4K.mp4", "/影视/示例影片-4K.mp4", 4_500_000_000)
+                    .with_id("fake-0000"),
+                RemoteEntry::file("使用说明.txt", "/文档/使用说明.txt", 2048),
+            ]),
             _ => {}
         }
     }
@@ -1447,16 +1530,34 @@ impl App {
         }
     }
 
+    /// 下载按钮：先弹窗让用户选择本次下载位置，再按计划入队。
+    pub fn open_download_destination_picker(&mut self, entries: Vec<RemoteEntry>) {
+        if entries.is_empty() {
+            self.toast(ToastKind::Warn, "没有选择要下载的条目");
+            return;
+        }
+        self.pending_download = Some(entries);
+        let start = self.download_dir();
+        self.open_picker_with_purpose(true, FilePickerPurpose::DownloadTo, start);
+    }
+
+    /// 按默认下载目录入队（CLI/验收钩子兼容入口）。
     pub fn enqueue_download_entries(&mut self, entries: &[RemoteEntry]) {
+        let dest = self.download_dir();
+        self.enqueue_download_entries_to(entries, &dest);
+    }
+
+    /// 把选中条目展开成下载任务，落盘到 `dest`。
+    pub fn enqueue_download_entries_to(&mut self, entries: &[RemoteEntry], dest: &Path) {
         let Some(drive) = self.active_drive() else {
             return;
         };
+        let _ = std::fs::create_dir_all(dest);
         let drive_id = self.active_drive_id();
-        let download_dir = self.download_dir();
         let mut files = 0usize;
         for e in entries.iter().filter(|e| !e.is_dir) {
             self.transfer
-                .enqueue_download(drive.clone(), e.path.clone(), None);
+                .enqueue_download(drive.clone(), e.path.clone(), Some(dest.join(&e.name)));
             files += 1;
         }
         // 目录：异步遍历源目录（plan 层统一规划）→ 按文件建任务；空目录去其他账号找同路径。
@@ -1471,7 +1572,7 @@ impl App {
                 let did = drive_id.clone();
                 let folder = e.name.clone();
                 let root = e.path.clone();
-                let base = download_dir.join(&e.name);
+                let base = dest.join(&e.name);
                 self.spawn(async move {
                     let result: std::result::Result<DirPlan, String> =
                         match wp_transfer::scan_remote_dir(&drive, &root).await {
@@ -3450,6 +3551,7 @@ impl App {
                     egui::RichText::new(if picker.dir_mode {
                         match picker.purpose {
                             FilePickerPurpose::UploadFolder => "选择要上传的文件夹",
+                            FilePickerPurpose::DownloadTo => "选择下载位置",
                             _ => "选择目录",
                         }
                     } else {
@@ -3521,7 +3623,8 @@ impl App {
                                 || match picker.purpose {
                                     FilePickerPurpose::Upload
                                     | FilePickerPurpose::UploadFolder
-                                    | FilePickerPurpose::DownloadDir => true,
+                                    | FilePickerPurpose::DownloadDir
+                                    | FilePickerPurpose::DownloadTo => true,
                                     FilePickerPurpose::PlayMedia => {
                                         crate::pages::player::is_media_file(&e.name)
                                     }
@@ -3596,10 +3699,10 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 if picker.dir_mode {
-                    let label = if matches!(picker.purpose, FilePickerPurpose::UploadFolder) {
-                        "✓ 上传此文件夹"
-                    } else {
-                        "✓ 选择此目录"
+                    let label = match picker.purpose {
+                        FilePickerPurpose::UploadFolder => "✓ 上传此文件夹",
+                        FilePickerPurpose::DownloadTo => "✓ 下载到此文件夹",
+                        _ => "✓ 选择此目录",
                     };
                     if ui.button(label).clicked() {
                         action = Some(FilePickerAction::PickDir(picker.path.clone()));
@@ -3610,6 +3713,9 @@ impl App {
                         | FilePickerPurpose::UploadFolder
                         | FilePickerPurpose::DownloadDir => {
                             format!("✓ 上传所选（{}）", picker.selected.len())
+                        }
+                        FilePickerPurpose::DownloadTo => {
+                            format!("✓ 下载所选（{}）", picker.selected.len())
                         }
                         FilePickerPurpose::PlayMedia => {
                             format!("▶ 播放所选（{}）", picker.selected.len())
@@ -3633,7 +3739,12 @@ impl App {
         });
 
         match action {
-            Some(FilePickerAction::Close) => {}
+            Some(FilePickerAction::Close) => {
+                // 取消选下载位置：清楚待下载清单，避免下次误入队
+                if matches!(picker.purpose, FilePickerPurpose::DownloadTo) {
+                    self.pending_download = None;
+                }
+            }
             Some(FilePickerAction::Navigate(p)) => {
                 load_local_dir(&mut picker, &p);
                 self.file_picker = Some(picker);
@@ -3647,6 +3758,7 @@ impl App {
                     FilePickerPurpose::Upload
                     | FilePickerPurpose::UploadFolder
                     | FilePickerPurpose::DownloadDir => self.enqueue_upload_files(&files),
+                    FilePickerPurpose::DownloadTo => {}
                     FilePickerPurpose::PlayMedia => match files.first() {
                         Some(file) => self.open_player_local_file(file.clone()),
                         None => self.toast(ToastKind::Warn, "未选择要播放的文件"),
@@ -3672,6 +3784,16 @@ impl App {
             FilePickerPurpose::UploadFolder => {
                 self.file_picker = None;
                 self.enqueue_upload_folder(path);
+            }
+            // 下载位置：记住本次位置并立即下载
+            FilePickerPurpose::DownloadTo => {
+                self.file_picker = None;
+                let entries = self.pending_download.take().unwrap_or_default();
+                self.cfg.download_dir = path.to_string_lossy().to_string();
+                self.settings_draft.download_dir = self.cfg.download_dir.clone();
+                self.toast(ToastKind::Info, format!("下载位置：{}", path.display()));
+                self.enqueue_download_entries_to(&entries, &path);
+                self.save_config();
             }
             // 其它目录选择：修改默认下载目录
             _ => {

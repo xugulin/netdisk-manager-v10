@@ -732,7 +732,8 @@ fn apply(app: &mut App, action: Action) {
                         .collect()
                 })
                 .unwrap_or_default();
-            app.enqueue_download_entries(&entries);
+            // 下载前弹窗：先选本次下载位置（记住后下次默认同位置）
+            app.open_download_destination_picker(entries);
         }
         Action::Delete(paths) => {
             if !paths.is_empty() {

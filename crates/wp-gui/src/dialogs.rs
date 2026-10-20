@@ -597,6 +597,7 @@ fn dir_picker(app: &mut App, ctx: &egui::Context, d: &mut DirPicker) -> bool {
     let (title, ok_text) = match &d.action {
         DirPickerAction::Move { .. } => ("移动到…", "移动到此目录"),
         DirPickerAction::Copy { .. } => ("复制到…", "复制到此目录"),
+        DirPickerAction::PickCrossCopy { .. } => ("选择目标目录…", "选择此目录"),
     };
     egui::Modal::new(crate::app::modal_id("dir_picker_modal")).show(ctx, |ui| {
         ui.set_width(540.0);
@@ -687,15 +688,36 @@ fn dir_picker(app: &mut App, ctx: &egui::Context, d: &mut DirPicker) -> bool {
         app.load_picker_dir(&d.drive, &d.path);
     }
     if close {
+        // 跨盘「浏览目标目录」取消：退回跨盘弹窗，不丢失已选条目
+        if let DirPickerAction::PickCrossCopy { src_drive, paths } = &d.action {
+            app.dialog = Some(Dialog::CrossCopy(CrossCopyDialog {
+                src_drive: src_drive.clone(),
+                paths: paths.clone(),
+                dst_drive: d.drive.clone(),
+                dst_dir: d.path.clone(),
+            }));
+        }
         return false;
     }
     if commit {
         let dest = d.path.clone();
-        let (paths, is_move) = match &d.action {
-            DirPickerAction::Move { paths } => (paths.clone(), true),
-            DirPickerAction::Copy { paths } => (paths.clone(), false),
-        };
-        app.do_move_copy(&d.drive, &paths, &dest, is_move);
+        match &d.action {
+            DirPickerAction::Move { paths } => {
+                app.do_move_copy(&d.drive, paths, &dest, true);
+            }
+            DirPickerAction::Copy { paths } => {
+                app.do_move_copy(&d.drive, paths, &dest, false);
+            }
+            DirPickerAction::PickCrossCopy { src_drive, paths } => {
+                app.pending_cross = None;
+                app.dialog = Some(Dialog::CrossCopy(CrossCopyDialog {
+                    src_drive: src_drive.clone(),
+                    paths: paths.clone(),
+                    dst_drive: d.drive.clone(),
+                    dst_dir: dest,
+                }));
+            }
+        }
         return false;
     }
     true
@@ -930,6 +952,7 @@ fn cross_copy(app: &mut App, ctx: &egui::Context, d: &mut CrossCopyDialog) -> bo
     let t = app.theme;
     let mut close = false;
     let mut start = false;
+    let mut browse = false;
     let targets: Vec<(String, String)> = app
         .drives
         .iter()
@@ -970,7 +993,10 @@ fn cross_copy(app: &mut App, ctx: &egui::Context, d: &mut CrossCopyDialog) -> bo
                 .show_ui(ui, |ui| {
                     for (id, name) in &targets {
                         if ui.selectable_label(&d.dst_drive == id, name).clicked() {
-                            d.dst_drive = id.clone();
+                            if d.dst_drive != *id {
+                                d.dst_drive = id.clone();
+                                d.dst_dir = "/".into();
+                            }
                         }
                     }
                 });
@@ -979,14 +1005,18 @@ fn cross_copy(app: &mut App, ctx: &egui::Context, d: &mut CrossCopyDialog) -> bo
             ui.label(RichText::new("目标目录").size(12.5).color(t.text));
             ui.add(
                 egui::TextEdit::singleline(&mut d.dst_dir)
-                    .desired_width(240.0)
+                    .desired_width(200.0)
                     .hint_text("/"),
             );
+            if ui.button("📁 浏览选择…").clicked() {
+                browse = true;
+            }
         });
         widgets::hint(
             ui,
             &t,
-            "流程：源盘下载到本地缓存 → 上传到目标盘（不经第三方中转服务）。",
+            "目标目录可手填，也可点「浏览选择…」用鼠标逐级选择目标网盘的目录；\
+             流程：源盘下载到本地缓存 → 上传到目标盘（不经第三方中转服务）。",
         );
         ui.add_space(10.0);
         let can = !targets.is_empty();
@@ -1011,6 +1041,21 @@ fn cross_copy(app: &mut App, ctx: &egui::Context, d: &mut CrossCopyDialog) -> bo
     if close {
         return false;
     }
+    if browse {
+        // 记录待回填的源实例/条目，打开目标盘目录选择器
+        app.pending_cross = Some((d.src_drive.clone(), d.paths.clone()));
+        let start_dir = if d.dst_dir.trim().is_empty() {
+            "/".to_string()
+        } else {
+            d.dst_dir.clone()
+        };
+        let action = DirPickerAction::PickCrossCopy {
+            src_drive: d.src_drive.clone(),
+            paths: d.paths.clone(),
+        };
+        app.open_dir_picker_at(&d.dst_drive, &start_dir, action);
+        return false;
+    }
     if start {
         app.enqueue_cross_copy(&d.paths, &d.dst_drive, &d.dst_dir);
         return false;
@@ -1021,15 +1066,21 @@ fn cross_copy(app: &mut App, ctx: &egui::Context, d: &mut CrossCopyDialog) -> bo
 
 /// 在对话框里选择目录（由 DirPicker 打开时调用）。
 impl App {
-    /// 给 DirPicker 加载目录（页面里直接调用）。
+    /// 给 DirPicker 加载目录（页面里直接调用，默认当前盘/当前路径）。
     pub fn open_dir_picker(&mut self, action: DirPickerAction) {
         let drive = self.active_drive_id();
+        let path = self
+            .browse_ref(&drive)
+            .map(|s| s.path.clone())
+            .unwrap_or_else(|| "/".into());
+        self.open_dir_picker_at(&drive, &path, action);
+    }
+
+    /// 在指定网盘/路径打开目录选择器（跨盘「浏览目标目录」用）。
+    pub fn open_dir_picker_at(&mut self, drive: &str, path: &str, action: DirPickerAction) {
         self.dialog = Some(Dialog::DirPicker(DirPicker {
-            drive: drive.clone(),
-            path: self
-                .browse_ref(&drive)
-                .map(|s| s.path.clone())
-                .unwrap_or_else(|| "/".into()),
+            drive: drive.to_string(),
+            path: path.to_string(),
             entries: Vec::new(),
             loading: false,
             error: String::new(),

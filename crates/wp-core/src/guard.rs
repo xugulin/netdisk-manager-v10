@@ -90,6 +90,51 @@ impl SensitiveWordDb {
         }
         self.global.retain(|x| x != word);
     }
+
+    /// 迁移旧数据：把「按实例 id」的词并入「按网盘类型（kind slug）」，
+    /// 并删除本机/演示网盘的词（本机不需要敏感词守卫）。
+    /// `pairs` 为 (实例 id, 网盘类型 slug)，如 ("baidu_2", "baidu")。
+    pub fn migrate_instances_to_kinds(&mut self, pairs: &[(String, String)]) -> bool {
+        let mut changed = false;
+        // 先收集要合并的旧实例词
+        let mut merged: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (id, kind) in pairs {
+            if let Some(words) = self.instances.remove(id) {
+                merged.entry(kind.clone()).or_default().extend(words);
+                changed = changed || id != kind;
+            }
+        }
+        for (kind, words) in merged {
+            let list = self.instances.entry(kind).or_default();
+            for w in words {
+                let w = w.trim().to_string();
+                if !w.is_empty() && !list.iter().any(|x| x == &w) {
+                    list.push(w);
+                }
+            }
+            changed = true;
+        }
+        // 本机/演示网盘不应有敏感词
+        for key in ["local", "fake", "本机", "演示网盘"] {
+            if self.instances.remove(key).is_some() {
+                changed = true;
+            }
+        }
+        // 改名记录里的实例 id 也改成类型 slug（页面展示统一）
+        let map: std::collections::HashMap<&str, &str> = pairs
+            .iter()
+            .map(|(id, k)| (id.as_str(), k.as_str()))
+            .collect();
+        for r in &mut self.rename_records {
+            if let Some(k) = map.get(r.instance.as_str()) {
+                if r.instance != *k {
+                    r.instance = (*k).to_string();
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
 }
 
 /// 一次命中。
@@ -368,20 +413,34 @@ impl GuardManager {
         self.db.save(&self.path)
     }
 
-    /// 取某实例的守卫（构建/复用匹配器）。
-    pub fn guard_for(&mut self, instance: &str) -> UploadGuard {
-        let words = self.db.words_for(instance);
-        UploadGuard::new(instance, self.action, self.enabled, &words)
+    /// 迁移旧词库（按实例 id → 按网盘类型）并保存。
+    pub fn migrate(&mut self, pairs: &[(String, String)]) {
+        if self.db.migrate_instances_to_kinds(pairs) {
+            let _ = self.save();
+        }
+    }
+
+    /// 取某「网盘类型」的守卫（同一网盘的不同账号实例共用词库）。
+    pub fn guard_for(&mut self, kind_key: &str) -> UploadGuard {
+        let words = self.db.words_for(kind_key);
+        UploadGuard::new(kind_key, self.action, self.enabled, &words)
     }
 
     /// 预检并记录统计/改名记录；返回最终用于上传的文件名。
+    ///
+    /// 语义：词库按**网盘类型**共享（baidu/baidu_2 同一词库）；本机（Local）不启用敏感词守卫。
     pub fn precheck(
         &mut self,
-        instance: &str,
+        _instance: &str,
         kind: DriveKind,
         name: &str,
     ) -> (GuardDecision, String) {
-        let guard = self.guard_for(instance);
+        if kind == DriveKind::Local {
+            // 上传本机文件不需要敏感词守卫
+            return (GuardDecision::Pass, name.to_string());
+        }
+        let kind_key = kind.slug().to_string();
+        let guard = self.guard_for(&kind_key);
         let (decision, final_name) = guard.check_name(name, kind);
         self.stats.checked += 1;
         match &decision {
@@ -391,7 +450,7 @@ impl GuardManager {
             GuardDecision::Rename { hit, new_name } => {
                 self.stats.renamed += 1;
                 self.db.rename_records.push(RenameRecord {
-                    instance: instance.to_string(),
+                    instance: kind_key.clone(),
                     original: name.to_string(),
                     renamed: new_name.clone(),
                     hit_word: hit.clone(),
@@ -412,6 +471,42 @@ impl GuardManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_shared_by_drive_kind_and_local_skipped() {
+        let path = std::env::temp_dir().join(format!("wp-guard-kind-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut gm = GuardManager::load(&path, GuardAction::Warn, true);
+        gm.db
+            .instances
+            .insert("baidu".into(), vec!["敏感词".into()]);
+        gm.db
+            .instances
+            .insert("local".into(), vec!["本地词".into()]);
+        // 迁移：旧实例 id 归并到网盘类型；本机词库删除
+        gm.migrate(&[
+            ("baidu_2".to_string(), "baidu".to_string()),
+            ("local".to_string(), "local".to_string()),
+        ]);
+        assert!(gm.db.instances.get("local").is_none(), "本机不应有敏感词库");
+
+        // 同一网盘不同账号实例共用词库
+        let before = gm.stats.checked;
+        let (d1, _) = gm.precheck("baidu_2", DriveKind::Baidu, "这是敏感词文件.txt");
+        assert!(
+            !matches!(d1, GuardDecision::Pass),
+            "同网盘实例应共享词库：{d1:?}"
+        );
+        assert_eq!(gm.stats.checked, before + 1);
+
+        // 本机跳过守卫：直接 Pass 且不计统计
+        let before = gm.stats.checked;
+        let (d2, name) = gm.precheck("local", DriveKind::Local, "敏感词文件.txt");
+        assert!(matches!(d2, GuardDecision::Pass));
+        assert_eq!(name, "敏感词文件.txt");
+        assert_eq!(gm.stats.checked, before, "本机不应计入敏感词检查次数");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn match_longest() {
