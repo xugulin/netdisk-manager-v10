@@ -418,11 +418,12 @@ mod tests {
         assert!(second.skip_reason.is_empty());
 
         // 本地根 + 子目录（scan.dirs 与文件父目录去重）。
+        // 注意用 join 生成期望值：Windows 下分隔符是 `\`，不能硬编码 `/`。
         assert_eq!(
             plan.dirs_to_ensure,
             vec![
-                "/tmp/下载 目标".to_string(),
-                "/tmp/下载 目标/子".to_string(),
+                local_root.to_string_lossy().to_string(),
+                local_root.join("子").to_string_lossy().to_string(),
             ]
         );
         assert_eq!(
@@ -451,8 +452,8 @@ mod tests {
         assert_eq!(
             plan.dirs_to_ensure,
             vec![
-                "/tmp/本地 根".to_string(),
-                "/tmp/本地 根/子 目录".to_string(),
+                local_root.to_string_lossy().to_string(),
+                local_root.join("子 目录").to_string_lossy().to_string(),
             ]
         );
     }
@@ -464,12 +465,8 @@ mod tests {
             dirs: vec!["子空目录".into(), "子空目录/更深".into()],
             files: Vec::new(),
         };
-        let plan = plan_download(
-            &scan,
-            "/网盘/空 目录",
-            Path::new("/tmp/空 目录"),
-            |_, _| false,
-        );
+        let local_root = Path::new("/tmp/空 目录");
+        let plan = plan_download(&scan, "/网盘/空 目录", local_root, |_, _| false);
 
         assert!(plan.is_empty());
         assert!(plan.files.is_empty());
@@ -478,9 +475,13 @@ mod tests {
         assert_eq!(
             plan.dirs_to_ensure,
             vec![
-                "/tmp/空 目录".to_string(),
-                "/tmp/空 目录/子空目录".to_string(),
-                "/tmp/空 目录/子空目录/更深".to_string(),
+                local_root.to_string_lossy().to_string(),
+                local_root.join("子空目录").to_string_lossy().to_string(),
+                local_root
+                    .join("子空目录")
+                    .join("更深")
+                    .to_string_lossy()
+                    .to_string(),
             ]
         );
         assert_eq!(plan.plan_summary(), "0 个文件 / 3 个目录 / 0 B");
