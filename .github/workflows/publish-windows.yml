@@ -1,0 +1,50 @@
+name: publish-windows
+
+# 把 build 工作流产出的 Windows 绿色包上传到 v1.0.0 发布（draft）。
+# 触发：workflow_dispatch（需要 contents:write + actions:read）。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_ID: "423533889"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 下载 build 产物（Windows）
+        uses: actions/download-artifact@v4
+        with:
+          name: 网盘管理-win64
+          run-id: 40212123201
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: artifact
+
+      - name: 上传到 draft Release
+        run: |
+          set -euo pipefail
+          ls -lh artifact
+          cp artifact/网盘管理-win64.zip netdisk-manager-v1.0.0-windows-x64.zip
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @netdisk-manager-v1.0.0-windows-x64.zip \
+            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=netdisk-manager-v1.0.0-windows-x64.zip" \
+            -o resp.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('resp.json'))
+          print('uploaded:',d.get('name'),d.get('size'),d.get('state'))
+          if d.get('state') != 'uploaded':
+              raise SystemExit('upload failed: '+str(d)[:500])
+          PY
+
+      - name: 校验 Release 资产
+        run: |
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);print([(a["name"],a["size"],a["state"]) for a in d["assets"]])'
