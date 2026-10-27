@@ -30,10 +30,31 @@ if (-not (Test-Path $Zip) -or (Get-Item $Zip).Length -eq 0) {
 }
 if (-not (Test-Path $Zip)) { throw "下载失败：$Zip" }
 
+$ZipLen = (Get-Item $Zip).Length
+Write-Host ("==> 压缩包大小 {0:N1} MB" -f ($ZipLen / 1MB))
+if ($ZipLen -lt 50MB) { throw "下载文件过小（$ZipLen 字节），可能下载失败：$Zip" }
+
 Write-Host "==> 解包并精简"
 $Tmp = Join-Path $Cache "chrome-win-unpack-$Rev"
 if (Test-Path $Tmp) { Remove-Item -Recurse -Force $Tmp }
-Expand-Archive -Path $Zip -DestinationPath $Tmp -Force
+New-Item -ItemType Directory -Path $Tmp -Force | Out-Null
+# 优先用 7-Zip / bsdtar 解包（Expand-Archive 在部分 pwsh 环境下会抛空异常）
+try {
+  $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+  if (Test-Path $sevenZip) {
+    Write-Host "==> 用 7-Zip 解包"
+    & $sevenZip x $Zip "-o$Tmp" -y | Out-Null
+  } elseif (Get-Command tar.exe -ErrorAction SilentlyContinue) {
+    Write-Host "==> 用 tar(bsdtar) 解包"
+    & tar.exe -xf $Zip -C $Tmp
+  } else {
+    Write-Host "==> 用 Expand-Archive 解包"
+    Expand-Archive -Path $Zip -DestinationPath $Tmp -Force
+  }
+} catch {
+  Write-Host "解包失败：$($_.Exception.Message)"
+  throw
+}
 $Src = Join-Path $Tmp "chrome-win"
 if (-not (Test-Path (Join-Path $Src "chrome.exe"))) { throw "解包后没找到 chrome.exe" }
 
