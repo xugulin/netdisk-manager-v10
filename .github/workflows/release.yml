@@ -79,6 +79,9 @@ jobs:
             target: linux-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # GitHub Release 资产名只保留 ASCII：统一用 netdisk-manager-<tag>-<arch>
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -119,7 +122,7 @@ jobs:
           cp README.md "$OUT/"
           cp -r 登录内核 "$OUT/"
           touch "$OUT/portable"
-          cd 出 && tar czf "网盘管理-${GITHUB_REF_NAME:-snapshot}-linux-x64.tar.gz" 网盘管理-linux-x64
+          cd 出 && tar czf "netdisk-manager-${TAG}-linux-x64.tar.gz" 网盘管理-linux-x64
           ls -lh *.tar.gz
 
       - name: 组装绿色版（Windows）
@@ -134,7 +137,7 @@ jobs:
           Copy-Item README.md $out
           Copy-Item 登录内核 $out -Recurse
           New-Item -ItemType File -Path (Join-Path $out "portable") | Out-Null
-          Compress-Archive -Path $out -DestinationPath "出\网盘管理-win64.zip" -Force
+          Compress-Archive -Path $out -DestinationPath "出\netdisk-manager-$env:TAG-win64.zip" -Force
           Get-ChildItem 出\*.zip | Format-Table Name,Length
 
       - name: 上传产物
@@ -174,8 +177,8 @@ jobs:
             ## 网盘管理 V10 ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
             绿色版（解压即用，自带内置登录内核 Chromium）：
-            - `网盘管理-*-linux-x64.tar.gz`（Linux x64，含 `登录内核/`、`docs/`）
-            - `网盘管理-win64.zip`（Windows x64，含 `登录内核\`、`docs\`）
+            - `netdisk-manager-<tag>-linux-x64.tar.gz`（Linux x64，含 `登录内核/`、`docs/`）
+            - `netdisk-manager-<tag>-win64.zip`（Windows x64，含 `登录内核\`、`docs\`）
 
             构建与测试：GitHub Actions 免费 runner（Windows + Linux 双平台单元测试通过后打包），
             登录内核版本见 `scripts/login-kernel.rev`。
