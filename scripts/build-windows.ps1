@@ -33,8 +33,13 @@ Get-Item $bin | Format-List Length, FullName
 
 if ($Portable) {
   $out = Join-Path $root "出\网盘管理-win64"
-  if (Test-Path $out) { Remove-Item -Recurse -Force $out }
-  New-Item -ItemType Directory -Path $out | Out-Null
+  # 先打包到临时目录再整体替换：不能直接删 $out（里面可能有用户 数据\：账号/日志/下载）
+  $stage = Join-Path $root "出\.网盘管理-win64.打包临时.$PID"
+  if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+  New-Item -ItemType Directory -Path $stage | Out-Null
+  $outForData = $out
+  $out = $stage
+  New-Item -ItemType Directory -Path $out -Force | Out-Null
   Copy-Item $bin (Join-Path $out "网盘管理.exe")
   $cli = Join-Path $meta.target_directory (Join-Path $mode "wp-cli.exe")
   if (Test-Path $cli) { Copy-Item $cli (Join-Path $out "wp-cli.exe") }
@@ -47,8 +52,24 @@ if ($Portable) {
     Copy-Item "assets/icons/netdisk-manager*.png" $iconOut -ErrorAction SilentlyContinue
     Copy-Item "assets/icons/hero.png","assets/icons/preview.png" $iconOut -ErrorAction SilentlyContinue
   }
+  # 内置登录内核（Chromium for Windows）
+  $kernel = Join-Path $root "登录内核"
+  if (Test-Path $kernel) {
+    Copy-Item $kernel (Join-Path $out "登录内核") -Recurse -Force
+    Write-Host "==> 已打包登录内核"
+  } else {
+    Write-Host "==> 提示：未找到 登录内核\，登录窗口不可用；先跑 .\scripts\fetch-login-chromium.ps1" -ForegroundColor Yellow
+  }
   # 绿色版标记：数据写在 exe 旁（U 盘/解压即用）
   New-Item -ItemType File -Path (Join-Path $out "portable") | Out-Null
-  Write-Host "==> 绿色版目录：$out" -ForegroundColor Green
-  Write-Host "    运行：$out\网盘管理.exe --demo"
+  # 保留用户数据目录
+  $dataOld = Join-Path $outForData "数据"
+  if (Test-Path $dataOld) {
+    Move-Item $dataOld (Join-Path $stage "数据")
+    Write-Host "==> 已保留数据目录"
+  }
+  if (Test-Path $outForData) { Remove-Item -Recurse -Force $outForData }
+  Move-Item $stage $outForData
+  Write-Host "==> 绿色版目录：$outForData" -ForegroundColor Green
+  Write-Host "    运行：$outForData\网盘管理.exe --demo"
 }

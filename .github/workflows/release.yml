@@ -1,0 +1,188 @@
+name: release
+
+# 发布流水线（GitHub 免费 Windows/Linux runner）：
+#   ① 测试：Windows + Linux 双平台跑核心 crate 单元测试并编译 GUI/CLI（任一失败即停）
+#   ② 打包：双平台各出「绿色版」压缩包（程序 + 内置登录内核 Chromium + 文档）
+#   ③ 发布：测试全部通过后创建 GitHub Release，上传 win64 / linux-x64 两个包
+#
+# 触发：
+#   * 手动：Actions → release → Run workflow（可指定 tag，默认 v1.0.1）
+#   * 推送 tag：v*
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布标签（如 v1.0.1）"
+        required: true
+        default: "v1.0.1"
+      publish:
+        description: "测试通过后创建 Release（关掉只跑测试）"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: 测试 · ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+          - os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Linux 系统依赖（egui 构建/运行）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev \
+            libxi-dev libgl1-mesa-dev xvfb fonts-noto-cjk
+
+      - name: 单元测试（核心/网络/驱动/传输）
+        run: cargo test --release -p wp-core -p wp-net -p wp-drive -p wp-transfer
+
+      - name: 编译 GUI + CLI（验证整仓可构建）
+        run: cargo build --release -p wp-gui -p wp-cli
+
+      - name: CLI 冒烟（--help）
+        shell: bash
+        run: ./target/release/wp-cli --help > /dev/null
+
+  package:
+    name: 打包 · ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: win64
+          - os: ubuntu-latest
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev \
+            libxi-dev libgl1-mesa-dev xvfb fonts-noto-cjk
+
+      - name: 下载内置登录内核（Linux）
+        if: runner.os == 'Linux'
+        run: ./scripts/fetch-login-chromium.sh
+
+      - name: 下载内置登录内核（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rev = (Get-Content scripts/login-kernel.rev -Raw).Trim()
+          ./scripts/fetch-login-chromium.ps1 -Rev $rev
+
+      - name: 编译（release）
+        run: cargo build --release -p wp-gui -p wp-cli
+
+      - name: 组装绿色版（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          OUT="出/网盘管理-linux-x64"
+          mkdir -p "$OUT"
+          cp target/release/网盘管理 "$OUT/"
+          cp target/release/wp-cli "$OUT/"
+          cp -r docs "$OUT/"
+          cp README.md "$OUT/"
+          cp -r 登录内核 "$OUT/"
+          touch "$OUT/portable"
+          cd 出 && tar czf "网盘管理-${GITHUB_REF_NAME:-snapshot}-linux-x64.tar.gz" 网盘管理-linux-x64
+          ls -lh *.tar.gz
+
+      - name: 组装绿色版（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "出\网盘管理-win64"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Copy-Item "target\release\网盘管理.exe" $out
+          Copy-Item "target\release\wp-cli.exe" $out
+          Copy-Item docs $out -Recurse
+          Copy-Item README.md $out
+          Copy-Item 登录内核 $out -Recurse
+          New-Item -ItemType File -Path (Join-Path $out "portable") | Out-Null
+          Compress-Archive -Path $out -DestinationPath "出\网盘管理-win64.zip" -Force
+          Get-ChildItem 出\*.zip | Format-Table Name,Length
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            出/*.zip
+            出/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: package
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载两个平台的产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: 列出产物
+        run: ls -lh artifacts
+
+      - name: 创建 Release 并上传
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: 网盘管理 V10 · ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          files: artifacts/*
+          body: |
+            ## 网盘管理 V10 ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+            绿色版（解压即用，自带内置登录内核 Chromium）：
+            - `网盘管理-*-linux-x64.tar.gz`（Linux x64，含 `登录内核/`、`docs/`）
+            - `网盘管理-win64.zip`（Windows x64，含 `登录内核\`、`docs\`）
+
+            构建与测试：GitHub Actions 免费 runner（Windows + Linux 双平台单元测试通过后打包），
+            登录内核版本见 `scripts/login-kernel.rev`。
+
+            ### 登录方式
+            - 百度：内置浏览器登录需拿到 pan 域 STOKEN（写权限）
+            - 夸克：内置浏览器登录（登录态自动导入）
+            - 光鸭：内置浏览器打开设备授权页，网页登录后自动抓凭证导入

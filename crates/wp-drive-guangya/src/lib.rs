@@ -330,7 +330,8 @@ impl Drive for GuangyaDrive {
                 password: false,
                 token: true,
                 // 光鸭有原生短信登录接口，无需浏览器通道
-                browser: false,
+                // 光鸭的浏览器登录 = 内置窗口打开设备授权页 + 设备码轮询
+                browser: true,
             },
             mkdir: true,
             // 源码与抓包都没有 rename/move/copy/search 接口。

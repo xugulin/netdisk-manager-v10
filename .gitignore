@@ -17,3 +17,7 @@
 /build/
 # CI 临时文件（MSYS2 安装位置）
 /msys2-root.txt
+
+# 内置登录内核（Chromium，约 300MB，按需跑 scripts/fetch-login-chromium.sh 生成）
+/登录内核/
+.cache/

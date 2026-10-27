@@ -384,6 +384,8 @@ pub struct LoginDialog {
     pub browser_status: String,
     /// 浏览器是否已打开、正在等待用户登录
     pub browser_busy: bool,
+    /// 是否是「设备授权窗口」模式（光鸭：窗口只显示授权页，进度靠设备码轮询）
+    pub browser_device: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +420,7 @@ impl LoginDialog {
             sms_resend_at: None,
             browser_status: String::new(),
             browser_busy: false,
+            browser_device: false,
         }
     }
 }
@@ -710,6 +713,8 @@ pub struct App {
     pub browser_login_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 正在浏览器登录的实例 id（用于关闭对话框时提示/取消）
     pub browser_login_drive: Option<String>,
+    /// 光鸭浏览器登录：等 begin_qr 拿到授权页 URL 后打开内置窗口
+    pub browser_device_pending: Option<String>,
     pub event_tx: Sender<Event>,
     pub event_rx: Receiver<Event>,
     pub rt: Option<tokio::runtime::Handle>,
@@ -791,6 +796,8 @@ impl App {
             wp_core::APP_NAME,
             wp_core::APP_VERSION
         );
+        // 清理上次异常退出留下的内置登录内核/临时配置（正常关闭由 on_exit 负责）
+        crate::browser_login::sweep_stale(&paths.root);
         log_info!(
             "应用",
             "数据目录：{}（{}）",
@@ -925,6 +932,7 @@ impl App {
             login_tabs: std::collections::HashMap::new(),
             browser_login_cancel: None,
             browser_login_drive: None,
+            browser_device_pending: None,
             event_tx,
             event_rx,
             rt: Some(rt),
@@ -2357,6 +2365,8 @@ impl App {
                 }
             }
             Event::QrStarted { drive, result } => {
+                let mut device_url: Option<String> = None;
+                let mut device_code: Option<String> = None;
                 if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
                     if login.drive != drive {
                         return;
@@ -2364,6 +2374,8 @@ impl App {
                     login.busy = false;
                     match result {
                         Ok(ch) => {
+                            device_url = ch.url.clone();
+                            device_code = ch.code.clone();
                             if let Some(png) = &ch.image_png {
                                 if let Some(ctx) = &self.ctx {
                                     login.qr_texture = fonts::png_texture(ctx, "qr", png);
@@ -2377,6 +2389,49 @@ impl App {
                         Err(e) => login.error = e.to_string(),
                     }
                 }
+                // 光鸭：拿到设备授权 URL → 在内置窗口里打开（轮询继续由界面驱动）
+                let is_guangya = self
+                    .slot_by_id(&drive)
+                    .map(|s| s.cfg.kind == DriveKind::Guangya)
+                    .unwrap_or(false);
+                // 光鸭：API 返回的 verification_uri 直接打开是 404 页；
+                // 网页版设备授权页是 https://www.guangyapan.com/device?code=<用户码>
+                let browse_url = if is_guangya {
+                    device_code
+                        .filter(|c| !c.is_empty())
+                        .map(|c| format!("https://www.guangyapan.com/device?code={c}"))
+                        .or(device_url)
+                } else {
+                    device_url
+                };
+                if let Some(url) = browse_url {
+                    if self.browser_device_pending.as_deref() == Some(drive.as_str()) {
+                        self.browser_device_pending = None;
+                        let root = self.paths.root.clone();
+                        let cancel = self.browser_login_cancel.clone();
+                        let tx = self.event_tx.clone();
+                        let id = drive.clone();
+                        std::thread::spawn(move || {
+                            let drive_for_run = id.clone();
+                            let drive_for_sink = id.clone();
+                            let tx2 = tx.clone();
+                            let cancel = cancel
+                                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                            crate::browser_login::run_device_window(
+                                &drive_for_run,
+                                &url,
+                                &root,
+                                cancel,
+                                Box::new(move |ev| {
+                                    let _ = tx2.send(Event::BrowserLogin {
+                                        drive: drive_for_sink.clone(),
+                                        event: ev,
+                                    });
+                                }),
+                            );
+                        });
+                    }
+                }
             }
             Event::BrowserLogin { drive, event } => {
                 use crate::browser_login::BrowserLoginEvent as BE;
@@ -2385,14 +2440,11 @@ impl App {
                         if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
                             if login.drive == drive {
                                 login.browser_busy = true;
-                                login.browser_status = msg;
+                                login.browser_status = msg.clone();
                                 login.error.clear();
                             }
                         }
-                        self.toast(
-                            ToastKind::Info,
-                            "已打开浏览器：请在网页里完成登录（短信/扫码/密码均可），完成后自动导入",
-                        );
+                        self.toast(ToastKind::Info, msg);
                     }
                     BE::Cookies(cookies) => {
                         self.browser_login_cancel = None;
@@ -2404,24 +2456,74 @@ impl App {
                                     "已读取登录会话，正在导入并校验…".to_string();
                             }
                         }
-                        wp_core::log_info!("界面", "浏览器登录：取到 {drive} 的会话，正在导入");
+                        wp_core::log_info!("界面", "内置登录窗口：取到 {drive} 的会话，正在导入");
                         self.login_cookie_async(&drive, cookies);
                     }
-                    BE::Failed(err) => {
+                    BE::Tokens(creds) => {
+                        self.browser_login_cancel = None;
+                        self.browser_login_drive = None;
+                        self.browser_device_pending = None;
+                        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+                            if login.drive == drive {
+                                login.browser_busy = false;
+                                login.browser_device = false;
+                                login.browser_status =
+                                    "已从网页登录态获取凭证，正在导入并校验…".to_string();
+                                login.error.clear();
+                            }
+                        }
+                        wp_core::log_info!("界面", "内置登录窗口：网页凭证已抓取，调用令牌导入");
+                        self.login_token_async(&drive, creds);
+                    }
+                    BE::Closed => {
                         self.browser_login_cancel = None;
                         self.browser_login_drive = None;
                         if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
                             if login.drive == drive {
                                 login.browser_busy = false;
-                                login.browser_status = err.clone();
-                                login.error = err.clone();
+                                login.browser_device = false;
+                                if !login.busy {
+                                    login.browser_status = "内置登录窗口已关闭".to_string();
+                                }
                             }
                         }
-                        self.toast(ToastKind::Error, format!("浏览器登录失败：{err}"));
+                    }
+                    BE::Failed(err) => {
+                        self.browser_login_cancel = None;
+                        self.browser_login_drive = None;
+                        // 缺登录内核不算「登录失败」：扫码走纯 HTTP，不依赖浏览器。
+                        // 这里自动切到扫码标签并发起二维码，避免用户卡在死路上。
+                        let no_kernel = err.contains("登录内核")
+                            || err.contains("找不到内置")
+                            || err.contains("未找到内置");
+                        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+                            if login.drive == drive {
+                                login.browser_busy = false;
+                                if no_kernel {
+                                    login.tab = LoginTab::Qr;
+                                    login.error.clear();
+                                    login.browser_status =
+                                        "缺少内置登录内核，已自动切到扫码登录（扫码无需浏览器）".into();
+                                } else {
+                                    login.browser_status = err.clone();
+                                    login.error = err.clone();
+                                }
+                            }
+                        }
+                        if no_kernel {
+                            self.toast(
+                                ToastKind::Info,
+                                "未找到内置登录内核，已自动切到扫码登录",
+                            );
+                            self.start_qr_login(&drive);
+                        } else {
+                            self.toast(ToastKind::Error, format!("内置登录窗口失败：{err}"));
+                        }
                     }
                 }
             }
             Event::QrPolled { drive, result } => {
+                let mut device_done = false;
                 if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
                     if login.drive != drive {
                         return;
@@ -2433,6 +2535,7 @@ impl App {
                             login.qr_message = poll.message.clone();
                             if poll.state == QrState::Success {
                                 login.busy = true;
+                                device_done = login.browser_device;
                                 self.refresh_account(&drive);
                                 self.finalize_login_async(&drive);
                             } else {
@@ -2442,10 +2545,24 @@ impl App {
                         Err(e) => login.error = e.to_string(),
                     }
                 }
+                // 光鸭设备授权成功：关掉只用于显示授权页的内置窗口
+                if device_done {
+                    self.cancel_browser_login();
+                    if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+                        login.browser_device = false;
+                        login.browser_busy = false;
+                        login.browser_status = "设备已确认，正在导入会话…".to_string();
+                    }
+                }
             }
             Event::LoggedIn { drive, result } => match result {
                 Ok(info) => {
                     let status = account_status_of(&info);
+                    // 只读会话 + 来自扫码 = 纯 HTTP 登录拿不到写权限（真机日志实证：
+                    // pan 域 STOKEN 仍是 64 字符 passport 版，写接口 errno:-6）。
+                    // 此时自动回落到已有的浏览器(CDP)通道；浏览器导入后不会再触发（那时 dialog 已关）。
+                    let readonly = matches!(&status, AccountStatus::ReadOnly(_));
+                    let from_qr = matches!(&self.dialog, Some(Dialog::Login(l)) if l.qr_state == QrState::Success);
                     match &status {
                         AccountStatus::ReadOnly(hint) => self.toast(
                             ToastKind::Warn,
@@ -2467,6 +2584,27 @@ impl App {
                         .map(|s| s.path.clone())
                         .unwrap_or_else(|| "/".into());
                     self.load_dir_for(&drive, &path);
+
+                    if readonly && from_qr {
+                        let is_baidu = self
+                            .drives
+                            .iter()
+                            .any(|s| s.id() == drive && s.kind() == DriveKind::Baidu);
+                        if is_baidu {
+                            if crate::browser_login::find_browser().is_some() {
+                                self.toast(
+                                    ToastKind::Info,
+                                    "扫码得到的是只读会话（百度写操作需要网页版登录态），已自动打开内置登录窗口；关闭窗口即可取消",
+                                );
+                                self.start_browser_login(&drive);
+                            } else {
+                                self.toast(
+                                    ToastKind::Warn,
+                                    "扫码得到的是只读会话，且本机没有浏览器；请在「登录 → Cookie」导入 pan.baidu.com 的最新 BDUSS+STOKEN，或先安装 Chrome/Edge",
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
@@ -2951,6 +3089,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        // 退出时先收掉内置登录窗口：否则登录线程随进程结束、Chromium 变孤儿留在桌面
+        crate::browser_login::shutdown_active();
         // 先关闭网盘代理会话，再按序释放渲染桥 → 引擎
         self.close_stream_session();
         // 顺序：先销毁渲染桥（释放 mpv render ctx/FBO/纹理）→ 再停引擎；
@@ -3445,10 +3585,15 @@ impl App {
             return;
         };
         if slot.drive.is_none() {
-            self.toast(ToastKind::Error, "该实例未初始化成功，无法打开浏览器登录");
+            self.toast(ToastKind::Error, "该实例未初始化成功，无法打开内置登录窗口");
             return;
         }
         let kind = slot.cfg.kind;
+        // 光鸭没有 Cookie 登录能力：浏览器登录 = 内置窗口打开设备授权页 + 设备码轮询
+        if kind == DriveKind::Guangya {
+            self.start_guangya_browser_login(drive_id);
+            return;
+        }
         if self.browser_login_cancel.is_some() {
             self.cancel_browser_login();
         }
@@ -3480,6 +3625,27 @@ impl App {
         });
     }
 
+    /// 光鸭的内置浏览器登录：先申请设备码，拿到授权页 URL 后开内置窗口；
+    /// 授权确认由设备码轮询检测（窗口只负责显示页面）。
+    fn start_guangya_browser_login(&mut self, drive_id: &str) {
+        if self.browser_login_cancel.is_some() {
+            self.cancel_browser_login();
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.browser_login_cancel = Some(cancel);
+        self.browser_login_drive = Some(drive_id.to_string());
+        self.browser_device_pending = Some(drive_id.to_string());
+        if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
+            if login.drive == drive_id {
+                login.browser_busy = true;
+                login.browser_device = true;
+                login.browser_status = "光鸭：正在申请设备授权码…".to_string();
+                login.error.clear();
+            }
+        }
+        self.start_qr_login(drive_id);
+    }
+
     /// 取消正在等待的浏览器登录（关闭浏览器并清理临时配置）。
     pub fn cancel_browser_login(&mut self) {
         if let Some(c) = self.browser_login_cancel.take() {
@@ -3488,7 +3654,7 @@ impl App {
         self.browser_login_drive = None;
         if let Some(Dialog::Login(login)) = self.dialog.as_mut() {
             if login.browser_busy {
-                login.browser_status = "正在取消浏览器登录…".to_string();
+                login.browser_status = "正在取消内置登录窗口…".to_string();
             }
         }
     }

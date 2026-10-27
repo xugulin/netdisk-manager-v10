@@ -168,7 +168,7 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
             }
             if d.caps.browser
                 && ui
-                    .selectable_label(tab == LoginTab::Browser, "🌐 浏览器")
+                    .selectable_label(tab == LoginTab::Browser, browser_tab_label())
                     .clicked()
             {
                 tab = LoginTab::Browser;
@@ -182,6 +182,10 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                 d.error.clear();
                 if tab == LoginTab::Qr && d.qr.is_none() {
                     outcome = Some(LoginOutcome::StartQr);
+                }
+                // 点「内置浏览器」标签即直接打开内置登录窗口（不用再点一次按钮）
+                if tab == LoginTab::Browser && !d.browser_busy {
+                    outcome = Some(LoginOutcome::StartBrowser);
                 }
             }
         });
@@ -470,32 +474,56 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
                 }
             }
             LoginTab::Browser => {
-                widgets::hint(
-                    ui,
-                    &t,
-                    "百度/夸克的「短信登录」在网页登录框的风控组件里，纯接口走不通（老项目实测）。                     程序会打开本机 Chrome/Edge/Chromium：在网页里点「短信登录」填手机号+验证码                     （也可扫码/密码），登录成功后自动读取会话并导入，无需手工复制 Cookie。",
-                );
+                widgets::hint(ui, &t, browser_tab_hint(kind));
                 ui.add_space(6.0);
+                // 登录内核预检：缺失时先在界面上暴露，而不是等点击才报错
+                let kernel = crate::browser_login::kernel_info();
+                match &kernel {
+                    Some(k) => {
+                        widgets::hint(ui, &t, &format!("登录内核：{}（{}）", k.version, k.path.display()));
+                    }
+                    None => {
+                        widgets::hint(
+                            ui,
+                            &t,
+                            "⚠ 未找到登录内核（程序目录下的「登录内核/」）。请使用完整绿色版，或先在仓库执行 scripts/fetch-login-chromium.sh。",
+                        );
+                    }
+                }
+                ui.add_space(6.0);
+                // 光鸭：内置窗口只显示设备授权页，进度靠设备码轮询驱动
+                if d.browser_device
+                    && !d.poll_inflight
+                    && matches!(d.qr_state, QrState::Waiting | QrState::Scanned)
+                    && d.qr_timer.elapsed() > std::time::Duration::from_millis(800)
+                {
+                    d.poll_inflight = true;
+                    d.qr_timer = std::time::Instant::now();
+                    request_poll = true;
+                }
                 if d.browser_busy {
-                    widgets::loading(ui, &t, "浏览器已打开，等待你在网页里完成登录…");
+                    if d.browser_device {
+                        widgets::loading(ui, &t, "光鸭设备授权页已打开：确认后自动导入…");
+                    } else {
+                        widgets::loading(ui, &t, browser_busy_text());
+                    }
                     ui.add_space(4.0);
-                    if widgets::secondary_button(ui, &t, "取消浏览器登录").clicked() {
+                    if widgets::secondary_button(ui, &t, "取消内置登录").clicked() {
                         outcome = Some(LoginOutcome::CancelBrowser);
                     }
-                } else if widgets::primary_button(ui, &t, "🌐 打开浏览器登录").clicked() {
+                } else if widgets::primary_button(ui, &t, browser_button_label()).clicked() {
                     outcome = Some(LoginOutcome::StartBrowser);
+                }
+                if d.browser_device && !d.qr_message.is_empty() {
+                    ui.add_space(4.0);
+                    widgets::hint(ui, &t, &format!("设备授权：{}", d.qr_message));
                 }
                 if !d.browser_status.is_empty() {
                     ui.add_space(6.0);
                     widgets::hint(ui, &t, &d.browser_status);
                 }
                 ui.add_space(6.0);
-                widgets::hint(
-                    ui,
-                    &t,
-                    "找不到浏览器？可设置环境变量 WP_LOGIN_BROWSER 指向 chrome/msedge 可执行文件；\
-                     或用「Cookie」标签手动导入。浏览器使用独立临时配置，关闭后自动清理。",
-                );
+                widgets::hint(ui, &t, browser_footer_hint());
             }
             LoginTab::Token => {
                 widgets::hint(
@@ -610,7 +638,7 @@ fn login(app: &mut App, ctx: &egui::Context, d: &mut LoginDialog) -> bool {
             LoginOutcome::CancelBrowser => {
                 app.cancel_browser_login();
                 d.browser_busy = false;
-                d.browser_status = "已取消浏览器登录".into();
+                d.browser_status = "已取消内置登录".into();
             }
             LoginOutcome::SaveQr => {
                 if let Some(png) = d.qr.as_ref().and_then(|q| q.image_png.clone()) {
@@ -1546,4 +1574,39 @@ fn account_details(
     } else {
         Some(Dialog::AccountDetails(d))
     }
+}
+
+// ───────────── 内置登录浏览器文案 ─────────────
+
+fn browser_tab_label() -> &'static str {
+    "🌐 内置浏览器"
+}
+
+fn browser_tab_hint(kind: DriveKind) -> &'static str {
+    match kind {
+        DriveKind::Guangya => {
+            "光鸭没有 Cookie 登录通道：内置窗口会打开**设备授权页**，\n\
+             在窗口里完成登录/确认（或在 App 内确认设备码）后自动导入令牌，\n\
+             无需手工复制，也不需要额外安装浏览器。"
+        }
+        _ => {
+            "百度/夸克「短信登录」在网页风控组件里，纯接口走不通。\n\
+             程序自带一个**只用于登录的 Chromium 内核**（不打开你系统里的浏览器），\n\
+             窗口只显示登录页（无地址栏/标签栏）：点「短信登录」填手机号+验证码\n\
+             （也可扫码/密码），登录成功后自动读取会话导入，无需手工复制 Cookie。"
+        }
+    }
+}
+
+fn browser_busy_text() -> &'static str {
+    "内置登录窗口已打开，等待你在里面完成登录…"
+}
+
+fn browser_button_label() -> &'static str {
+    "🌐 打开内置登录窗口"
+}
+
+fn browser_footer_hint() -> &'static str {
+    "登录内核只随本程序使用（独立临时配置，关闭后清理）。\
+     如窗口打不开，请检查程序目录下的「登录内核」是否完整；也可用「Cookie」标签手动导入。"
 }

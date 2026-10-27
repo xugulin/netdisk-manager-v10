@@ -44,6 +44,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 widgets::kv_row(ui, &t, "任务库", &app.paths.tasks_file().display().to_string());
                 widgets::kv_row(ui, &t, "日志文件", &wp_core::logging::current_file().map(|p| p.display().to_string()).unwrap_or_else(|| "（未启用）".into()));
                 widgets::kv_row(ui, &t, "中文字体", "自动探测系统字体；可在设置里指定字体文件");
+                widgets::kv_row(ui, &t, "登录内核", &crate::browser_login::kernel_report());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("📂 打开数据目录").clicked() {
@@ -155,3 +156,5 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     let _ = theme::radius(0);
     let _: &Theme = &t;
 }
+
+

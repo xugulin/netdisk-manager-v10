@@ -72,6 +72,14 @@ echo "→ 安装二进制：$BIN_ARG → $BIN_DIR/$APP_NAME"
 install -d "$BIN_DIR"
 install -m 755 "$BIN_ARG" "$BIN_DIR/$APP_NAME"
 
+# ── 登录内核自检：内置 Chromium 不在二进制里，是程序目录下的 登录内核/ ──
+BIN_DIR_REAL="$(dirname "$BIN_DIR/$APP_NAME")"
+if [ ! -d "$BIN_DIR_REAL/登录内核" ]; then
+  echo "⚠ 没找到登录内核目录（$BIN_DIR_REAL/登录内核）。" >&2
+  echo "   登录窗口将不可用；请使用完整绿色版，或先在仓库里跑 ./scripts/fetch-login-chromium.sh。" >&2
+  echo "   （也可继续用 WhatsApp 扫码/Cookie 登录，不受影响。）" >&2
+fi
+
 echo "→ 安装图标 → $ICONS_DIR"
 for size in 16 24 32 48 64 128 256 512; do
   src="$ROOT/assets/icons/$ICON_NAME-$size.png"

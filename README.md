@@ -7,7 +7,8 @@
 > 之后，**用 Rust 从最底层协议重写**的图形界面网盘管理工具。
 >
 > * **纯 Rust GUI**（eframe / egui），单可执行文件；
-> * **Windows 10/11 + Linux 同一套代码**，无 Qt/PySide/WebView 等系统 GUI 依赖；
+> * **Windows 10/11 + Linux 同一套代码**，无 Qt/PySide 依赖；
+> * 登录窗口**内置一个只用于登录的 Chromium 内核**（随包分发，不打开用户系统浏览器、不需要另装 Chrome）；
 > * 三家网盘**进程内原生适配器**，无 Python、无子进程桥、不依赖 Alist/rclone；
 > * 无网盘账号也能用内置「演示网盘 / 本机」跑通全部界面（含截图验收）。
 
@@ -80,14 +81,28 @@ sudo ./scripts/install-desktop.sh --prefix /usr/local
 
 ```bash
 # 依赖：rustup（stable）、系统 OpenGL/X11 运行库
+# 登录内核（Chromium 159，约 255MB 压缩 / 392MB 解压）不入库，首次构建前先拉一次：
+./scripts/fetch-login-chromium.sh     # 产出 登录内核/（默认用 scripts/login-kernel.rev 固定版本）
+./scripts/verify-login-kernel.sh      # 自检：版本 + 真实启动 + CDP 握手
+./scripts/verify-login-import.sh      # 链路验收：内置窗口 → 注入测试 Cookie → CDP 读回 → 应用导入（免真账号）
 ./scripts/build-linux.sh              # release 构建
-./scripts/build-linux.sh --portable   # 顺带生成绿色版目录 出/网盘管理-linux-x64/
+./scripts/build-linux.sh --portable   # 生成绿色版 出/网盘管理-linux-x64/（含登录内核）
+# 绿色版体积 ≈ 主程序 27MB + 播放器运行时 126MB + 登录内核 392MB ≈ 545MB
+
+# 运行机要求（绿色版解压即用，但 Chromium 仍依赖系统运行库）：
+#  * glibc ≥ 2.25（实测内核最高只用到 GLIBC_2.25；Ubuntu 18.04+/Debian 10+ 满足）
+#  * X11/OpenGL + Chromium 常规运行库：libnss3、libnspr4、libgbm、libasound2、libatk1.0、
+#    libatk-bridge2.0、libcups2、libdrm2、libxkbcommon0、libpango、libglib2.0、libdbus-1、
+#    libX11/libXcomposite/libXdamage/libXrandr 等（桌面发行版基本自带）
+#  * 若内核启动失败，`./scripts/verify-login-kernel.sh` 会打印缺失/崩溃原因
 ```
 
 **Windows 10/11**
 
 ```powershell
 # 依赖：rustup（MSVC 工具链）+ Visual Studio Build Tools（C++ 桌面开发）
+# 登录内核（Windows 版）同样不入库，先拉一次：
+powershell -ExecutionPolicy Bypass -File .\scripts\fetch-login-chromium.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Portable
 ```
@@ -168,12 +183,15 @@ GUI 之外还有同一套适配器的 CLI，适合批量验证、自动化和无
      （V9 老项目实测结论）；支持带 `Cookie:` 前缀/多行/多余空格，一键打开对应网盘登录页；
    * **短信**（光鸭）：手机号格式校验 + 验证码 4~8 位校验，发送后 **60 秒重发倒计时**；
    * **令牌**（光鸭）：可粘贴 access token 或登录接口的 JSON（access/refresh token）；
-   * **浏览器登录（百度/夸克短信登录）**：百度/夸克的「短信登录」在网页登录框的风控组件里
+   * **内置浏览器登录（百度/夸克短信登录）**：百度/夸克的「短信登录」在网页登录框的风控组件里
      （纯 HTTP 老接口走不通，V8.3 老项目已实测，见 `网盘管理/v8_3/docs/实验_纯HTTP登录.md`），
-     因此程序会打开本机 **Chrome / Edge / Chromium**（独立临时配置 + 远程调试端口）：
-     在网页里点「短信登录」→ 填手机号 + 验证码（也可扫码/密码）→ 登录成功后程序通过 CDP
-     自动读取会话 Cookie 并导入校验，无需手工复制；关闭浏览器后临时配置自动清理。
-     找不到浏览器时可用「Cookie」标签手动导入，或设置 `WP_LOGIN_BROWSER` 指向浏览器可执行文件；
+     因此程序会用**自带的 Chromium 内核**（`登录内核/`）打开登录窗口：
+     在里面点「短信登录」→ 填手机号 + 验证码（也可扫码/密码）→ 登录成功后通过 CDP 自动读取会话
+     Cookie 导入，无需手工复制；窗口关闭或超时即取消，临时配置自动清理。
+     不打开用户系统里的 Chrome/Edge，也不需要另外安装浏览器；
+     内核缺失（不完整安装包）时会提示重装，也可用「Cookie」标签手动导入；
+     正常关闭主程序会自动关闭并清理登录窗口；异常退出（崩溃/强杀）留下的内核进程
+     会在下次启动时自动清扫，不会越积越多；
    * 同一网盘类型会记住上次使用的登录方式（如百度上次用 Cookie，下次默认 Cookie）。
 4. 顶栏网盘标签：悬停显示「实例 / 账号 / 登录状态」；右键菜单可 **登录/更换账号、退出登录、
    刷新、再加一个同类型账号、移除实例**；状态点绿=已登录、黄=未登录、红=异常。
@@ -385,3 +403,9 @@ crates/
 > 硬解/HDR、libbluray 蓝光、AI 挂钩点与源码自建能力都是最优；渲染按平台双模式
 > （Linux 进程内 GL render API；Windows 原生子窗口 + D3D11VA）；网盘流走本地磁盘预读缓存代理；
 > 弹幕后续以「egui 覆盖层（Mode A）/ 预生成 ASS 弹幕轨（Mode B）」双通道接入。
+
+## 文档
+
+- [内置登录交付说明](docs/内置登录-交付说明.md)（架构/增删/验证矩阵/剩余人工验证）
+- [内置登录真机验证清单](docs/内置登录-真机验证清单.md)
+- [JS 宿主替代浏览器可行性](docs/JS宿主替代浏览器-可行性.md)（含每轮实验记录）
