@@ -102,9 +102,7 @@ jobs:
       - name: 下载内置登录内核（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          $rev = (Get-Content scripts/login-kernel.rev -Raw).Trim()
-          ./scripts/fetch-login-chromium.ps1 -Rev $rev
+        run: ./scripts/fetch-login-chromium.ps1
 
       - name: 编译（release）
         run: cargo build --release -p wp-gui -p wp-cli

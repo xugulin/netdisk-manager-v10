@@ -14,21 +14,37 @@ $Rev = $null
 for ($i = 0; $i -lt $args.Count; $i++) {
   if ($args[$i] -eq "-Rev" -and $i + 1 -lt $args.Count) { $Rev = $args[$i + 1] }
 }
+$Base = "https://storage.googleapis.com/chromium-browser-snapshots/Win_x64"
+# Windows 快照的 revision 与 Linux 不同：优先用 scripts/login-kernel-win.rev 固定的版本
+$RevFile = Join-Path $Root "scripts/login-kernel-win.rev"
+if (-not $Rev -and (Test-Path $RevFile)) { $Rev = (Get-Content $RevFile -Raw).Trim() }
 if (-not $Rev) {
-  $Rev = (Invoke-WebRequest -UseBasicParsing "https://storage.googleapis.com/chromium-browser-snapshots/Win_x64/LAST_CHANGE").Content.Trim()
+  $Rev = (Invoke-WebRequest -UseBasicParsing "$Base/LAST_CHANGE").Content.Trim()
 }
 if (-not $Rev) { throw "取 Chromium 版本号失败（网络？）" }
 
-$Url = "https://storage.googleapis.com/chromium-browser-snapshots/Win_x64/$Rev/chrome-win.zip"
+$Url = "$Base/$Rev/chrome-win.zip"
 $Cache = Join-Path $Root ".cache"
 New-Item -ItemType Directory -Force -Path $Cache | Out-Null
 $Zip = Join-Path $Cache "chrome-win-$Rev.zip"
 
 if (-not (Test-Path $Zip) -or (Get-Item $Zip).Length -eq 0) {
-  Write-Host "==> 下载 Chromium 快照 $Rev（约 250MB）"
-  curl.exe -L --retry 5 -C - --progress-bar -o $Zip $Url
+  Write-Host "==> 下载 Chromium 快照 $Rev（Win_x64，约 250MB）"
+  curl.exe -fL --retry 5 --progress-bar -o $Zip $Url
+  if ($LASTEXITCODE -ne 0) { Write-Host "==> 下载退出码 $LASTEXITCODE（固定 revision 可能在该架构无快照）" }
 }
-if (-not (Test-Path $Zip)) { throw "下载失败：$Zip" }
+# 固定 revision 在 Win_x64 不存在时（404），回退到该架构最新快照
+if ((-not (Test-Path $Zip)) -or ((Get-Item $Zip).Length -lt 50MB)) {
+  $Last = (Invoke-WebRequest -UseBasicParsing "$Base/LAST_CHANGE").Content.Trim()
+  if ($Last -and $Last -ne $Rev) {
+    Write-Host "==> 固定 revision $Rev 不可用，回退 Win_x64 最新 $Last"
+    $Rev = $Last
+    $Url = "$Base/$Rev/chrome-win.zip"
+    $Zip = Join-Path $Cache "chrome-win-$Rev.zip"
+    curl.exe -fL --retry 5 --progress-bar -o $Zip $Url
+  }
+}
+if (-not (Test-Path $Zip)) { throw "下载失败：$Zip（url=$Url）" }
 
 $ZipLen = (Get-Item $Zip).Length
 Write-Host ("==> 压缩包大小 {0:N1} MB" -f ($ZipLen / 1MB))
